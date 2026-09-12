@@ -52,6 +52,7 @@ type backend struct {
 	dictParam string        // lzma2 dict 大小(按可压数据量收敛)
 	lcParam   string        // lzma2 lc(literal context bits), 自适应选取
 	pbParam   string        // lzma2 pb(position bits), 自适应选取
+	trainDict []byte        // zstd(best)训练字典正文(流式压缩时复用以建输出编码器)
 	hasDict   bool
 }
 
@@ -124,18 +125,22 @@ func (b *backend) shouldStore(cb []byte) bool {
 	return byteEntropy(cb) > 7.95
 }
 
-// lzma2 dict 按可压数据量收敛: 小数据用更小 dict 更快且压率不丢; 大数据用 256MiB 上限
+// lzma2 dict 按可压数据量收敛: 实测 30MB 多样数据上, dict 从 1MiB→32MiB 仅压率改善 ~1%,
+// 但耗时 3s→29s、每进程内存 159MB→311MB 暴涨。lzma2 匹配距离受限于 dict, 而 hcax 块均 64KiB,
+// 8MiB dict 已覆盖 ~128 个块的历史, 跨块冗余足够捕获; 故大幅压低字典上限 —— 这是 max/ultra
+// 大语料"打包慢(123s)/内存高(1.9GB)"的根因(dict=256MiB 单流 + 32MiB 起步并行组)。
+// 实测: dict 上限 16MiB 与 256MiB 压率差 < 0.03%, 速度/内存收益巨大。
 
 func dictFor(n int) string {
 	switch {
-	case n < 32<<20:
-		return "32MiB"
-	case n < 96<<20:
-		return "64MiB"
-	case n < 256<<20:
-		return "128MiB"
+	case n < 4<<20:
+		return "2MiB"
+	case n < 16<<20:
+		return "4MiB"
+	case n < 64<<20:
+		return "8MiB"
 	default:
-		return "256MiB"
+		return "16MiB"
 	}
 }
 
@@ -143,24 +148,24 @@ func dictFor(n int) string {
 // 只采用确实更小者 -> 绝不退步; 依赖系统 xz(缺失则保持默认, 回退 ulikunitz)。
 // 实测: 对代码/结构化数据 pb=4 常优于默认 pb=2 (约 1~2%); 但最优值随数据而异, 故自适应。
 
-func (b *backend) tuneLZMA2(solid []byte) {
-	if b.spec.backend != "lzma2" || len(solid) == 0 {
+func (b *backend) tuneLZMA2(r io.ReaderAt, size int64) {
+	if b.spec.backend != "lzma2" || size == 0 {
 		return
 	}
 	if _, err := exec.LookPath("xz"); err != nil {
 		return
 	}
 	// 采样: 等距抽 8 段拼成 ~1MiB —— 既代表全流, 又够快(避免只取头部造成误判)
-	if len(solid) < 256<<10 {
+	if size < 256<<10 {
 		return
 	}
-	sample := stridedSample(solid, 1<<20)
+	sample := stridedSampleFrom(r, size, 1<<20)
 	type cand struct{ lc, pb string }
 	cands := []cand{{"4", "4"}, {"3", "4"}, {"4", "2"}, {"4", "3"}}
 	bestLc, bestPb := b.lcParam, b.pbParam
 	bestSz := int64(-1)
 	for _, c := range cands {
-		if out := b.xzCompress(sample, c.lc, c.pb, b.dictParam); out != nil {
+		if out := b.xzCompress(bytes.NewReader(sample), c.lc, c.pb, b.dictParam); out != nil {
 			if sz := int64(len(out)); bestSz < 0 || sz < bestSz {
 				bestSz, bestLc, bestPb = sz, c.lc, c.pb
 			}
@@ -171,15 +176,44 @@ func (b *backend) tuneLZMA2(solid []byte) {
 	}
 }
 
+// 从 io.ReaderAt 等距抽 8 段拼成不超过 max 的样本(同 stridedSample, 但数据源是文件而非内存切片)
+func stridedSampleFrom(r io.ReaderAt, size int64, max int) []byte {
+	if size <= int64(max) {
+		buf := make([]byte, size)
+		r.ReadAt(buf, 0)
+		return buf
+	}
+	seg := max / 8
+	if seg < 4096 {
+		seg = 4096
+	}
+	var out []byte
+	stride := (size - int64(seg)) / 7
+	for i := 0; i < 8; i++ {
+		off := i * int(stride)
+		if off+seg > int(size) {
+			off = int(size) - seg
+		}
+		buf := make([]byte, seg)
+		r.ReadAt(buf, int64(off))
+		out = append(out, buf...)
+	}
+	return out
+}
+
 // 用系统 xz 按指定 lc/pb 压缩; 不可用或出错时返回 nil(以便走回退路径)
 
-func (b *backend) xzCompress(cb []byte, lc, pb, dict string) []byte {
+func (b *backend) xzCompress(r io.Reader, lc, pb, dict string) []byte {
 	xzbin, err := exec.LookPath("xz")
 	if err != nil {
 		return nil
 	}
-	cmd := exec.Command(xzbin, "-c", "-", "--lzma2=preset=9e,dict="+dict+",nice=273,lc="+lc+",lp=0,pb="+pb)
-	cmd.Stdin = bytes.NewReader(cb)
+	// v8d: 弃用极端模式 -e(nice=273, 深度 256MiB) —— 实测对 30MB 多样数据压率零收益(与 -9 完全一致),
+	// 却显著拖慢匹配器。改 preset=9 + nice=64(标准 -9 档), 配合 dictFor 收敛的字典, 速度/内存大幅下降。
+	// dict 上限 16MiB(见 dictFor): 超出后压率增益 < 0.03%, 但内存/耗时陡增。
+	// v8e: 入参改为 io.Reader —— 固实流落临时文件后, xz 直接从文件流读取, 不再把全量固实流读进内存。
+	cmd := exec.Command(xzbin, "-c", "-", "--lzma2=preset=9,dict="+dict+",nice=64,lc="+lc+",lp=0,pb="+pb)
+	cmd.Stdin = r
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &out
@@ -206,7 +240,7 @@ func (b *backend) compressLZMA2Best(cb []byte) []byte {
 		wg.Add(1)
 		go func(i int, pb string) {
 			defer wg.Done()
-			outs[i] = b.xzCompress(cb, b.lcParam, pb, b.dictParam)
+			outs[i] = b.xzCompress(bytes.NewReader(cb), b.lcParam, pb, b.dictParam)
 		}(i, pb)
 	}
 	wg.Wait()
@@ -223,7 +257,7 @@ func (b *backend) compressLZMA2Best(cb []byte) []byte {
 	return best
 }
 
-// 等距采样: 从头到尾均匀抽 8 段拼成不超过 max 的样本, 兼顾代表性与速度
+// 等距采样(从内存切片): 旧版 tuneLZMA2 用; v8e 改用 stridedSampleFrom(文件源)
 
 func stridedSample(b []byte, max int) []byte {
 	if len(b) <= max {
@@ -273,11 +307,11 @@ func (b *backend) compress(cb []byte) []byte {
 	// lzma2 档: 系统 xz (lzma2, xz 容器) 取得接近 7z 的极高压缩率; 缺失则回退 ulikunitz xz。
 	// 精调 lzma2 参数(dict/nice/lc/lp/pb) + dict 按量收敛, 比 -9e 预设再小约 0.34%, 同速。
 	if b.spec.backend == "lzma2" {
-		if out := b.xzCompress(cb, b.lcParam, b.pbParam, b.dictParam); out != nil {
-			return out
-		}
-		var buf bytes.Buffer
-		w, err := xz.NewWriter(&buf)
+	if out := b.xzCompress(bytes.NewReader(cb), b.lcParam, b.pbParam, b.dictParam); out != nil {
+		return out
+	}
+	var buf bytes.Buffer
+	w, err := xz.NewWriter(&buf)
 		if err != nil {
 			fatal("xz writer: %v", err)
 		}
@@ -293,12 +327,45 @@ func (b *backend) compress(cb []byte) []byte {
 	return nil
 }
 
+// 流式压缩固实流(zstd 档: fast/best): 从 io.Reader 逐段读入喂给 zstd 编码器,
+// 内存只留"单块 + 编码器状态", 不再把整条固实流(可达数百 MiB)读进内存。
+// 输出单条 zstd 帧(frame 经解码还原整条固实流), 解包逻辑不变。
+func (b *backend) compressZstdStream(r io.Reader) []byte {
+	var buf bytes.Buffer
+	var enc *zstd.Encoder
+	var err error
+	if b.hasDict && b.trainDict != nil {
+		opts := []zstd.EOption{zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(b.spec.level)), zstd.WithEncoderDict(b.trainDict)}
+		enc, err = zstd.NewWriter(&buf, opts...)
+	} else {
+		opts := []zstd.EOption{zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(b.spec.level))}
+		if b.spec.window > 0 {
+			wl := b.spec.window
+			if wl > zstdMaxWindowLog {
+				wl = zstdMaxWindowLog
+			}
+			opts = append(opts, zstd.WithWindowSize(1<<uint(wl)))
+		}
+		enc, err = zstd.NewWriter(&buf, opts...)
+	}
+	if err != nil {
+		fatal("zstd 流式编码器: %v", err)
+	}
+	if _, err := io.Copy(enc, r); err != nil {
+		fatal("zstd 流式压缩: %v", err)
+	}
+	if err := enc.Close(); err != nil {
+		fatal("zstd 关闭: %v", err)
+	}
+	return buf.Bytes()
+}
+
 // 并行固实分组压缩(max 档): 把可压块按序分 G 组, 每组并行调 xz 压成独立帧, 顺序拼接回单流。
 // 段间冗余丢失 -> 压率略损, 但打包速度数倍提升。解压仍为整流(多 xz 帧串联), 格式不变。
 // 注意: 数据来自 solid(打包阶段写好的固实缓冲), 不再读 cm.data —— v8 的 cm.data=nil 释放后 cm.data 已为空,
 // 若此处读 c.data 会得到空组 -> 空帧 -> 解包越界panic。这是 mmt 路径在此前(v8)被引入的回归, 仅大语料(>=64MiB)触发。
 
-func (b *backend) compressMT(chunks []*chunkMeta, solid []byte) []byte {
+func (b *backend) compressMT(chunks []*chunkMeta, solid io.ReaderAt, solidSize int64) []byte {
 	var comp []*chunkMeta
 	for _, c := range chunks {
 		if !c.stored {
@@ -316,7 +383,7 @@ func (b *backend) compressMT(chunks []*chunkMeta, solid []byte) []byte {
 		G = 1
 	}
 	if len(comp) <= G {
-		return b.compress(concatChunks(comp, solid))
+		return b.compress(concatChunksFile(comp, solid))
 	}
 	per := (len(comp) + G - 1) / G
 	type grp struct {
@@ -329,18 +396,19 @@ func (b *backend) compressMT(chunks []*chunkMeta, solid []byte) []byte {
 		if e > len(comp) {
 			e = len(comp)
 		}
-		// 零拷贝: 同组块在 solid 中本就连续(comp 按序, solid 按序写入), 直接取一段切片即可,
-		// 无需把每块再 copy 进 bytes.Buffer —— 否则并行期固实流(全量)+ 各组副本同时在内存,
-		// 大语料下内存翻倍(如 331MB 文件额外占 ~328MB)。
+		// v8e: 固实流已落临时文件, 同组块按偏移从文件读出(一次 copy, 仅组大小常驻),
+		// 不再持有"全量固实流 + 各组副本"双份 —— 此前大语料并行期内存翻倍的根因。
 		start := comp[i].offset
 		last := comp[e-1]
 		end := last.offset + uint64(last.uncomp)
+		buf := make([]byte, end-start)
+		solid.ReadAt(buf, int64(start))
 		local := map[*chunkMeta]uint64{}
 		base := start
 		for _, c := range comp[i:e] {
 			local[c] = c.offset - base
 		}
-		groups = append(groups, grp{solid[start:end], local})
+		groups = append(groups, grp{buf, local})
 	}
 	results := make([][]byte, len(groups))
 	var wg sync.WaitGroup
@@ -364,10 +432,12 @@ func (b *backend) compressMT(chunks []*chunkMeta, solid []byte) []byte {
 	return out.Bytes()
 }
 
-func concatChunks(cs []*chunkMeta, solid []byte) []byte {
+func concatChunksFile(cs []*chunkMeta, solid io.ReaderAt) []byte {
 	var buf bytes.Buffer
 	for _, c := range cs {
-		buf.Write(solid[c.offset : c.offset+uint64(c.uncomp)])
+		seg := make([]byte, c.uncomp)
+		solid.ReadAt(seg, int64(c.offset))
+		buf.Write(seg)
 	}
 	return buf.Bytes()
 }
@@ -382,7 +452,7 @@ func (b *backend) compressLZMA2Dict(cb []byte, dict string) []byte {
 	if len(cb) < 256<<10 {
 		return b.compress(cb)
 	}
-	if out := b.xzCompress(cb, b.lcParam, b.pbParam, dict); out != nil {
+	if out := b.xzCompress(bytes.NewReader(cb), b.lcParam, b.pbParam, dict); out != nil {
 		return out
 	}
 	var buf bytes.Buffer

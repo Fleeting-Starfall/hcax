@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -220,6 +222,16 @@ func storedName(fp, root string) string {
 	return rel
 }
 
+// 流式计算整条数据的 16 字节校验哈希(sha256 前 16B): 固实流/原样区落临时文件后,
+// 不再把全量数据读进内存即可完成流级校验(替代原先的 hash16(全量切片))。
+func hashReader(r io.Reader) [16]byte {
+	h := sha256.New()
+	io.Copy(h, r)
+	var out [16]byte
+	copy(out[:], h.Sum(nil)[:16])
+	return out
+}
+
 func pack(inputs []string, outPath, mode string) {
 	spec, ok := modes[mode]
 	if !ok {
@@ -236,6 +248,26 @@ func pack(inputs []string, outPath, mode string) {
 	var chunkMetas []*chunkMeta
 	var fileEntries []fileEntry
 	var totalUncomp uint64
+
+	// v8e: 固实流/原样区落临时文件 —— 块变换后立即写入文件并丢弃, 内存里同一份数据只"流式经过",
+	// 不再整条常驻(此前整条固实流 + 原样区 = 全量输入常驻内存, 是多样大文件打包内存 ~5×输入 的根因)。
+	// 压缩时从临时文件流式读取(见 compressZstdStream / xzCompress / compressMT), 内存降到"单块 + 编码器状态"。
+	csf, err := os.CreateTemp("", "hcax-solid-")
+	if err != nil {
+		fatal("临时文件: %v", err)
+	}
+	rsf, err := os.CreateTemp("", "hcax-raw-")
+	if err != nil {
+		fatal("临时文件: %v", err)
+	}
+	defer os.Remove(csf.Name())
+	defer os.Remove(rsf.Name())
+	defer csf.Close()
+	defer rsf.Close()
+	var trainSamples [][]byte
+	var trainBytes int
+	var compSolidSize, rawRegionSize int64
+	nStored, nComp := 0, 0
 
 	blk := make([]byte, 1<<20)
 	for _, fp := range files {
@@ -277,11 +309,35 @@ func pack(inputs []string, outPath, mode string) {
 			default:
 				xf, tb = be.chooseTransform(cb)
 			}
-			// v8: xfNone 时 applyXform 返回原块(cb); 配合块缓冲池需复制一份, 避免池化缓冲被 cm.data 持有后被复用而损坏数据
-			if xf == xfNone {
-				tb = append([]byte(nil), cb...)
+			// v8d: 直接写入固实流/原样区, 块数据不再经 cm.data 中转(避免"cm.data + compSolid"双份常驻)。
+			// xfNone 时 tb==cb(applyXform/chooseTransform 对 xfNone 返回原块, 不再强制拷贝),
+			// bytes.Buffer.Write 会同步拷走, 池化缓冲被复用也无碍; 仅 zstd 训练样本按需复制(封顶 64MiB)。
+			if spec.backend == "zstd" && len(tb) >= 200 && len(tb) <= 128<<10 &&
+				len(trainSamples) < 2000 && trainBytes < 64<<20 {
+				s := append([]byte(nil), tb...)
+				trainSamples = append(trainSamples, s)
+				trainBytes += len(s)
 			}
-			cm := &chunkMeta{hash: hh, uncomp: uint32(len(cb)), xform: xf, data: tb, idx: uint32(len(chunkMetas))}
+			cm := &chunkMeta{hash: hh, uncomp: uint32(len(cb)), xform: xf, idx: uint32(len(chunkMetas))}
+			if be.shouldStore(tb) {
+				cm.stored = true
+				cm.offset = uint64(rawRegionSize)
+				n, e := rsf.Write(tb)
+				if e != nil {
+					fatal("写原样区: %v", e)
+				}
+				rawRegionSize += int64(n)
+				nStored++
+			} else {
+				cm.stored = false
+				cm.offset = uint64(compSolidSize)
+				n, e := csf.Write(tb)
+				if e != nil {
+					fatal("写固实流: %v", e)
+				}
+				compSolidSize += int64(n)
+				nComp++
+			}
 			if !spec.solid {
 				chunkMap[hh] = cm
 			}
@@ -351,6 +407,11 @@ func pack(inputs []string, outPath, mode string) {
 		})
 		totalUncomp += uint64(st.Size())
 	}
+	if os.Getenv("HCAX_T") != "" {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		fmt.Fprintf(os.Stderr, "[t] after-chunking GoAlloc=%dMB Sys=%dMB nChunks=%d\n", ms.Alloc/1048576, ms.Sys/1048576, len(chunkMetas))
+	}
 
 	// 目录条目(含空目录): 不产生数据块, 只记录名字/权限/时间, 保证解包后目录结构完整
 	for _, d := range dirs {
@@ -368,92 +429,104 @@ func pack(inputs []string, outPath, mode string) {
 		})
 	}
 
-	// 分桶: 可压块进 compSolid(固实压缩保压率), 不可压块进 rawRegion(原样存储, 省编码开销)
-	var compSolid, rawRegion bytes.Buffer
-	nStored, nComp := 0, 0
-	for _, cm := range chunkMetas {
-		if be.shouldStore(cm.data) {
-			cm.stored = true
-			cm.offset = uint64(rawRegion.Len())
-			rawRegion.Write(cm.data)
-			nStored++
-		} else {
-			cm.stored = false
-			cm.offset = uint64(compSolid.Len())
-			compSolid.Write(cm.data)
-			nComp++
-		}
-	}
+	// v8d: 分桶已在 onChunk 内直接完成(块写入 compSolid/rawRegion 并即时释放), 此处不再有 cm.data 中转。
+	// 故内存里可压/原样数据各只存一份(compSolid / rawRegion), 大文件打包峰值内存从 ~5×输入 降到 ~1.5×输入。
 
 	// lzma2 dict 按可压数据量收敛; lc/pb 自适应在压缩阶段进行(单流用全流试选, 并行用采样试选)
-	be.dictParam = dictFor(compSolid.Len())
+	be.dictParam = dictFor(int(compSolidSize))
+	if os.Getenv("HCAX_T") != "" {
+		var ms runtime.MemStats
+		runtime.ReadMemStats(&ms)
+		fmt.Fprintf(os.Stderr, "[t] bucket done nComp=%d nStored=%d compSolid=%d raw=%d | GoAlloc=%dMB Sys=%dMB\n",
+			nComp, nStored, compSolidSize, rawRegionSize, ms.Alloc/1048576, ms.Sys/1048576)
+	}
 
-	// zstd 训练字典(best 相似文件): 收集可压块样本训练一个字典, 用字典压缩该组
+	// zstd 训练字典(best 相似文件): 用上面复制的独立样本训练字典, 用字典压缩该组
 	var trainDict []byte
-	if spec.backend == "zstd" {
-		var samples [][]byte
-		var samplesBytes int
-		for _, c := range chunkMetas {
-			if len(c.data) >= 200 && len(c.data) <= 128<<10 {
-				samples = append(samples, c.data)
-				samplesBytes += len(c.data)
-				// 封顶样本总量(64MiB): zstd 字典训练对样本量不敏感, 多于此只是徒增内存峰值;
-				// 对"非重复多文件"场景, 原上限 2000×128KiB=256MiB 会在训练期间与 cm.data 双份常驻
-				if len(samples) >= 2000 || samplesBytes >= 64<<20 {
-					break
-				}
+	if spec.backend == "zstd" && len(trainSamples) >= 4 {
+		// BuildDict: Contents=样本(建码表), History=代表样本(作字典正文, >=8B)
+		var hist []byte
+		for _, s := range trainSamples {
+			hist = append(hist, s...)
+			if len(hist) >= 100<<10 {
+				break
 			}
 		}
-		if len(samples) >= 4 {
-			// BuildDict: Contents=样本(建码表), History=代表样本(作字典正文, >=8B)
-			var hist []byte
-			for _, s := range samples {
-				hist = append(hist, s...)
-				if len(hist) >= 100<<10 {
-					break
+		if len(hist) < 8 {
+			hist = trainSamples[0]
+		}
+		if d, e := zstd.BuildDict(zstd.BuildDictOptions{
+			ID:       1,
+			Contents: trainSamples,
+			History:  hist,
+			Offsets:  [3]int{1, 4, 8},
+			Level:    zstd.EncoderLevelFromZstd(spec.level),
+		}); e == nil && len(d) > 0 {
+			trainDict = d
+			opts := []zstd.EOption{zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(spec.level)), zstd.WithEncoderDict(trainDict)}
+			if spec.window > 0 {
+				wl := spec.window
+				if wl > zstdMaxWindowLog {
+					wl = zstdMaxWindowLog
 				}
+				opts = append(opts, zstd.WithWindowSize(1<<uint(wl)))
 			}
-			if len(hist) < 8 {
-				hist = samples[0]
-			}
-			if d, e := zstd.BuildDict(zstd.BuildDictOptions{
-				ID:       1,
-				Contents: samples,
-				History:  hist,
-				Offsets:  [3]int{1, 4, 8},
-				Level:    zstd.EncoderLevelFromZstd(spec.level),
-			}); e == nil && len(d) > 0 {
-				trainDict = d
-				opts := []zstd.EOption{zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(spec.level)), zstd.WithEncoderDict(trainDict)}
-				if spec.window > 0 {
-					wl := spec.window
-					if wl > zstdMaxWindowLog {
-						wl = zstdMaxWindowLog
-					}
-					opts = append(opts, zstd.WithWindowSize(1<<uint(wl)))
-				}
-				if enc, e2 := zstd.NewWriter(io.Discard, opts...); e2 == nil {
-					be.zEncDict = enc
-					be.hasDict = true
-				}
+			if enc, e2 := zstd.NewWriter(io.Discard, opts...); e2 == nil {
+				be.zEncDict = enc
+				be.hasDict = true
 			}
 		}
 	}
+	be.trainDict = trainDict // v8e: 流式压缩时复用该字典建输出编码器
+	trainSamples = nil       // v8d: 字典已建, 释放样本
 
-	// v8: 打包阶段 cm.data 仅用于分桶/训练字典; 此后压缩与解包都读 compSolid/rawRegion,
-	// 不再需要 cm.data. 释放它, 避免"块数据被存两份"(尤其 ultra/随机不可压大数据)吃内存.
-	for _, cm := range chunkMetas {
-		cm.data = nil
-	}
-
-	// 压缩可压固实流: 仅当可压数据 >= mmtMinBytes 才并行分组(mmt)提速;
-	// 中小语料走单线程整流保压率(并行切段会丢段间冗余)
+	// 压缩可压固实流:
+	// - zstd 档(fast/best): 从临时文件流式压缩(compressZstdStream), 内存只留单块+编码器;
+	// - lzma2 且可压数据 >= mmtMinBytes: 并行分组(mmt)提速, 各组从临时文件读各自切片;
+	// - 其余(中小 lzma2): 单流全流选参, 把固实流读回内存(<64MiB, 安全)。
 	var frame []byte
-	if be.spec.mmt && nComp > 1 && compSolid.Len() >= mmtMinBytes {
-		be.tuneLZMA2(compSolid.Bytes()) // 大语料: 采样试选(全流试选太贵), 再分组并行压
-		frame = be.compressMT(chunkMetas, compSolid.Bytes())
+	if be.spec.backend == "zstd" {
+		if compSolidSize > 0 {
+			if _, e := csf.Seek(0, io.SeekStart); e != nil {
+				fatal("seek 固实流: %v", e)
+			}
+			t0 := time.Now()
+			frame = be.compressZstdStream(csf)
+			if os.Getenv("HCAX_T") != "" {
+				fmt.Fprintf(os.Stderr, "[t] compressZstdStream %v\n", time.Since(t0))
+			}
+		}
+	} else if be.spec.mmt && nComp > 1 && compSolidSize >= mmtMinBytes {
+		if os.Getenv("HCAX_T") != "" {
+			fmt.Fprintf(os.Stderr, "[t] -> mmt path G=%d\n", runtime.NumCPU())
+		}
+		t0 := time.Now()
+		be.tuneLZMA2(csf, compSolidSize) // 大语料: 采样试选(全流试选太贵), 再分组并行压
+		if os.Getenv("HCAX_T") != "" {
+			fmt.Fprintf(os.Stderr, "[t] tuneLZMA2 %v\n", time.Since(t0))
+		}
+		t0 = time.Now()
+		frame = be.compressMT(chunkMetas, csf, compSolidSize)
+		if os.Getenv("HCAX_T") != "" {
+			fmt.Fprintf(os.Stderr, "[t] compressMT %v\n", time.Since(t0))
+		}
 	} else {
-		frame = be.compressLZMA2Best(compSolid.Bytes()) // 中小: 全流试 pb=2/4, 选优并复用结果
+		if os.Getenv("HCAX_T") != "" {
+			fmt.Fprintf(os.Stderr, "[t] -> single-stream path\n")
+		}
+		t0 := time.Now()
+		var solidData []byte
+		if compSolidSize > 0 {
+			csf.Seek(0, io.SeekStart)
+			solidData, err = io.ReadAll(csf)
+			if err != nil {
+				fatal("读固实流: %v", err)
+			}
+		}
+		frame = be.compressLZMA2Best(solidData) // 中小: 全流试 pb=2/4, 选优并复用结果
+		if os.Getenv("HCAX_T") != "" {
+			fmt.Fprintf(os.Stderr, "[t] compressLZMA2Best %v\n", time.Since(t0))
+		}
 	}
 
 	out, err := os.Create(outPath)
@@ -465,12 +538,14 @@ func pack(inputs []string, outPath, mode string) {
 	// 元数据(块表+文件表) 序列化后一并压缩(v6): 明文元数据往往占归档一半以上, 压缩收益极大
 	// 流级校验哈希(替代逐块哈希: 逐块哈希是随机数, 不可压缩, 大量小文件时开销极大)
 	var solidHash, rawHash [8]byte
-	if compSolid.Len() > 0 {
-		h := hash16(compSolid.Bytes())
+	if compSolidSize > 0 {
+		csf.Seek(0, io.SeekStart)
+		h := hashReader(csf)
 		copy(solidHash[:], h[:8])
 	}
-	if rawRegion.Len() > 0 {
-		h := hash16(rawRegion.Bytes())
+	if rawRegionSize > 0 {
+		rsf.Seek(0, io.SeekStart)
+		h := hashReader(rsf)
 		copy(rawHash[:], h[:8])
 	}
 	metaRaw := serializeMeta(chunkMetas, fileEntries, solidHash, rawHash)
@@ -493,13 +568,16 @@ func pack(inputs []string, outPath, mode string) {
 	binary.Write(out, binary.LittleEndian, uint64(len(metaFrame)))
 	binary.Write(out, binary.LittleEndian, uint64(len(metaRaw)))
 	binary.Write(out, binary.LittleEndian, uint64(len(frame)))
-	binary.Write(out, binary.LittleEndian, uint64(rawRegion.Len()))
+	binary.Write(out, binary.LittleEndian, uint64(rawRegionSize))
 	binary.Write(out, binary.LittleEndian, uint32(len(chunkMetas)))
 	binary.Write(out, binary.LittleEndian, uint32(len(fileEntries)))
 	// 布局: metaFrame | dataFrame | rawRegion | dictRegion
 	out.Write(metaFrame)
 	out.Write(frame)
-	out.Write(rawRegion.Bytes())
+	if rawRegionSize > 0 {
+		rsf.Seek(0, io.SeekStart)
+		io.Copy(out, rsf)
+	}
 	out.Write(dictBuf.Bytes())
 	// trailer
 	out.WriteString(trailerMag)
