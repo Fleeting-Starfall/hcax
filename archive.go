@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -233,7 +234,6 @@ func collectPaths(inputs []string) (files []string, dirs []string, links []strin
 	return
 }
 
-// 只收普通文件: 其它类型(socket/fifo/设备/管道)无法有意义地归档
 func minInt(a, b int) int {
 	if a < b {
 		return a
@@ -241,6 +241,8 @@ func minInt(a, b int) int {
 	return b
 }
 
+// 只收普通文件: 其它类型(socket/fifo/设备/管道)无法有意义地归档,
+// 读它会阻塞(fifo)或直接失败(设备), 不该让整次打包报销。
 func isRegular(fi os.FileInfo) bool {
 	return fi.Mode()&os.ModeType == 0
 }
@@ -1257,6 +1259,53 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	os.Chtimes(target, time.Unix(int64(fe.mtime), 0), time.Unix(int64(fe.mtime), 0))
 }
 
+// 归一用户给出的抽取目标: 反斜杠按分隔符处理, 去掉结尾多余的分隔符,
+// 这样 "d/sub" 与 "d/sub/" 是同一个意思。
+func normAsk(s string) string {
+	s = filepath.ToSlash(s)
+	for len(s) > 1 && strings.HasSuffix(s, "/") {
+		s = s[:len(s)-1]
+	}
+	return s
+}
+
+// 判断归档内的一个条目是否被用户的某个抽取目标命中。三种命中方式(由精确到宽松):
+//  1. 完整路径相等:   "d/sub/r.bin"
+//  2. 基名相等:       "r.bin"   —— 记不住全路径时的兜底
+//  3. 目录前缀:       "d/sub"   —— 抽出该子树(含子树下的目录条目)
+//
+// 老实现只支持 1)2), 于是 extract 归档 d/sub 只会建出一个空的 d/sub 目录,
+// 里面的文件一个都没抽出来; 用户会以为命令成功、数据到手了。
+func matchEntry(name, ask string) bool {
+	n := filepath.ToSlash(name)
+	if n == ask {
+		return true
+	}
+	if path.Base(n) == ask {
+		return true
+	}
+	return strings.HasPrefix(n, ask+"/")
+}
+
+// 用户指定的目标一个都没命中, 十有八九是拼错了 —— 静默"抽取完成: 0 文件"
+// 会让人误以为成功。全部落空直接报错; 部分落空只警告(批量抽取时常见)。
+func reportUnmatched(asks []string, hit map[string]bool) {
+	var miss []string
+	for _, p := range asks {
+		if !hit[p] {
+			miss = append(miss, p)
+		}
+	}
+	if len(miss) == 0 {
+		return
+	}
+	msg := "归档中没有匹配 " + strings.Join(miss, ", ") + " 的条目"
+	if len(miss) == len(asks) {
+		fatal("%s(用 list 查看归档内的真实路径)", msg)
+	}
+	fmt.Fprintf(os.Stderr, "警告: %s\n", msg)
+}
+
 func unpack(archivePath, outDir string, verify bool, only []string) {
 	a := openArchive(archivePath)
 	if verify {
@@ -1272,16 +1321,22 @@ func unpack(archivePath, outDir string, verify bool, only []string) {
 		fmt.Printf("解包完成: %d 条目 -> %s  模式=%s 校验=%v\n", len(a.files), outDir, modeName(a.spec.code), verify)
 		return
 	}
-	set := map[string]bool{}
+	asks := make([]string, 0, len(only))
 	for _, o := range only {
-		set[o] = true
+		asks = append(asks, normAsk(o))
 	}
 	var want []fileEntry
+	hit := make(map[string]bool, len(asks))
 	for _, fe := range a.files {
-		if set[fe.name] || set[filepath.Base(fe.name)] {
-			want = append(want, fe)
+		for _, p := range asks {
+			if matchEntry(fe.name, p) {
+				want = append(want, fe)
+				hit[p] = true
+				break // 一个条目只解一次(多个条件同时命中时不重复)
+			}
 		}
 	}
+	reportUnmatched(asks, hit)
 	// 只解到目标文件的块末尾为止: 抽归档前部的小文件不必解压整条固实流
 	a.prepareFor(want)
 	for _, fe := range want {

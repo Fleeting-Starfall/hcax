@@ -136,6 +136,20 @@ if "$BIN" extract "$A" rx2 novel.txt records.json >/dev/null 2>&1 && \
    cmp -s corpus/novel.txt rx2/corpus/novel.txt && cmp -s corpus/records.json rx2/corpus/records.json; then
   ok "extract 多文件"; else bad "extract 多文件"; fi
 if "$BIN" unpack "$A" r_verify --verify >/dev/null 2>&1; then ok "unpack --verify"; else bad "unpack --verify"; fi
+# extract 给目录名: 应抽出整棵子树(旧实现只建出一个空目录, 里面的文件一个都没出来)
+rm -rf rx3
+if "$BIN" extract edge.hcax rx3 edge/deep >/dev/null 2>&1 && \
+   cmp -s edge/deep/rand.bin rx3/edge/deep/rand.bin; then
+  ok "extract 目录前缀抽出整棵子树"; else bad "extract 目录前缀"; fi
+# 抽不到的名字必须明确报错: 静默"抽取完成: 0 文件"会让人误以为拿到了数据
+rm -rf rx4
+if "$BIN" extract edge.hcax rx4 definitely-missing 2>&1 | grep -qE '没有匹配'; then
+  ok "extract 落空时明确报错"; else bad "extract 落空时静默成功"; fi
+# 部分落空: 命中的照常抽出, 落空的给警告(不因一条拼错就整次报销)
+rm -rf rx5
+if "$BIN" extract edge.hcax rx5 edge/deep/rand.bin nope 2>&1 | grep -qE '警告.*没有匹配' && \
+   cmp -s edge/deep/rand.bin rx5/edge/deep/rand.bin; then
+  ok "extract 部分落空: 警告但仍抽出命中的"; else bad "extract 部分落空处理"; fi
 
 # ---------------------------------------------------------------- 4. 损坏检测
 note "4. 损坏检测"

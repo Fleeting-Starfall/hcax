@@ -88,6 +88,7 @@ func applyXform(t byte, b []byte, decode bool) []byte {
 	}
 	return b
 }
+
 // 必须**倒序**遍历: 前向遍历时 b[i-d] 已经被改写过了, 算出来的就不是
 // "减原始值" 而是 "减上一层差分" —— 与 deltaXform(非 in-place)结果不同。
 // chooseTransform 用 in-place 版估算大小、却用非 in-place 版实际编码,
@@ -109,21 +110,35 @@ func bcjX86InPlace(b []byte, decode bool) {
 		default:
 			continue
 		}
-		if i+relOff+4 > n { continue }
+		if i+relOff+4 > n {
+			continue
+		}
 		p := i + relOff
 		addr := uint32(b[p]) | uint32(b[p+1])<<8 | uint32(b[p+2])<<16 | uint32(b[p+3])<<24
-		if decode { addr -= uint32(i) } else { addr += uint32(i) }
-		b[p] = byte(addr); b[p+1] = byte(addr >> 8); b[p+2] = byte(addr >> 16); b[p+3] = byte(addr >> 24)
+		if decode {
+			addr -= uint32(i)
+		} else {
+			addr += uint32(i)
+		}
+		b[p] = byte(addr)
+		b[p+1] = byte(addr >> 8)
+		b[p+2] = byte(addr >> 16)
+		b[p+3] = byte(addr >> 24)
 		i += relOff + 3
 	}
 }
 func applyXformInPlace(t byte, b []byte) {
 	switch t {
-	case xfDelta1: deltaInPlace(b, 1)
-	case xfDelta2: deltaInPlace(b, 2)
-	case xfDelta3: deltaInPlace(b, 3)
-	case xfDelta4: deltaInPlace(b, 4)
-	case xfBCJX86: bcjX86InPlace(b, false)
+	case xfDelta1:
+		deltaInPlace(b, 1)
+	case xfDelta2:
+		deltaInPlace(b, 2)
+	case xfDelta3:
+		deltaInPlace(b, 3)
+	case xfDelta4:
+		deltaInPlace(b, 4)
+	case xfBCJX86:
+		bcjX86InPlace(b, false)
 	}
 }
 
