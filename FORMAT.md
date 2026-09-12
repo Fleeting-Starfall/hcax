@@ -1,6 +1,6 @@
 # hcax 容器格式规范
 
-本文描述 `.hcax` 归档的**字节级布局**。实现见 `archive.go`（容器）、`backend.go`（后端）、
+本文描述 `.hcax` 归档的**字节级布局**。实现见 `format.go`（容器读写）、`pack.go`（写）、`unpack.go`（读）、`backend.go`（后端）、
 `chunker.go`（格式常量）。当前写入版本 **v11**，可读取 **v2 ~ v11**。
 
 约定：所有整数均为 **小端（little-endian）**，无对齐填充。路径分隔符按打包时的平台记录

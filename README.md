@@ -429,9 +429,13 @@ v8e 只把**打包**侧内存修好了，解包侧仍是"整条固实流 + 原�
 
 ```
 main.go        命令行入口 / 用法说明 / 参数解析
-archive.go     容器格式: pack / openArchive / unpack / extract / list / verify / 惰性解压
+format.go      容器格式: 条目类型 + 元数据序列化/解析 + 版本决策(字节级布局见 FORMAT.md)
+pack.go        打包侧: 收集输入 / --exclude / 分块去重 / 压缩 / 写容器
+unpack.go      解包侧: 打开归档 / 惰性展开固实流 / 还原文件·目录·符号链接·硬链接
+cmds.go        只读命令: list / info / verify(都不需要展开数据区)
+util.go        全局小工具: 清理钩子 / 报错退出 / 归档内路径安全
 backend.go     压缩后端: zstd / lzma2 / CM 调度, 门控判定, 参数自适应, 并行分组
-chunker.go     内容定长分块器(FastCDC gear hash) + 格式常量
+chunker.go     内容定长分块器(FastCDC gear hash)
 preprocess.go  预处理变换: DELTA / BCJ-x86 / 探测
 raster.go      光栅图: BMP/TGA/PNM 识别 + RCT 色彩去相关 + MED 二维预测 + 变换选优 + 字节熵
 cm.go          上下文混合(CM)压缩器: 算术编码 + 多模型 + 混合器 + SSE

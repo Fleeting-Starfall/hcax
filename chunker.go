@@ -3,71 +3,30 @@ package main
 import (
 	"crypto/sha256"
 	"math/rand"
-	"os"
 	"sync"
 )
 
 const (
-	magic      = "HCAX"
-	trailerMag = "XACH"
-	version    = 11 // v10: 文件表条目的时间改 int64 纳秒、权限改 uint32(带 setuid/setgid/sticky)
-	// 兼容读 v2~v10; 写的时候能不升就不升:
-	//   普通归档仍写 v8, 有符号链接才升 v9, 只有 v9 装不下的元数据才升 v10。
-	// 这样格式演进不破坏既有生态 —— 旧版二进制照样能解开新工具打的绝大多数包。
-	verCompat = 8
-	verLinks  = 9  // 需要符号链接条目
-	verExt    = 10 // 需要扩展时间/权限
-	verHard   = 11 // 需要硬链接条目
-
 	chunkBits = 16
 	chunkMin  = 8 * 1024
 	chunkMax  = 256 * 1024
 	mask64    = (1 << chunkBits) - 1
-
-	headerSize = 24 // v2 头长; v3+ 头长 32(后续再读 8 字节 rawLen)
 )
-
-// 该写哪个版本? 逐条检查: 只要有一个条目用了高版本才装得下的特性, 就整体升上去
-// (容器只有一个版本号, 不能每个条目各写各的)。
-// precise = 用户显式要求纳秒时间戳(-T/--precise-times)
-func writeVer(files []fileEntry, precise bool) byte {
-	if precise {
-		return verExt
-	}
-	v := byte(verCompat)
-	for i := range files {
-		fe := &files[i]
-		if fe.isLink && v < verLinks {
-			v = verLinks
-		}
-		if fe.isHard && v < verHard {
-			v = verHard
-		}
-		if v >= verExt {
-			continue
-		}
-		// v9 及以前: 权限只有 0777, 时间是 uint32 秒 —— 这两个存不下才升 v10
-		if fe.mode&^uint32(os.ModePerm) != 0 || !fitsOldTime(fe.nano) {
-			v = verExt
-		}
-	}
-	return v
-}
-
-// 亚秒部分**不算**必须升版本的理由: 现实里几乎所有文件都带亚秒时间戳(APFS/ext4
-// 都是纳秒级), 若因此一律写 v10, 等于让每一个新归档都与旧版二进制绝缘 —— 为了
-// 一点点精度牺牲兼容性不值得。所以默认按秒存(与 tar 一致), 只有用户显式
-// 要求 -T、或归档本来就要升 v10 时才把纳秒一起存下来。
-func fitsOldTime(nano int64) bool {
-	if nano == 0 {
-		return true // 没有可用时间戳, 存 0 即可, 不必为此升版本
-	}
-	sec := nano / 1e9
-	return sec >= 0 && sec <= 0xFFFFFFFF
-}
 
 // 不可压判定阈值: 廉价 zstd-l1 压缩后若输出 >= 输入(完全压不动)才原样存储;
 // 只要 l1 能缩小一点点, 就交真压缩器(可能压得更好), 避免误丢压率
+
+type chunker struct {
+	rh      uint64
+	start   int
+	scanned int
+	pending []byte
+	minS    int
+	maxS    int
+	mask    uint64
+	gear    [256]uint64
+	onChunk func([]byte)
+}
 
 var gear = func() [256]uint64 {
 	var g [256]uint64
