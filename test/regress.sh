@@ -178,6 +178,22 @@ rm -rf eo_out
 if "$BIN" unpack eo.hcax eo_out >/dev/null 2>&1 && [ -d eo_out/emptyonly/sub ] && [ -f eo_out/emptyonly/zero.bin ]; then
   ok "全空内容可解包(目录与空文件都在)"; else bad "全空内容解包异常"; fi
 
+
+# 健壮性: 目录里有无权限文件或 FIFO 时, 旧版要么整个失败, 要么在 os.Open(FIFO) 处永久阻塞
+mkdir -p robo
+printf 'good data\n' > robo/ok.txt
+printf 'secret\n' > robo/locked.txt
+chmod 000 robo/locked.txt
+if command -v mkfifo >/dev/null 2>&1; then mkfifo robo/pipe 2>/dev/null; fi
+# 不用 timeout: macOS 默认没有 GNU coreutils 的 timeout
+if "$BIN" pack robo.hcax robo -m fast >/dev/null 2>&1; then
+  ok "含无权限文件/FIFO 仍能完成打包(不失败、不卡死)"
+else
+  bad "含无权限文件/FIFO 时打包失败或卡死"
+fi
+if "$BIN" list robo.hcax 2>/dev/null | grep -q 'robo/ok.txt'; then ok "可读文件仍被归档"; else bad "可读文件丢失"; fi
+chmod 644 robo/locked.txt
+
 note "5. 资源与卫生"
 count_tmp() { find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'hcax-solid-*' -o -maxdepth 1 -name 'hcax-raw-*' 2>/dev/null | wc -l | tr -d ' '; }
 before=$(count_tmp)

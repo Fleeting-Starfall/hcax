@@ -215,17 +215,37 @@ func collectPaths(inputs []string) (files []string, dirs []string, links []strin
 					links = append(links, q)
 				} else if info.IsDir() {
 					dirs = append(dirs, q)
+				} else if !isRegular(info) {
+					// socket / fifo / 设备节点: 读它会阻塞或直接失败,
+					// 备份整个目录时不该因为这一个条目就让整次打包报销
+					skipped = append(skipped, q)
 				} else {
 					files = append(files, q)
 				}
 				return nil
 			})
+		} else if !isRegular(fi) {
+			skipped = append(skipped, p)
 		} else {
 			files = append(files, p)
 		}
 	}
 	return
 }
+
+// 只收普通文件: 其它类型(socket/fifo/设备/管道)无法有意义地归档
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func isRegular(fi os.FileInfo) bool {
+	return fi.Mode()&os.ModeType == 0
+}
+
+var skipped []string // 被跳过的非普通文件(打包结束时一并报告)
 
 func commonRoot(paths []string) string {
 	if len(paths) == 0 {
@@ -346,7 +366,10 @@ func pack(inputs []string, outPath, mode string) {
 		}
 		f, err := os.Open(fp)
 		if err != nil {
-			fatal("open %s: %v", fp, err)
+			// 单个文件读不到(权限/被删除)不该让整次备份报销: 警告并跳过
+			fmt.Fprintf(os.Stderr, "警告: 跳过无法读取的文件 %s: %v\n", fp, err)
+			skipped = append(skipped, fp)
+			continue
 		}
 		rel := storedName(fp, root)
 		st, _ := f.Stat()
@@ -719,6 +742,16 @@ func pack(inputs []string, outPath, mode string) {
 	runCleanups() // 成功路径也要删临时文件(清理钩子本身幂等, 重复执行无副作用)
 	fmt.Printf("打包完成: %s  原始 %d B -> %d B  压率 %s  模式=%s  唯一块=%d(可压%d/原样%d)\n",
 		outPath, raw, sz.Size(), ratio, mode, len(chunkMetas), nComp, nStored)
+	if len(skipped) > 0 {
+		fmt.Printf("跳过 %d 个条目(无权限或非普通文件): %s%s\n",
+			len(skipped), strings.Join(skipped[:minInt(3, len(skipped))], ", "),
+			func() string {
+				if len(skipped) > 3 {
+					return fmt.Sprintf(" 等 %d 个", len(skipped))
+				}
+				return ""
+			}())
+	}
 }
 
 // ---------- read archive ----------
