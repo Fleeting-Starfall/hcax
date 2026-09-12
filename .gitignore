@@ -1,0 +1,21 @@
+# 编译产物
+/hcax
+/hcax.exe
+*.test
+
+# 归档与测试数据
+*.hcax
+*.7z
+*.zip
+*.xz
+testdata/
+bench-out/
+
+# 早期原型与中间产物(保留在本地, 不入库)
+_legacy_prototype/
+
+# 编辑器/系统
+.DS_Store
+*.swp
+.idea/
+.vscode/
