@@ -167,6 +167,17 @@ PYX
 if "$BIN" list badhdr.hcax >/dev/null 2>&1; then bad "荒谬 nChunks 被接受"; else ok "荒谬 nChunks 被拒绝"; fi
 if "$BIN" list badhdr.hcax 2>&1 | grep -qE '损坏|异常'; then ok "头部损坏报错明确"; else bad "头部损坏报错含糊"; fi
 
+
+# 全空内容(只有空目录与空文件): 老实现压率除零输出 +Inf%
+mkdir -p emptyonly/sub
+: > emptyonly/zero.bin
+: > emptyonly/sub/zero2.bin
+if "$BIN" pack eo.hcax emptyonly -m best >/dev/null 2>&1; then ok "全空内容可打包"; else bad "全空内容打包失败"; fi
+if "$BIN" pack eo.hcax emptyonly -m best 2>/dev/null | grep -q 'Inf\|NaN'; then bad "全空内容压率出现 Inf/NaN"; else ok "全空内容压率不出现 Inf/NaN"; fi
+rm -rf eo_out
+if "$BIN" unpack eo.hcax eo_out >/dev/null 2>&1 && [ -d eo_out/emptyonly/sub ] && [ -f eo_out/emptyonly/zero.bin ]; then
+  ok "全空内容可解包(目录与空文件都在)"; else bad "全空内容解包异常"; fi
+
 note "5. 资源与卫生"
 count_tmp() { find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'hcax-solid-*' -o -maxdepth 1 -name 'hcax-raw-*' 2>/dev/null | wc -l | tr -d ' '; }
 before=$(count_tmp)

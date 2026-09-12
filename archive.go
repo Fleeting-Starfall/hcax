@@ -711,9 +711,14 @@ func pack(inputs []string, outPath, mode string) {
 
 	sz, _ := out.Stat()
 	raw := totalUncomp
+	// 全是空文件/空目录时 raw==0, 直接除会得到 +Inf% —— 显示成 "-" 更诚实
+	ratio := "-"
+	if raw > 0 {
+		ratio = fmt.Sprintf("%.2f%%", 100.0*float64(sz.Size())/float64(raw))
+	}
 	runCleanups() // 成功路径也要删临时文件(清理钩子本身幂等, 重复执行无副作用)
-	fmt.Printf("打包完成: %s  原始 %d B -> %d B  压率 %.2f%%  模式=%s  唯一块=%d(可压%d/原样%d)\n",
-		outPath, raw, sz.Size(), 100.0*float64(sz.Size())/float64(raw), mode, len(chunkMetas), nComp, nStored)
+	fmt.Printf("打包完成: %s  原始 %d B -> %d B  压率 %s  模式=%s  唯一块=%d(可压%d/原样%d)\n",
+		outPath, raw, sz.Size(), ratio, mode, len(chunkMetas), nComp, nStored)
 }
 
 // ---------- read archive ----------
@@ -1231,7 +1236,7 @@ func unpack(archivePath, outDir string, verify bool, only []string) {
 			a.extractFile(fe, outDir, verify)
 		}
 		runCleanups()
-		fmt.Printf("解包完成: %d 文件 -> %s  模式=%s 校验=%v\n", len(a.files), outDir, modeName(a.spec.code), verify)
+		fmt.Printf("解包完成: %d 条目 -> %s  模式=%s 校验=%v\n", len(a.files), outDir, modeName(a.spec.code), verify)
 		return
 	}
 	set := map[string]bool{}
@@ -1276,7 +1281,7 @@ func listArchive(archivePath string) {
 		}
 		tot += fe.size
 	}
-	fmt.Printf("共 %d 文件, 原大小 %d B, 唯一块 %d\n", len(a.files), tot, len(a.chunks))
+	fmt.Printf("共 %d 条目, 原大小 %d B, 唯一块 %d\n", len(a.files), tot, len(a.chunks))
 }
 
 // info: 打印容器内部布局。配合 FORMAT.md 用来核对/调试格式 —— 光看归档大小
