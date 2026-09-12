@@ -779,6 +779,7 @@ func openArchive(path string) *archive {
 		// 3) 数据区: 只记录位置, 不读不解压 —— 按需(惰性)解压见 ensureSolid
 		a := &archive{spec: spec, be: be, src: f, dataStart: dataOff,
 			compLen: int64(compLen), rawOff: rawOff, rawLen: int64(rawLen),
+			metaCompLen: int64(metaCompLen), metaRawLen: int64(metaRawLen),
 			chunks: chunks, files: files, hashLen: 0,
 			solidHash: sh, rawHash: rh, ver: ver}
 		a.checkCounts()
@@ -1255,6 +1256,67 @@ func listArchive(archivePath string) {
 		tot += fe.size
 	}
 	fmt.Printf("共 %d 文件, 原大小 %d B, 唯一块 %d\n", len(a.files), tot, len(a.chunks))
+}
+
+// info: 打印容器内部布局。配合 FORMAT.md 用来核对/调试格式 —— 光看归档大小
+// 无法判断"到底是数据压得好, 还是元数据占了大头"、"有没有走原样存储"这些问题。
+func infoArchive(archivePath string) {
+	a := openArchive(archivePath)
+	fi, _ := a.src.Stat()
+	sz := fi.Size()
+	var nStored, nComp, rawSum uint64
+	var nLink, nDir int
+	for i := range a.chunks {
+		if a.chunks[i].stored {
+			nStored++
+		} else {
+			nComp++
+		}
+		rawSum += uint64(a.chunks[i].uncomp)
+	}
+	for i := range a.files {
+		if a.files[i].isDir {
+			nDir++
+		} else if a.files[i].isLink {
+			nLink++
+		}
+	}
+	dictLen := sz - 20 - (a.rawOff + a.rawLen)
+	if dictLen < 0 {
+		dictLen = 0
+	}
+	pct := func(n, d int64) string {
+		if d <= 0 {
+			return "-"
+		}
+		return fmt.Sprintf("%.2f%%", 100.0*float64(n)/float64(d))
+	}
+	fmt.Printf("归档: %s\n", archivePath)
+	fmt.Printf("  版本      v%d\n", a.ver)
+	fmt.Printf("  模式      %s (后端 %s)\n", modeName(a.spec.code), a.spec.backend)
+	fmt.Printf("  条目      %d 个 (文件 %d / 目录 %d / 链接 %d)\n",
+		len(a.files), len(a.files)-nDir-nLink, nDir, nLink)
+	fmt.Printf("  块        %d (可压 %d / 原样 %d)\n", len(a.chunks), nComp, nStored)
+	fmt.Printf("  块数据    %d B (去重后)\n", rawSum)
+	fmt.Printf("  归档大小  %d B\n", sz)
+	fmt.Printf("---- 布局 ----\n")
+	hdrLen := int64(48)
+	if a.ver < 6 {
+		hdrLen = a.dataStart // v2=24, v3~v5=32
+	}
+	fmt.Printf("  头部      %d B\n", hdrLen)
+	fmt.Printf("  元数据    %d B (压缩) -> %d B (原始)\n", a.metaCompLen, a.metaRawLen)
+	fmt.Printf("  数据区    %d B  %s\n", a.compLen, pct(a.compLen, sz))
+	fmt.Printf("  原样区    %d B  %s\n", a.rawLen, pct(a.rawLen, sz))
+	fmt.Printf("  字典区    %d B  %s\n", dictLen, func() string {
+		if dictLen > 8 {
+			return "含训练字典"
+		}
+		return "无"
+	}())
+	fmt.Printf("  尾部      %d B\n", int64(20))
+	fmt.Printf("  合计      %d B (文件 %d B)\n", a.dataStart+a.compLen+a.rawLen+dictLen+20, sz)
+	runCleanups()
 }
 
 func verifyArchive(archivePath string) {

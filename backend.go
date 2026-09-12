@@ -545,10 +545,12 @@ type archive struct {
 	dataStart int64
 
 	// 归档文件句柄: 原样区/数据区按需 ReadAt, 不再整段读进内存
-	src     *os.File
-	compLen int64 // 压缩帧字节数
-	rawOff  int64 // 原样区在归档文件中的偏移
-	rawLen  int64
+	src         *os.File
+	compLen     int64 // 压缩帧字节数
+	metaCompLen int64 // 元数据帧压缩后长度
+	metaRawLen  int64 // 元数据解压后长度
+	rawOff      int64 // 原样区在归档文件中的偏移
+	rawLen      int64
 
 	// 固实流解压结果落临时文件(与打包侧 v8e 对称), 且**惰性解压**:
 	// 只有真正要读某个块时才解压到该块末尾为止。

@@ -18,6 +18,7 @@ func usage() {
 	fmt.Println("  hcax extract 输入.hcax 输出目录 [文件...] [--verify]")
 	fmt.Println("  hcax list   输入.hcax")
 	fmt.Println("  hcax verify 输入.hcax")
+	fmt.Println("  hcax info   输入.hcax   # 容器布局详情(版本/各区大小/块数)")
 }
 
 func main() {
@@ -93,6 +94,11 @@ func main() {
 			fatal("verify 需要 输入")
 		}
 		verifyArchive(os.Args[2])
+	case "info":
+		if len(os.Args) < 3 {
+			fatal("info 需要 输入")
+		}
+		infoArchive(os.Args[2])
 	default:
 		usage()
 		os.Exit(1)
