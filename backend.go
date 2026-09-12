@@ -32,7 +32,7 @@ var modes = map[string]modeSpec{
 	"fast":  {0, "zstd", 3, 0, false, false},
 	"best":  {1, "zstd", 19, 27, false, false},
 	"max":   {2, "lzma2", 9, 27, false, true},
-	"ultra": {3, "lzma2", 9, 27, true, false},
+	"ultra": {3, "lzma2", 9, 27, false, false}, // v8b: 关固实(去重), 内存从 ~1.8GB 降到 ~max 级(~86MB); 仍单流全流选参保压率(区别于 max 的并行)
 	"text":  {4, "cm", 0, 0, false, false}, // 上下文混合: 对文本/代码/源数据极高压缩率(纯算法, 慢)
 }
 
