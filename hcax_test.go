@@ -8,6 +8,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"math/rand"
 	"testing"
 )
@@ -81,15 +82,15 @@ func TestSafeName(t *testing.T) {
 	}{
 		{"a.txt", true},
 		{"dir/a.txt", true},
-		{"a..b.txt", true},      // 合法: 连续两个点只是文件名的一部分
-		{"..weird.txt", true},   // 合法: Unix 下这就是个普通文件名
-		{"a/../b.txt", false},   // 逃逸
-		{"../b.txt", false},     // 逃逸
-		{"..", false},           // 逃逸
-		{"a/..", false},         // 逃逸
-		{"/etc/passwd", false},  // 绝对路径
-		{"", false},             // 空名
-		{`a\..\b.txt`, false},   // Windows 风格逃逸(Unix 上 \ 是合法字符, 但仍要挡)
+		{"a..b.txt", true},     // 合法: 连续两个点只是文件名的一部分
+		{"..weird.txt", true},  // 合法: Unix 下这就是个普通文件名
+		{"a/../b.txt", false},  // 逃逸
+		{"../b.txt", false},    // 逃逸
+		{"..", false},          // 逃逸
+		{"a/..", false},        // 逃逸
+		{"/etc/passwd", false}, // 绝对路径
+		{"", false},            // 空名
+		{`a\..\b.txt`, false},  // Windows 风格逃逸(Unix 上 \ 是合法字符, 但仍要挡)
 	}
 	for _, c := range cases {
 		if got := safeName(c.name); got != c.ok {
@@ -105,11 +106,11 @@ func TestCommonRoot(t *testing.T) {
 		in   []string
 		want string
 	}{
-		{[]string{"dir"}, "."},                        // 打包一个目录 -> 保留目录名
-		{[]string{"dir/a.txt"}, "dir"},                // 打包单个文件 -> 只存文件名
-		{[]string{"a.txt", "b.txt"}, "."},             //
-		{[]string{"d1", "d2"}, "."},                   // 多个顶层目录
-		{[]string{"/x/y/z", "/x/y/w"}, "/x/y"},        // 绝对路径: 不能丢掉开头的 /
+		{[]string{"dir"}, "."},                 // 打包一个目录 -> 保留目录名
+		{[]string{"dir/a.txt"}, "dir"},         // 打包单个文件 -> 只存文件名
+		{[]string{"a.txt", "b.txt"}, "."},      //
+		{[]string{"d1", "d2"}, "."},            // 多个顶层目录
+		{[]string{"/x/y/z", "/x/y/w"}, "/x/y"}, // 绝对路径: 不能丢掉开头的 /
 		{[]string{"/x/y/a.txt", "/x/y/b.txt"}, "/x/y"},
 	}
 	for _, c := range cases {
@@ -209,5 +210,109 @@ func TestCMRoundTrip(t *testing.T) {
 	dec := cmDecompress(enc)
 	if !bytes.Equal(dec, src) {
 		t.Fatal("CM 解压结果与原文不一致")
+	}
+}
+
+// ---------- 光栅变换可逆(文件级, 一旦不可逆整个图片就废了) ----------
+
+func makeTestBMP(w, h, bpp int) []byte {
+	rowSize := ((w*bpp/8 + 3) / 4) * 4
+	pixSize := rowSize * h
+	off := 14 + 40
+	b := make([]byte, off+pixSize)
+	b[0], b[1] = 'B', 'M'
+	binary.LittleEndian.PutUint32(b[2:], uint32(len(b)))
+	binary.LittleEndian.PutUint32(b[10:], uint32(off))
+	binary.LittleEndian.PutUint32(b[14:], 40)
+	binary.LittleEndian.PutUint32(b[18:], uint32(w))
+	binary.LittleEndian.PutUint32(b[22:], uint32(h))
+	binary.LittleEndian.PutUint16(b[26:], 1) // planes
+	binary.LittleEndian.PutUint16(b[28:], uint16(bpp))
+	// 像素填成带梯度的内容(全 0 的话压不压都一样, 测不出问题)
+	rng := rand.New(rand.NewSource(99))
+	for i := off; i < len(b); i++ {
+		b[i] = byte(rng.Intn(256))
+	}
+	return b
+}
+
+func TestRasterRoundTrip(t *testing.T) {
+	for _, bpp := range []int{8, 24, 32} {
+		src := makeTestBMP(17, 9, bpp)
+		for _, xf := range []byte{xfRasterMed, xfRasterRctMed} {
+			buf := append([]byte(nil), src...)
+			if !rasterApply(xf, buf, true) {
+				continue // 该 bpp 不支持此变换(如灰度图无 RCT)
+			}
+			if bytes.Equal(buf, src) {
+				t.Fatalf("bpp=%d xform=%d: 正向变换后数据没变(可能是空操作)", bpp, xf)
+			}
+			if !rasterApply(xf, buf, false) {
+				t.Fatalf("bpp=%d xform=%d: 逆变换失败", bpp, xf)
+			}
+			if !bytes.Equal(buf, src) {
+				t.Fatalf("bpp=%d xform=%d: 逆变换后与原文不一致(图片会损坏)", bpp, xf)
+			}
+		}
+	}
+}
+
+// ---------- 元数据序列化/解析往返 ----------
+
+func TestMetaRoundTrip(t *testing.T) {
+	chunks := []*chunkMeta{
+		{uncomp: 100, xform: xfDelta3, offset: 0},
+		{uncomp: 200, stored: true, offset: 0, dictID: 1},
+		{uncomp: 300, xform: xfBCJX86},
+	}
+	files := []fileEntry{
+		{name: "a/b.txt", size: 100, mtime: 12345, mode: 0644, chunks: []uint32{0, 1}},
+		{name: "dir", isDir: true, mode: 0755},
+		{name: "link", isLink: true, link: "a/b.txt", size: 8},
+		{name: "img.bmp", size: 900, mode: 0644, chunks: []uint32{2}, xform: xfRasterRctMed},
+	}
+	var sh, rh [8]byte
+	copy(sh[:], []byte{1, 2, 3, 4, 5, 6, 7, 8})
+	copy(rh[:], []byte{8, 7, 6, 5, 4, 3, 2, 1})
+	raw := serializeMeta(chunks, files, sh, rh)
+
+	gotChunks, gotFiles, gotSH, gotRH := parseMeta(raw, uint32(len(chunks)), uint32(len(files)), version)
+
+	if gotSH != sh || gotRH != rh {
+		t.Fatal("流级哈希往返不一致")
+	}
+	if len(gotChunks) != len(chunks) || len(gotFiles) != len(files) {
+		t.Fatalf("条目数不符: 块 %d/%d 文件 %d/%d", len(gotChunks), len(chunks), len(gotFiles), len(files))
+	}
+	for i := range chunks {
+		if gotChunks[i].uncomp != chunks[i].uncomp || gotChunks[i].stored != chunks[i].stored ||
+			gotChunks[i].xform != chunks[i].xform || (gotChunks[i].dictID != 0) != (chunks[i].dictID != 0) {
+			t.Errorf("块 %d 往返不一致: %+v vs %+v", i, gotChunks[i], chunks[i])
+		}
+	}
+	for i := range files {
+		g, w := gotFiles[i], files[i]
+		if g.name != w.name || g.size != w.size || g.mtime != w.mtime || g.mode != w.mode ||
+			g.isDir != w.isDir || g.isLink != w.isLink || g.link != w.link || g.xform != w.xform {
+			t.Errorf("文件 %d 往返不一致: %+v vs %+v", i, g, w)
+		}
+		if len(g.chunks) != len(w.chunks) {
+			t.Errorf("文件 %d 块索引数不一致", i)
+		}
+	}
+	// 块偏移: 可压块与原样块各自顺序累加(v6 起不再存偏移)
+	var compOff, rawOff uint64
+	for i, c := range gotChunks {
+		if c.stored {
+			if c.offset != rawOff {
+				t.Errorf("块 %d 原样偏移 %d 期望 %d", i, c.offset, rawOff)
+			}
+			rawOff += uint64(c.uncomp)
+		} else {
+			if c.offset != compOff {
+				t.Errorf("块 %d 固实偏移 %d 期望 %d", i, c.offset, compOff)
+			}
+			compOff += uint64(c.uncomp)
+		}
 	}
 }
