@@ -69,6 +69,12 @@ if [ -x "$REF" ]; then
   # 含链接的归档应当被老版本明确拒绝(而不是解出错误数据)
   if "$REF" list a_max.hcax >/dev/null 2>&1; then
     bad "含链接的 v9 归档被老版接受了(应当拒绝)"; else ok "含链接的 v9 归档被老版明确拒绝"; fi
+  # CM(text) 码流必须与参考版逐字节一致: CM 只能做"不改变数值路径"的实现优化,
+  # 一旦改了模型/混合逻辑, 旧 text 归档就再也解不开了 —— 这条用例专门拦它
+  head -c 300000 c2/novel.txt > t.txt
+  "$REF" pack t_ref.hcax t.txt -m text >/dev/null 2>&1
+  "$BIN" pack t_new.hcax t.txt -m text >/dev/null 2>&1
+  if cmp -s t_ref.hcax t_new.hcax; then ok "CM(text) 码流与参考版逐字节一致"; else bad "CM 码流变了(会破坏旧 text 归档)"; fi
 else
   printf '  \033[33mSKIP\033[0m 未找到参考版二进制 %s\n' "$REF"
 fi

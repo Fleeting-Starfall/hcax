@@ -230,6 +230,12 @@ type cmCodec struct {
 	// 逐 bit 状态
 	c0   uint32
 	bpos int
+	// 每个 bit 的中间结果缓存: predict 算好给 update 复用。
+	// 原实现 update 会把 7 个上下文哈希重算一遍(每 bit 14 次 -> 7 次),
+	// 且 st 数组按值返回/传参, 每 bit 多拷两趟 36B。
+	// 纯实现优化: 数值路径不变, 压缩输出逐字节一致。
+	idx [cmNM]uint32
+	st  [cmNI]int32
 	// SSE
 	apm1 *apm
 	apm2 *apm
@@ -262,20 +268,30 @@ func newCMCodec() *cmCodec {
 	return c
 }
 
-func ctxIdx(cx uint32, bits int, c0 uint32) uint32 {
+// 每个模型的表大小掩码预计算好, 免得每 bit 每模型都重算一次移位
+var cmMask = func() [cmNM]uint32 {
+	var m [cmNM]uint32
+	for i, b := range cmTblBits {
+		m[i] = uint32((1 << uint(b)) - 1)
+	}
+	return m
+}()
+
+func ctxIdx(cx uint32, i int, c0 uint32) uint32 {
 	h := cx*2654435761 + 0x9e3779b9
 	h ^= h >> 15
 	h *= 2246822519
 	h ^= h >> 13
-	mask := uint32((1 << uint(bits)) - 1)
-	return (h + c0*0x7feb352d) & mask
+	return (h + c0*0x7feb352d) & cmMask[i]
 }
 
-// 返回: 最终 12-bit P(1), 混合器自身 12-bit P(1), 各输入 stretch 值
-func (c *cmCodec) predict() (uint32, uint32, [cmNI]int32) {
-	var st [cmNI]int32
+// 返回: 最终 12-bit P(1), 混合器自身 12-bit P(1)(用于训练权重)。
+// 上下文索引与各模型 stretch 值缓存在 c.idx / c.st, 供 update 复用。
+func (c *cmCodec) predict() (uint32, uint32) {
+	st := c.st[:]
 	for i := 0; i < cmNM; i++ {
-		idx := ctxIdx(c.cx[i], cmTblBits[i], c.c0)
+		idx := ctxIdx(c.cx[i], i, c.c0)
+		c.idx[i] = idx
 		st[i] = stretchT[c.tbls[i].p16(idx)>>4]
 	}
 	// 匹配模型
@@ -318,12 +334,13 @@ func (c *cmCodec) predict() (uint32, uint32, [cmNI]int32) {
 	} else if p12 > 4094 {
 		p12 = 4094
 	}
-	return uint32(p12), uint32(pMix), st
+	return uint32(p12), uint32(pMix)
 }
 
-func (c *cmCodec) update(bit int, pMix uint32, st [cmNI]int32) {
+func (c *cmCodec) update(bit int, pMix uint32) {
+	st := c.st[:]
 	for i := 0; i < cmNM; i++ {
-		c.tbls[i].update(ctxIdx(c.cx[i], cmTblBits[i], c.c0), bit)
+		c.tbls[i].update(c.idx[i], bit)
 	}
 	target := int32(4096)
 	if bit == 0 {
@@ -403,9 +420,9 @@ func cmCompress(data []byte) []byte {
 	for _, b := range data {
 		for i := 7; i >= 0; i-- {
 			bit := int((b >> uint(i)) & 1)
-			p, pm, st := c.predict()
+			p, pm := c.predict()
 			c.enc.encode(bit, p)
-			c.update(bit, pm, st)
+			c.update(bit, pm)
 		}
 		c.byteDone(b)
 	}
@@ -439,9 +456,9 @@ func cmDecompressTo(w io.Writer, frame []byte) error {
 	for j := uint64(0); j < n; j++ {
 		var b byte
 		for i := 7; i >= 0; i-- {
-			p, pm, st := c.predict()
+			p, pm := c.predict()
 			bit := c.dec.decode(p)
-			c.update(bit, pm, st)
+			c.update(bit, pm)
 			b = (b << 1) | byte(bit)
 		}
 		buf[bn] = b
