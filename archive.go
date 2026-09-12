@@ -196,9 +196,11 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 		nc := int(binary.LittleEndian.Uint32(m[pos : pos+4]))
 		pos += 4
 		need(m, pos, 4*nc, "文件块索引")
-		if nc > 0 && uint32(nc) > nChunks {
-			fatal("元数据损坏: 文件 %s 引用了 %d 个块, 但块表只有 %d 项", files[i].name, nc, nChunks)
-		}
+		// 不能拿"文件引用的块数"去和"块表条目数"比大小: 去重之后同一个块会被
+		// 引用多次, 引用数**必然**可以大于唯一块数(一个 35MB 全零文件只对应
+		// 2 个唯一块, 却要引用 134 次)。老检查在这里直接判"元数据损坏",
+		// 于是内部重复度高的归档打得开、解不开 —— 数据被自己锁死。
+		// 只对逐个索引做上界检查(下面那个循环)。
 		idxs := make([]uint32, nc)
 		for j := range idxs {
 			idxs[j] = binary.LittleEndian.Uint32(m[pos : pos+4])
@@ -1155,6 +1157,22 @@ func (a *archive) checkCounts() {
 	}
 }
 
+// addProgress 累加已解出字节并按阈值回报进度。
+// 解包几百 MB 的归档要跑几十秒, 全程无反馈跟卡死没区别(打包侧早就有了, 解包侧一直缺)。
+func (a *archive) addProgress(n uint64) {
+	if !a.progShow || a.progTotal == 0 || a.progDone >= a.progTotal {
+		return // 已报完 100% 就别再打了(后续 0 字节的目录条目还会进来)
+	}
+	a.progDone += n
+	if a.progDone-a.progLast >= 16<<20 || a.progDone >= a.progTotal {
+		a.progLast = a.progDone
+		fmt.Fprintf(os.Stderr, "\r  解包中 %.0f%%   ", 100.0*float64(a.progDone)/float64(a.progTotal))
+		if a.progDone >= a.progTotal {
+			fmt.Fprintln(os.Stderr)
+		}
+	}
+}
+
 // 惰性解压固实流到至少 need 字节为止。
 // 首次调用时才建临时文件与解压器; 后续若已解压够长则直接返回(零成本)。
 // 关键收益: (1) list/verify 这类不需要数据的命令不再解压; (2) extract 只抽归档前部的
@@ -1290,6 +1308,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	if !safeName(fe.name) {
 		fatal("非法路径: %s", fe.name)
 	}
+	defer a.addProgress(fe.size) // 所有 return 分支都要计入进度
 	target := joinOut(outDir, fe.name)
 	// 目录条目(含空目录): 直接建目录
 	if fe.isDir {
@@ -1448,12 +1467,26 @@ func reportUnmatched(asks []string, hit map[string]bool) {
 	fmt.Fprintf(os.Stderr, "警告: %s\n", msg)
 }
 
+// 只有"够大"才显示进度: 小归档一闪而过, 进度反而成了噪音
+func (a *archive) setProgress(items []fileEntry) {
+	var tot uint64
+	for _, fe := range items {
+		tot += fe.size
+	}
+	if tot < 32<<20 {
+		return
+	}
+	a.progShow = true
+	a.progTotal = tot
+}
+
 func unpack(archivePath, outDir string, verify bool, only []string) {
 	a := openArchive(archivePath)
 	if verify {
 		a.verifyStream() // v6 流级校验(旧版为空操作, 由 readChunk 逐块校验)
 	}
 	os.MkdirAll(outDir, 0o755)
+	a.setProgress(a.files)
 	if len(only) == 0 {
 		// 全量解包: 顺序读取, 固实流按需推进即可
 		for _, fe := range a.files {
@@ -1479,6 +1512,7 @@ func unpack(archivePath, outDir string, verify bool, only []string) {
 		}
 	}
 	reportUnmatched(asks, hit)
+	a.setProgress(want)
 	// 只解到目标文件的块末尾为止: 抽归档前部的小文件不必解压整条固实流
 	a.prepareFor(want)
 	for _, fe := range want {

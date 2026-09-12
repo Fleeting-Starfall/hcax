@@ -572,6 +572,12 @@ type archive struct {
 	solidSize int64     // 已解压字节数
 	solidEOF  bool      // 流已到底
 
+	// 解包进度(与打包侧的进度对称): 只写 stderr, 不污染 stdout 的机器可读输出
+	progShow  bool
+	progDone  uint64
+	progLast  uint64
+	progTotal uint64
+
 	chunks    []chunkMeta
 	files     []fileEntry
 	ver       byte // 归档格式版本(v7 起文件级变换显式记录; 更早版本靠启发式判断)

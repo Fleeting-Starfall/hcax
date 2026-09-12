@@ -233,6 +233,33 @@ else
   printf '  \033[33mSKIP\033[0m 当前文件系统不支持硬链接\n'
 fi
 
+# 解包进度: 大归档要有反馈(打包侧早就有, 解包侧一直缺), 小归档不该有噪音
+mkdir -p progb && head -c 35000000 /dev/zero > progb/z.bin
+if "$BIN" pack progb.hcax progb -m fast >/dev/null 2>&1; then ok "进度用大语料打包"; else bad "进度用大语料打包失败"; fi
+rm -rf progb_out
+if "$BIN" unpack progb.hcax progb_out 2>&1 >/dev/null | grep -q '解包中'; then
+  ok "大归档解包有进度反馈"; else bad "大归档解包无进度"; fi
+rm -rf progb_out2
+if "$BIN" unpack edge.hcax progb_out2 2>&1 >/dev/null | grep -q '解包中'; then
+  bad "小归档也打进度(噪音)"; else ok "小归档不打进度"; fi
+
+# 高内部重复度的文件: 引用块数 >> 唯一块数。
+# 旧代码拿"文件引用的块数"和"块表条目数"比大小, 认定引用数不可能超过唯一块数 ——
+# 而去重的意义恰恰就是多次引用同一块。结果这类归档打得开、却再也解不开(被自己锁死)。
+mkdir -p repd
+"$PY" -c "
+blk = b'hcax' * 16384          # 64KB 一段
+with open('repd/r.bin', 'wb') as f:
+    for _ in range(200):
+        f.write(blk)
+"
+if "$BIN" pack repd.hcax repd -m fast >/dev/null 2>&1; then ok "高重复度文件可打包"; else bad "高重复度打包失败"; fi
+if "$BIN" list repd.hcax >/dev/null 2>&1; then
+  ok "高重复度归档可读取(引用数 > 唯一块数)"; else bad "高重复度归档被误判为损坏"; fi
+rm -rf repd_out
+if "$BIN" unpack repd.hcax repd_out >/dev/null 2>&1 && cmp -s repd/r.bin repd_out/repd/r.bin; then
+  ok "高重复度往返一致"; else bad "高重复度往返不一致"; fi
+
 # ---------------------------------------------------------------- 4. 损坏检测
 note "4. 损坏检测"
 cp "$A" corrupt.hcax
