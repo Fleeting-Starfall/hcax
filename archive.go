@@ -718,6 +718,8 @@ func openArchive(path string) *archive {
 		rawOff := dataOff + int64(compLen)
 		dictOff := rawOff + int64(rawLen)
 
+		checkTailMagic(f, rawOff+int64(rawLen))
+
 		// 1) 先装载训练字典(元数据帧可能就是用该字典压的)
 		if _, err := f.Seek(dictOff, io.SeekStart); err == nil {
 			var dc uint32
@@ -752,10 +754,12 @@ func openArchive(path string) *archive {
 		}
 		chunks, files, sh, rh := parseMeta(metaRaw, nChunks, nFiles, ver)
 		// 3) 数据区: 只记录位置, 不读不解压 —— 按需(惰性)解压见 ensureSolid
-		return &archive{spec: spec, be: be, src: f, dataStart: dataOff,
+		a := &archive{spec: spec, be: be, src: f, dataStart: dataOff,
 			compLen: int64(compLen), rawOff: rawOff, rawLen: int64(rawLen),
 			chunks: chunks, files: files, hashLen: 0,
 			solidHash: sh, rawHash: rh, ver: ver}
+		a.checkCounts()
+		return a
 	}
 
 	// ================= 旧版本 v2..v5 =================
@@ -779,6 +783,9 @@ func openArchive(path string) *archive {
 		nFiles = binary.LittleEndian.Uint32(hdr[20:24])
 		dataStart = 24
 	}
+
+	// 同样在读数据区之前先确认文件没被截断(v2~v5 的尾部布局与 v6+ 一致)
+	checkTailMagic(f, dataStart+int64(compLen)+int64(rawLen))
 
 	// 先解析块表/文件表, 定位 v5 dict 区; 训练字典必须在解压帧之前装载(否则 zstd 报 unknown dictionary)
 	ctOff := dataStart + int64(compLen) + int64(rawLen)
@@ -853,9 +860,58 @@ func openArchive(path string) *archive {
 	}
 
 	// 数据区同样只记位置(惰性解压): 旧版布局为 [数据区][原样区][块表][文件表][字典区]
-	return &archive{spec: spec, be: be, src: f, dataStart: dataStart,
+	a := &archive{spec: spec, be: be, src: f, dataStart: dataStart,
 		compLen: int64(compLen), rawOff: dataStart + int64(compLen), rawLen: int64(rawLen),
 		chunks: chunks, files: files, hashLen: 16, ver: ver}
+	a.checkCounts()
+	return a
+}
+
+// 尾部魔数校验: trailer 布局(所有版本一致) = "XACH" + totalUncomp(8) + nFiles(4) + nChunks(4) = 20B。
+// 老实现只写不读 —— 归档被截断(传输中断/磁盘满/拷一半)时, 会一路走到解压阶段才报出
+// "unknown dictionary" 之类莫名其妙的错误, 甚至可能静默解出一部分数据让人误以为成功。
+// 这里在**读数据区之前**就核对文件长度与尾部魔数, 截断当场给出明确提示。
+
+func checkTailMagic(f *os.File, dataEnd int64) {
+	const trailerLen = 20
+	fi, err := f.Stat()
+	if err != nil {
+		return
+	}
+	sz := fi.Size()
+	if sz < 48+trailerLen {
+		fatal("归档过短(%d B): 不是完整的 HCAX 文件", sz)
+	}
+	off := sz - trailerLen
+	if dataEnd > off {
+		fatal("归档被截断: 数据区需延伸到 %d B, 但文件只有 %d B", dataEnd, sz)
+	}
+	tb := make([]byte, 4)
+	if _, err := f.ReadAt(tb, off); err != nil {
+		fatal("读尾部失败: %v", err)
+	}
+	if string(tb) != trailerMag {
+		fatal("尾部魔数不符: 归档被截断或损坏(尾部 %d 字节处不是 %s)", off, trailerMag)
+	}
+}
+
+// 条目数一致性校验: 尾部记录的 nFiles/nChunks 必须与头部一致(解析元数据后调用)
+func (a *archive) checkCounts() {
+	const trailerLen = 20
+	fi, err := a.src.Stat()
+	if err != nil {
+		return
+	}
+	tb := make([]byte, trailerLen)
+	if _, err := a.src.ReadAt(tb, fi.Size()-trailerLen); err != nil {
+		fatal("读尾部失败: %v", err)
+	}
+	nf := binary.LittleEndian.Uint32(tb[12:16])
+	nc := binary.LittleEndian.Uint32(tb[16:20])
+	if nf != uint32(len(a.files)) || nc != uint32(len(a.chunks)) {
+		fatal("尾部与头部不一致(文件数 %d≠%d 或 块数 %d≠%d): 归档已损坏",
+			nf, len(a.files), nc, len(a.chunks))
+	}
 }
 
 // 惰性解压固实流到至少 need 字节为止。

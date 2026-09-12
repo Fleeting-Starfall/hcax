@@ -145,6 +145,13 @@ SZ=$(wc -c < corrupt.hcax)
 OFF=$((SZ/2))
 printf '\xff' | dd of=corrupt.hcax bs=1 seek="$OFF" count=1 conv=notrunc >/dev/null 2>&1
 if "$BIN" verify corrupt.hcax >/dev/null 2>&1; then bad "篡改后 verify 仍通过(无法发现损坏)"; else ok "篡改 1 字节被 verify 捕获"; fi
+# 截断: 老实现只写 trailer 从不校验, 被截断的归档会一路解下去甚至静默解出部分数据
+cp "$A" trunc.hcax
+TSZ=$(wc -c < trunc.hcax | tr -d ' ')
+: | dd of=trunc.hcax bs=1 seek=$((TSZ-30)) count=0 conv=notrunc >/dev/null 2>&1
+head -c $((TSZ-30)) "$A" > trunc.hcax
+if "$BIN" list trunc.hcax >/dev/null 2>&1; then bad "截断的归档被接受了(应报错)"; else ok "截断的归档被拒绝"; fi
+if "$BIN" list trunc.hcax 2>&1 | grep -qE '截断|尾部'; then ok "截断报错信息明确"; else bad "截断报错信息含糊"; fi
 
 # ---------------------------------------------------------------- 5. 资源
 note "5. 资源与卫生"
