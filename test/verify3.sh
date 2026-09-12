@@ -28,6 +28,11 @@ else
   echo "$out" | grep FAIL | sed 's/^/  /'; FAIL=$((FAIL+1)); bad "regress.sh 有失败项"
 fi
 
+# 单元测试(含随机目录树往返 / 随机损坏不崩): 端到端脚本跑一遍要几十秒,
+# 而很多 bug(R18 那种"打得开解不开")在毫秒级的用例里就能撞出来
+if (cd "$ROOT" && go test ./... >"$WORK/gotest.log" 2>&1); then
+  ok "go test 全通过"; else bad "go test 有失败项"; sed 's/^/    /' "$WORK/gotest.log" | tail -20; fi
+
 # ------------------------------------------------------------ 第2轮
 note "第2轮 无损往返(较大语料)"
 "$PY" "$HERE/mkcorpus.py" "$WORK/c2" $((16*1024*1024)) >/dev/null

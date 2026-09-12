@@ -22,10 +22,14 @@ func runCleanups() {
 	cleanupFns = nil
 }
 
+// 退出动作单独抽出来: 测试里会把它换成 panic, 好把"归档损坏"这类分支当成
+// 普通失败来断言(否则 os.Exit 会直接干掉整个测试进程, 后面的用例全跑不了)。
+var fatalExit = os.Exit
+
 func fatal(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "错误: "+format+"\n", args...)
 	runCleanups()
-	os.Exit(1)
+	fatalExit(1)
 }
 
 func safeName(name string) bool {
