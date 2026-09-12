@@ -589,6 +589,27 @@ func pack(inputs []string, outPath, mode string) {
 			if os.Getenv("HCAX_T") != "" {
 				fmt.Fprintf(os.Stderr, "[t] compressZstdStream %v\n", time.Since(t0))
 			}
+			// 训练字典是要**写进归档**的, 小语料上它可能比省下的空间还多:
+			// 实测 200KB 语料训出 114KB 字典, 占归档 57%, 整体压率反而 100%+。
+			// 数据量不大时压两次比真实总大小(压缩帧 + 字典), 只有确实更小才用字典。
+			// 大语料上字典开销相对可忽略, 且压一次 level-19 很贵, 故不比较。
+			if be.hasDict && compSolidSize <= dictTrialMaxBytes {
+				if _, e := csf.Seek(0, io.SeekStart); e != nil {
+					fatal("seek 固实流: %v", e)
+				}
+				be.hasDict = false
+				alt := be.compressZstdStream(csf)
+				if len(alt) < len(frame)+len(be.trainDict) {
+					frame = alt
+					be.trainDict = nil // 字典不划算: 不写字典区
+					if os.Getenv("HCAX_T") != "" {
+						fmt.Fprintf(os.Stderr, "[t] dict dropped: %d B dict not worth it\n", len(be.trainDict))
+					}
+				} else {
+					be.hasDict = true
+				}
+				trainDict = be.trainDict
+			}
 		}
 	} else if be.spec.mmt && nComp > 1 && compSolidSize >= mmtMinBytes {
 		if os.Getenv("HCAX_T") != "" {

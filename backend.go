@@ -26,6 +26,11 @@ const mmtMinBytes = 64 << 20
 // max(~88MB, zstd 模式才建编码器)的根因。封顶后 best 内存回到 ~10MB 级, 压率不变(块内匹配用不到大窗口)。
 const zstdMaxWindowLog = 20
 
+// dictTrialMaxBytes: 训练字典是否划算的"试压"上限。
+// 字典本身要写进归档, 小语料上可能比它省下的还多 —— 只有可压数据不超过这个量时,
+// 才值得多花一次压缩去比较"带字典帧+字典" vs "无字典帧"。(见 archive.go 中的试压逻辑)
+const dictTrialMaxBytes = 32 << 20
+
 type modeSpec struct {
 	code    byte
 	backend string // "zstd" or "lzma2"
