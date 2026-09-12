@@ -18,7 +18,7 @@ func usage() {
 	fmt.Println("                  命中目录时整棵子树跳过。例: --exclude .git --exclude '*.tmp'")
 	fmt.Println("  hcax unpack 输入.hcax 输出目录 [--verify]")
 	fmt.Println("  hcax extract 输入.hcax 输出目录 [文件...] [--verify]")
-	fmt.Println("  hcax list   输入.hcax")
+	fmt.Println("  hcax list   输入.hcax [-l]      # -l/--long: 权限 + 修改时间 + 分类统计")
 	fmt.Println("  hcax verify 输入.hcax")
 	fmt.Println("  hcax info   输入.hcax   # 容器布局详情(版本/各区大小/块数)")
 }
@@ -94,10 +94,19 @@ func main() {
 		}
 		unpack(a, o, verify, files)
 	case "list":
-		if len(os.Args) < 3 {
+		long := false
+		var a string
+		for i := 2; i < len(os.Args); i++ {
+			if os.Args[i] == "-l" || os.Args[i] == "--long" {
+				long = true
+			} else if a == "" {
+				a = os.Args[i]
+			}
+		}
+		if a == "" {
 			fatal("list 需要 输入")
 		}
-		listArchive(os.Args[2])
+		listArchive(a, long)
 	case "verify":
 		if len(os.Args) < 3 {
 			fatal("verify 需要 输入")

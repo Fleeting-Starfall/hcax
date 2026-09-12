@@ -136,6 +136,15 @@ if "$BIN" extract "$A" rx2 novel.txt records.json >/dev/null 2>&1 && \
    cmp -s corpus/novel.txt rx2/corpus/novel.txt && cmp -s corpus/records.json rx2/corpus/records.json; then
   ok "extract 多文件"; else bad "extract 多文件"; fi
 if "$BIN" unpack "$A" r_verify --verify >/dev/null 2>&1; then ok "unpack --verify"; else bad "unpack --verify"; fi
+# list: 按路径排序(打包顺序是 文件/目录/链接 三组, 直接打印是乱的) + 分类统计
+if "$BIN" list "$A" 2>/dev/null | sed -n '1,/^共/p' | grep -E '^  ' | awk '{print $2}' | sort -c 2>/dev/null; then
+  ok "list 按路径排序输出"; else bad "list 未按路径排序"; fi
+if "$BIN" list "$A" 2>/dev/null | grep -qE '条目 \([0-9]+ 文件 / [0-9]+ 目录 / [0-9]+ 链接\)'; then
+  ok "list 分类统计"; else bad "list 分类统计缺失"; fi
+if "$BIN" list edge.hcax -l 2>/dev/null | grep -qE 'L.*link_file -> one\.bin'; then
+  ok "list -l 显示链接目标"; else bad "list -l 链接目标"; fi
+if "$BIN" list edge.hcax -l 2>/dev/null | grep -qE '^  d.*edge/deep/$'; then
+  ok "list -l 目录带类型位与斜杠"; else bad "list -l 目录"; fi
 # extract 给目录名: 应抽出整棵子树(旧实现只建出一个空目录, 里面的文件一个都没出来)
 rm -rf rx3
 if "$BIN" extract edge.hcax rx3 edge/deep >/dev/null 2>&1 && \

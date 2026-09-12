@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -1412,10 +1413,68 @@ func modeName(code byte) string {
 	return "?"
 }
 
-func listArchive(archivePath string) {
+// 归档里只存了权限位(0777)和 mtime, 类型由标志位决定 —— 拼回一个 os.FileMode
+// 只为借用它的 String() 打印 "drwxr-xr-x" 这种人眼一眼能读的形式。
+func modeString(fe fileEntry) string {
+	var m os.FileMode
+	switch {
+	case fe.isDir:
+		m = os.ModeDir
+	case fe.isLink:
+		m = os.ModeSymlink
+	}
+	m |= os.FileMode(fe.mode & 0o7777)
+	return m.String()
+}
+
+// 人类可读的大小: 字节数在列表里一眼看不出量级(100000 还是 100000000?)
+func humanSize(n uint64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := uint64(unit), 0
+	for i := n / unit; i >= unit && exp < 4; i /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTP"[exp])
+}
+
+func listArchive(archivePath string, long bool) {
 	a := openArchive(archivePath)
+	// 按路径排序: 打包顺序是 文件→目录→链接 三组分着来的, 直接打印看着是乱的。
+	// 只排副本, 不动 a.files —— 解包依赖其原顺序(固实流顺序读)。
+	items := make([]fileEntry, len(a.files))
+	copy(items, a.files)
+	sort.Slice(items, func(i, j int) bool { return items[i].name < items[j].name })
+
 	var tot uint64
-	for _, fe := range a.files {
+	var nFile, nDir, nLink int
+	for _, fe := range items {
+		switch {
+		case fe.isDir:
+			nDir++
+		case fe.isLink:
+			nLink++
+		default:
+			nFile++
+		}
+		tot += fe.size
+		if long {
+			t := "-"
+			if fe.mtime != 0 {
+				t = time.Unix(int64(fe.mtime), 0).Format("2006-01-02 15:04")
+			}
+			suffix := ""
+			if fe.isLink {
+				suffix = " -> " + fe.link
+			} else if fe.isDir {
+				suffix = "/"
+			}
+			fmt.Printf("  %s  %s  %12d  %s%s\n", modeString(fe), t, fe.size, fe.name, suffix)
+			continue
+		}
 		switch {
 		case fe.isDir:
 			fmt.Printf("  %12s  %s/\n", "<dir>", fe.name)
@@ -1424,9 +1483,9 @@ func listArchive(archivePath string) {
 		default:
 			fmt.Printf("  %12d  %s\n", fe.size, fe.name)
 		}
-		tot += fe.size
 	}
-	fmt.Printf("共 %d 条目, 原大小 %d B, 唯一块 %d\n", len(a.files), tot, len(a.chunks))
+	fmt.Printf("共 %d 条目 (%d 文件 / %d 目录 / %d 链接), 原大小 %d B (%s), 唯一块 %d\n",
+		len(items), nFile, nDir, nLink, tot, humanSize(tot), len(a.chunks))
 }
 
 // info: 打印容器内部布局。配合 FORMAT.md 用来核对/调试格式 —— 光看归档大小
