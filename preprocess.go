@@ -88,8 +88,12 @@ func applyXform(t byte, b []byte, decode bool) []byte {
 	}
 	return b
 }
+// 必须**倒序**遍历: 前向遍历时 b[i-d] 已经被改写过了, 算出来的就不是
+// "减原始值" 而是 "减上一层差分" —— 与 deltaXform(非 in-place)结果不同。
+// chooseTransform 用 in-place 版估算大小、却用非 in-place 版实际编码,
+// 两者不一致等于在评估一组永远不会产生的字节, 选出来的变换未必最优。
 func deltaInPlace(b []byte, d int) {
-	for i := d; i < len(b); i++ {
+	for i := len(b) - 1; i >= d; i-- {
 		b[i] -= b[i-d]
 	}
 }
