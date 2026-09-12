@@ -117,11 +117,17 @@ func (b *backend) chooseTransform(cb []byte) (byte, []byte) {
 // 廉价判定: 该块是否不可压(应原样存储而非进压缩器)。zstd 模式恒压, 不原样存储。
 
 func (b *backend) shouldStore(cb []byte) bool {
-	if b.spec.backend != "lzma2" {
-		return false
-	}
 	if len(cb) == 0 {
 		return true
+	}
+	// CM(text) 靠统计预测, 对高熵数据(随机/已压缩)既压不动又极慢(逐 bit 建模 ~0.5MB/s)。
+	// 让这类块走原样存储, 免得 CM 在压不出结果的数据上白耗时间。
+	// (此前只有 lzma2 档做原样判定, text 档一律硬送进 CM。)
+	if b.spec.backend == "cm" {
+		return byteEntropy(cb) > 7.95
+	}
+	if b.spec.backend != "lzma2" {
+		return false
 	}
 	out := b.gateEnc.EncodeAll(cb, nil)
 	if len(out) < len(cb)*storeThresholdPct/100 {
