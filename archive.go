@@ -392,10 +392,14 @@ func pack(inputs []string, outPath, mode string) {
 	var trainDict []byte
 	if spec.backend == "zstd" {
 		var samples [][]byte
+		var samplesBytes int
 		for _, c := range chunkMetas {
 			if len(c.data) >= 200 && len(c.data) <= 128<<10 {
 				samples = append(samples, c.data)
-				if len(samples) >= 2000 {
+				samplesBytes += len(c.data)
+				// 封顶样本总量(64MiB): zstd 字典训练对样本量不敏感, 多于此只是徒增内存峰值;
+				// 对"非重复多文件"场景, 原上限 2000×128KiB=256MiB 会在训练期间与 cm.data 双份常驻
+				if len(samples) >= 2000 || samplesBytes >= 64<<20 {
 					break
 				}
 			}
@@ -422,7 +426,11 @@ func pack(inputs []string, outPath, mode string) {
 				trainDict = d
 				opts := []zstd.EOption{zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(spec.level)), zstd.WithEncoderDict(trainDict)}
 				if spec.window > 0 {
-					opts = append(opts, zstd.WithWindowSize(1<<uint(spec.window)))
+					wl := spec.window
+					if wl > zstdMaxWindowLog {
+						wl = zstdMaxWindowLog
+					}
+					opts = append(opts, zstd.WithWindowSize(1<<uint(wl)))
 				}
 				if enc, e2 := zstd.NewWriter(io.Discard, opts...); e2 == nil {
 					be.zEncDict = enc
@@ -443,7 +451,7 @@ func pack(inputs []string, outPath, mode string) {
 	var frame []byte
 	if be.spec.mmt && nComp > 1 && compSolid.Len() >= mmtMinBytes {
 		be.tuneLZMA2(compSolid.Bytes()) // 大语料: 采样试选(全流试选太贵), 再分组并行压
-		frame = be.compressMT(chunkMetas)
+		frame = be.compressMT(chunkMetas, compSolid.Bytes())
 	} else {
 		frame = be.compressLZMA2Best(compSolid.Bytes()) // 中小: 全流试 pb=2/4, 选优并复用结果
 	}

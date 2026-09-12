@@ -19,6 +19,12 @@ const storeThresholdPct = 100
 
 const mmtMinBytes = 64 << 20
 
+// zstd 模式按块编码(块上限 chunkMax=256KiB), 单个块被独立 EncodeAll, 匹配距离不可能跨块,
+// 故编码器窗口封顶到 1MiB(已远超 256KiB 块上限); 更大的窗口纯浪费内存。
+// best 档原 window=27(1<<27=128MiB), 两个 zstd 编码器常驻 ~256MiB —— 是 best 内存(~264MB)远高于
+// max(~88MB, zstd 模式才建编码器)的根因。封顶后 best 内存回到 ~10MB 级, 压率不变(块内匹配用不到大窗口)。
+const zstdMaxWindowLog = 20
+
 type modeSpec struct {
 	code    byte
 	backend string // "zstd" or "lzma2"
@@ -53,14 +59,9 @@ func newBackend(spec modeSpec) *backend {
 	b := &backend{spec: spec, lcParam: "4", pbParam: "2"} // lzma2 默认; tuneLZMA2 会按数据自适应覆盖
 	if spec.backend == "zstd" {
 		var err error
-		opts := []zstd.EOption{zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(spec.level))}
-		if spec.window > 0 {
-			opts = append(opts, zstd.WithWindowSize(1<<uint(spec.window)))
-		}
-		b.zEnc, err = zstd.NewWriter(io.Discard, opts...)
-		if err != nil {
-			fatal("zstd encoder: %v", err)
-		}
+		// v8c: zEnc(无字典编码器)改为惰性创建 —— best 档总会训练字典并用 zEncDict, 原 zEnc 从未被使用,
+		// 却白白常驻一个 level-19 编码器(~35~69MB, 其内存由 level 决定、与窗口无关)。惰性创建后,
+		// 只有"未训练字典"的 zstd 档(fast / 训练失败回退)才建它。
 		b.zDec, err = zstd.NewReader(nil)
 		if err != nil {
 			fatal("zstd decoder: %v", err)
@@ -159,7 +160,7 @@ func (b *backend) tuneLZMA2(solid []byte) {
 	bestLc, bestPb := b.lcParam, b.pbParam
 	bestSz := int64(-1)
 	for _, c := range cands {
-		if out := b.xzCompress(sample, c.lc, c.pb); out != nil {
+		if out := b.xzCompress(sample, c.lc, c.pb, b.dictParam); out != nil {
 			if sz := int64(len(out)); bestSz < 0 || sz < bestSz {
 				bestSz, bestLc, bestPb = sz, c.lc, c.pb
 			}
@@ -172,12 +173,12 @@ func (b *backend) tuneLZMA2(solid []byte) {
 
 // 用系统 xz 按指定 lc/pb 压缩; 不可用或出错时返回 nil(以便走回退路径)
 
-func (b *backend) xzCompress(cb []byte, lc, pb string) []byte {
+func (b *backend) xzCompress(cb []byte, lc, pb, dict string) []byte {
 	xzbin, err := exec.LookPath("xz")
 	if err != nil {
 		return nil
 	}
-	cmd := exec.Command(xzbin, "-c", "-", "--lzma2=preset=9e,dict="+b.dictParam+",nice=273,lc="+lc+",lp=0,pb="+pb)
+	cmd := exec.Command(xzbin, "-c", "-", "--lzma2=preset=9e,dict="+dict+",nice=273,lc="+lc+",lp=0,pb="+pb)
 	cmd.Stdin = bytes.NewReader(cb)
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -205,7 +206,7 @@ func (b *backend) compressLZMA2Best(cb []byte) []byte {
 		wg.Add(1)
 		go func(i int, pb string) {
 			defer wg.Done()
-			outs[i] = b.xzCompress(cb, b.lcParam, pb)
+			outs[i] = b.xzCompress(cb, b.lcParam, pb, b.dictParam)
 		}(i, pb)
 	}
 	wg.Wait()
@@ -252,12 +253,27 @@ func (b *backend) compress(cb []byte) []byte {
 		if b.hasDict && b.zEncDict != nil {
 			return b.zEncDict.EncodeAll(cb, nil)
 		}
+		if b.zEnc == nil {
+			opts := []zstd.EOption{zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(b.spec.level))}
+			if b.spec.window > 0 {
+				wl := b.spec.window
+				if wl > zstdMaxWindowLog {
+					wl = zstdMaxWindowLog
+				}
+				opts = append(opts, zstd.WithWindowSize(1<<uint(wl)))
+			}
+			e, err := zstd.NewWriter(io.Discard, opts...)
+			if err != nil {
+				fatal("zstd encoder: %v", err)
+			}
+			b.zEnc = e
+		}
 		return b.zEnc.EncodeAll(cb, nil)
 	}
 	// lzma2 档: 系统 xz (lzma2, xz 容器) 取得接近 7z 的极高压缩率; 缺失则回退 ulikunitz xz。
 	// 精调 lzma2 参数(dict/nice/lc/lp/pb) + dict 按量收敛, 比 -9e 预设再小约 0.34%, 同速。
 	if b.spec.backend == "lzma2" {
-		if out := b.xzCompress(cb, b.lcParam, b.pbParam); out != nil {
+		if out := b.xzCompress(cb, b.lcParam, b.pbParam, b.dictParam); out != nil {
 			return out
 		}
 		var buf bytes.Buffer
@@ -279,8 +295,10 @@ func (b *backend) compress(cb []byte) []byte {
 
 // 并行固实分组压缩(max 档): 把可压块按序分 G 组, 每组并行调 xz 压成独立帧, 顺序拼接回单流。
 // 段间冗余丢失 -> 压率略损, 但打包速度数倍提升。解压仍为整流(多 xz 帧串联), 格式不变。
+// 注意: 数据来自 solid(打包阶段写好的固实缓冲), 不再读 cm.data —— v8 的 cm.data=nil 释放后 cm.data 已为空,
+// 若此处读 c.data 会得到空组 -> 空帧 -> 解包越界panic。这是 mmt 路径在此前(v8)被引入的回归, 仅大语料(>=64MiB)触发。
 
-func (b *backend) compressMT(chunks []*chunkMeta) []byte {
+func (b *backend) compressMT(chunks []*chunkMeta, solid []byte) []byte {
 	var comp []*chunkMeta
 	for _, c := range chunks {
 		if !c.stored {
@@ -298,7 +316,7 @@ func (b *backend) compressMT(chunks []*chunkMeta) []byte {
 		G = 1
 	}
 	if len(comp) <= G {
-		return b.compress(concatChunks(comp))
+		return b.compress(concatChunks(comp, solid))
 	}
 	per := (len(comp) + G - 1) / G
 	type grp struct {
@@ -311,15 +329,18 @@ func (b *backend) compressMT(chunks []*chunkMeta) []byte {
 		if e > len(comp) {
 			e = len(comp)
 		}
-		var sub bytes.Buffer
+		// 零拷贝: 同组块在 solid 中本就连续(comp 按序, solid 按序写入), 直接取一段切片即可,
+		// 无需把每块再 copy 进 bytes.Buffer —— 否则并行期固实流(全量)+ 各组副本同时在内存,
+		// 大语料下内存翻倍(如 331MB 文件额外占 ~328MB)。
+		start := comp[i].offset
+		last := comp[e-1]
+		end := last.offset + uint64(last.uncomp)
 		local := map[*chunkMeta]uint64{}
-		off := uint64(0)
+		base := start
 		for _, c := range comp[i:e] {
-			sub.Write(c.data)
-			local[c] = off
-			off += uint64(len(c.data))
+			local[c] = c.offset - base
 		}
-		groups = append(groups, grp{sub.Bytes(), local})
+		groups = append(groups, grp{solid[start:end], local})
 	}
 	results := make([][]byte, len(groups))
 	var wg sync.WaitGroup
@@ -327,7 +348,7 @@ func (b *backend) compressMT(chunks []*chunkMeta) []byte {
 		wg.Add(1)
 		go func(gi int) {
 			defer wg.Done()
-			results[gi] = b.compress(groups[gi].sub)
+			results[gi] = b.compressLZMA2Dict(groups[gi].sub, dictFor(len(groups[gi].sub)))
 		}(gi)
 	}
 	wg.Wait()
@@ -343,10 +364,37 @@ func (b *backend) compressMT(chunks []*chunkMeta) []byte {
 	return out.Bytes()
 }
 
-func concatChunks(cs []*chunkMeta) []byte {
+func concatChunks(cs []*chunkMeta, solid []byte) []byte {
 	var buf bytes.Buffer
 	for _, c := range cs {
-		buf.Write(c.data)
+		buf.Write(solid[c.offset : c.offset+uint64(c.uncomp)])
+	}
+	return buf.Bytes()
+}
+
+// 按指定 lzma2 字典压缩(并行分组用): 组越小字典越小 -> xz 子进程内存随组大小线性下降。
+// 系统 xz 缺失时回退 ulikunitz。xz 帧自描述(字典嵌帧头), 解压无需记参, 格式不变。
+
+func (b *backend) compressLZMA2Dict(cb []byte, dict string) []byte {
+	if b.spec.backend != "lzma2" {
+		return b.compress(cb)
+	}
+	if len(cb) < 256<<10 {
+		return b.compress(cb)
+	}
+	if out := b.xzCompress(cb, b.lcParam, b.pbParam, dict); out != nil {
+		return out
+	}
+	var buf bytes.Buffer
+	w, err := xz.NewWriter(&buf)
+	if err != nil {
+		fatal("xz writer: %v", err)
+	}
+	if _, err := w.Write(cb); err != nil {
+		fatal("xz write: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		fatal("xz close: %v", err)
 	}
 	return buf.Bytes()
 }
