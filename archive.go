@@ -41,6 +41,12 @@ type chunkMeta struct {
 	idx    uint32
 }
 
+// 文件身份: (设备号, inode) 唯一确定一个文件; nlink>1 才说明它有多个名字(硬链接)。
+// 单名字文件不记 —— 否则每个文件都要白存一份键。
+type fileIDKey struct {
+	dev, ino, nlink uint64
+}
+
 type fileEntry struct {
 	name   string
 	size   uint64
@@ -50,6 +56,7 @@ type fileEntry struct {
 	chunks []uint32
 	isDir  bool // 目录条目(空目录也保留)
 	isLink bool // v9: 符号链接条目(存链接目标, 不存文件内容)
+	isHard bool // v11: 硬链接条目(复用首个条目的块索引, 不再读一遍内容)
 	link   string
 	// xform: 文件级预处理标记(v7)。光栅图(BMP/TGA/PNM)在分块之前对整文件做过
 	// 二维预测/色彩去相关, 该变换跨块生效, 故必须记在文件级而非块级。
@@ -89,6 +96,9 @@ func serializeMeta(chunks []*chunkMeta, files []fileEntry, solidHash, rawHash [8
 		if fe.isLink {
 			f |= 0x20 // v9: 符号链接
 		}
+		if fe.isHard {
+			f |= 0x40 // v11: 硬链接
+		}
 		b.WriteByte(f)
 		binary.Write(&b, binary.LittleEndian, fe.size)
 		if ver >= 10 {
@@ -103,7 +113,7 @@ func serializeMeta(chunks []*chunkMeta, files []fileEntry, solidHash, rawHash [8
 		for _, ix := range fe.chunks {
 			binary.Write(&b, binary.LittleEndian, ix)
 		}
-		if fe.isLink { // v9: 链接目标跟在该条目之后
+		if fe.isLink || fe.isHard { // v9 链接目标 / v11 硬链接指向的归档内路径
 			lb := []byte(fe.link)
 			binary.Write(&b, binary.LittleEndian, uint16(len(lb)))
 			b.Write(lb)
@@ -165,6 +175,7 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 			files[i].xform = (f >> 1) & 0x0f
 		}
 		files[i].isLink = ver >= 9 && f&0x20 != 0
+		files[i].isHard = ver >= 11 && f&0x40 != 0
 		files[i].size = binary.LittleEndian.Uint64(m[pos : pos+8])
 		pos += 8
 		if ver >= 10 {
@@ -197,7 +208,7 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 			}
 		}
 		files[i].chunks = idxs
-		if files[i].isLink {
+		if files[i].isLink || files[i].isHard {
 			need(m, pos, 2, "链接目标长度")
 			tl := int(binary.LittleEndian.Uint16(m[pos : pos+2]))
 			pos += 2
@@ -423,6 +434,7 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 	be := newBackend(spec)
 
 	chunkMap := map[[16]byte]*chunkMeta{}
+	hardSeen := map[fileIDKey]int{} // (dev,ino) -> 首个条目在 fileEntries 中的下标
 	var chunkMetas []*chunkMeta
 	var fileEntries []fileEntry
 	var totalUncomp uint64
@@ -477,6 +489,23 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 		}
 		rel := storedName(fp, root)
 		st, _ := f.Stat()
+
+		// 硬链接(v11): 同一 inode 的第二个及以后的名字, 直接复用首个条目的块索引 ——
+		// CDC 去重本来就会命中同一批块, 所以既不占归档空间, 也省掉一整遍读盘/分块。
+		if first, dup := hardSeen[fileKeyOf(st)]; dup {
+			src := fileEntries[first]
+			fileEntries = append(fileEntries, fileEntry{
+				name: rel, size: src.size, mtime: uint64(st.ModTime().Unix()),
+				nano: st.ModTime().UnixNano(), mode: entryMode(st),
+				chunks: src.chunks, xform: src.xform, isHard: true, link: src.name,
+			})
+			totalUncomp += src.size
+			f.Close()
+			continue
+		}
+		if k, ok := fileKey(st); ok && k.nlink > 1 {
+			hardSeen[k] = len(fileEntries) // 本条目即将 append 到的下标
+		}
 		var curChunks []uint32
 		var xfProbe byte    // zstd 档文件级探测的变换类型; 在闭包 onChunk 之前声明以便捕获
 		rasterMode := false // 光栅图: 已做文件级二维预测/色彩去相关, 块级不再叠加变换
@@ -1285,6 +1314,18 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		fatal("mkdir: %v", err)
 	}
+	// 硬链接(v11): 尽量还原成共享 inode 的硬链接。
+	// 源不在这次解包范围内时(extract 只抽了一部分)退化成普通文件 —— 块索引还在,
+	// 内容照样完整, 不会解出一个空壳。
+	if fe.isHard {
+		src := joinOut(outDir, fe.link)
+		if _, e := os.Lstat(src); e == nil {
+			os.Remove(target)
+			if e := os.Link(src, target); e == nil {
+				return
+			}
+		}
+	}
 	// 防"先建链接再写穿": 归档里若先有条目在 target 处建了符号链接(比如 -> /etc),
 	// 后续同名文件条目经 os.Create 会跟随该链接写到链接指向的目录里去。
 	// 写文件前先把已存在的符号链接摘掉, 保证只会写解包目录内部。
@@ -1509,9 +1550,12 @@ func listArchive(archivePath string, long bool) {
 				t = time.Unix(int64(fe.mtime), 0).Format("2006-01-02 15:04")
 			}
 			suffix := ""
-			if fe.isLink {
-				suffix = " -> " + fe.link
-			} else if fe.isDir {
+			switch {
+			case fe.isLink:
+				suffix = " -> " + fe.link // 符号链接
+			case fe.isHard:
+				suffix = " => " + fe.link // 硬链接: 指向归档内首个名字(共享同一 inode)
+			case fe.isDir:
 				suffix = "/"
 			}
 			fmt.Printf("  %s  %s  %12d  %s%s\n", modeString(fe), t, fe.size, fe.name, suffix)

@@ -1,7 +1,7 @@
 # hcax 容器格式规范
 
 本文描述 `.hcax` 归档的**字节级布局**。实现见 `archive.go`（容器）、`backend.go`（后端）、
-`chunker.go`（格式常量）。当前写入版本 **v10**，可读取 **v2 ~ v10**。
+`chunker.go`（格式常量）。当前写入版本 **v11**，可读取 **v2 ~ v11**。
 
 约定：所有整数均为 **小端（little-endian）**，无对齐填充。路径分隔符按打包时的平台记录
 （Unix 为 `/`），解包时用 `filepath.FromSlash` 转换。
@@ -78,13 +78,13 @@
 |---|---|---|
 | 2 | nameLen | 文件名长度 |
 | nameLen | name | 归档内相对路径 |
-| 1 | flags | bit0 = isDir<br>bits1–4 = xform（v7+，文件级光栅变换）<br>bit5 = isLink（v9+） |
+| 1 | flags | bit0 = isDir<br>bits1–4 = xform（v7+，文件级光栅变换）<br>bit5 = isLink（v9+）<br>bit6 = isHard（v11+） |
 | 8 | size | 原始大小（符号链接记为目标字符串长度） |
 | 4 / 8 | mtime | v≤9：Unix 秒（uint32）<br>v10+：Unix **纳秒**（int64，0 = 无时间戳） |
 | 2 / 4 | mode | v≤9：权限位低 12 位（uint16）<br>v10+：uint32，含 setuid / setgid / sticky |
 | 4 | nChunks | 该文件引用的块数 |
 | 4×nChunks | chunks | 块索引（必须 < nChunks） |
-| 2 + tl | link | **仅 isLink（v9+）**：目标长度 + 目标字符串 |
+| 2 + tl | link | **仅 isLink（v9+）/ isHard（v11+）**：目标长度 + 目标字符串。<br>isHard 时目标是**归档内首个名字的归档内路径**，解包时 `os.Link` 还原共享 inode |
 
 ---
 
@@ -144,10 +144,11 @@ uint32 count      // 0 或 1
 | v8 | 无格式变更（打包内存修复） |
 | v9 | 文件表 flag bit5 = isLink + 链接目标字段（符号链接） |
 | v10 | 文件表的 mtime 改 int64 纳秒、mode 改 uint32（补回 setuid / setgid / sticky） |
+| v11 | 文件表 flag bit6 = isHard + 复用 link 字段存"首个名字"（硬链接） |
 
 ### 版本写入策略
 
-`version = 10`，`verCompat = 8`，`verLinks = 9`，`verExt = 10`。
+`version = 11`，`verCompat = 8`，`verLinks = 9`，`verExt = 10`，`verHard = 11`。
 
 **能不升就不升**——每升一版就意味着旧版二进制读不了这个归档：
 
@@ -155,6 +156,7 @@ uint32 count      // 0 或 1
 - 含符号链接 → v9
 - 含 setuid / setgid / sticky，或时间戳超出 uint32 秒（2038 之后 / 1970 之前）→ v10
 - 用户显式加 `-T / --precise-times` → v10（时间戳存到纳秒）
+- 含硬链接 → v11
 
 **亚秒精度不单独触发升级**：现实里几乎所有文件都带纳秒级 mtime（APFS / ext4 都是），
 若因此一律写 v10，等于让每一个新归档都与旧版绝缘。所以默认按秒存（与 tar 一致），
@@ -163,8 +165,8 @@ uint32 count      // 0 或 1
 
 ### 兼容性保证
 
-- 读：v2 ~ v10 全部可读（旧块表走逐块 16B 哈希校验，v6+ 走流级校验）
-- 写：默认为 v8（兼容优先），按需升 v9 / v10
+- 读：v2 ~ v11 全部可读（旧块表走逐块 16B 哈希校验，v6+ 走流级校验）
+- 写：默认为 v8（兼容优先），按需升 v9 / v10 / v11
 - 解压始终纯 Go，零外部依赖；只有 `max`/`ultra` 的**压缩**会用系统 `xz`，缺失则回退纯 Go
 
 ---

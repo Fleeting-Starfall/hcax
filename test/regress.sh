@@ -206,6 +206,33 @@ if "$BIN" pack permns.hcax perm -m fast -T >/dev/null 2>&1 && \
    [ "$("$PY" -c "import os; print(os.stat('permns_out/perm/ns.bin').st_mtime_ns)")" = "1700000000123456789" ]; then
   ok "-T 纳秒时间戳逐位还原"; else bad "-T 纳秒时间戳"; fi
 
+# 硬链接(v11): 同一 inode 的多个名字只存一份内容, 解包后重新共享 inode
+mkdir -p hardl
+head -c 200000 /dev/urandom > hardl/orig.bin
+if ln hardl/orig.bin hardl/a.bin 2>/dev/null && ln hardl/orig.bin hardl/b.bin 2>/dev/null; then
+  if "$BIN" pack hardl.hcax hardl -m fast >/dev/null 2>&1; then ok "硬链接可打包"; else bad "硬链接打包失败"; fi
+  if [ "$(verbyte hardl.hcax)" = "11" ]; then ok "硬链接归档升 v11"; else bad "硬链接未升 v11"; fi
+  # 内容只存一份: 200KB×3 = 600KB, 归档必须明显小于 300KB
+  if [ "$(stat -f%z hardl.hcax 2>/dev/null || stat -c%s hardl.hcax)" -lt 300000 ]; then
+    ok "硬链接内容只存一份"; else bad "硬链接内容被重复存储"; fi
+  rm -rf hardl_out
+  if "$BIN" unpack hardl.hcax hardl_out >/dev/null 2>&1; then
+    i1=$("$PY" -c "import os; print(os.stat('hardl_out/hardl/orig.bin').st_ino)")
+    i2=$("$PY" -c "import os; print(os.stat('hardl_out/hardl/a.bin').st_ino)")
+    if [ -n "$i1" ] && [ "$i1" = "$i2" ]; then ok "硬链接还原为共享 inode"; else bad "硬链接未还原"; fi
+    if cmp -s hardl/orig.bin hardl_out/hardl/b.bin; then ok "硬链接内容一致"; else bad "硬链接内容不一致"; fi
+  else
+    bad "硬链接解包失败"
+  fi
+  # 只抽硬链接本身(源不在解包范围内)时必须退化为内容完整的普通文件
+  rm -rf hardl_x
+  if "$BIN" extract hardl.hcax hardl_x hardl/b.bin >/dev/null 2>&1 && \
+     cmp -s hardl/orig.bin hardl_x/hardl/b.bin; then
+    ok "只抽硬链接时退化为完整文件"; else bad "只抽硬链接时内容缺失"; fi
+else
+  printf '  \033[33mSKIP\033[0m 当前文件系统不支持硬链接\n'
+fi
+
 # ---------------------------------------------------------------- 4. 损坏检测
 note "4. 损坏检测"
 cp "$A" corrupt.hcax

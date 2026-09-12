@@ -10,13 +10,14 @@ import (
 const (
 	magic      = "HCAX"
 	trailerMag = "XACH"
-	version    = 10 // v10: 文件表条目的时间改 int64 纳秒、权限改 uint32(带 setuid/setgid/sticky)
+	version    = 11 // v10: 文件表条目的时间改 int64 纳秒、权限改 uint32(带 setuid/setgid/sticky)
 	// 兼容读 v2~v10; 写的时候能不升就不升:
 	//   普通归档仍写 v8, 有符号链接才升 v9, 只有 v9 装不下的元数据才升 v10。
 	// 这样格式演进不破坏既有生态 —— 旧版二进制照样能解开新工具打的绝大多数包。
 	verCompat = 8
 	verLinks  = 9  // 需要符号链接条目
 	verExt    = 10 // 需要扩展时间/权限
+	verHard   = 11 // 需要硬链接条目
 
 	chunkBits = 16
 	chunkMin  = 8 * 1024
@@ -38,6 +39,9 @@ func writeVer(files []fileEntry, precise bool) byte {
 		fe := &files[i]
 		if fe.isLink && v < verLinks {
 			v = verLinks
+		}
+		if fe.isHard && v < verHard {
+			v = verHard
 		}
 		if v >= verExt {
 			continue
