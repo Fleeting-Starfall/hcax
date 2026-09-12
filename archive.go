@@ -197,11 +197,54 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 // 旧实现把链接当普通文件读: 指向目录的链接会让 Read 返回 EISDIR 直接打包失败;
 // 指向文件的链接则把目标内容复制一份存进归档, 解包后变成普通文件 —— 语义错误且浪费空间。
 
-func collectPaths(inputs []string) (files []string, dirs []string, links []string) {
+// 排除规则(glob): 命中的条目不进归档; 命中的目录整棵子树跳过(连遍历都不做,
+// 备份时排除 .git / node_modules 这类大目录时能省下大量 stat 与读写)。
+// 三种比对, 任一命中即排除:
+//
+//	"*.tmp"       —— 任意层级下叫这个名字的文件(按基名比)
+//	".git"        —— 任意层级名为 .git 的目录(按路径分段比)
+//	"build/*"     —— 打包根下 build 目录里的条目(按"相对打包根的路径"比)
+//
+// full = 磁盘上的真实路径, rel = 相对本次打包根的路径。两种都要比:
+// 用户写模式时心里想的是归档里看到的路径(rel), 而 ".git" 这种又希望任意层级都生效(分段)。
+func excluded(full, rel string, excl []string) bool {
+	if len(excl) == 0 {
+		return false
+	}
+	norm := filepath.ToSlash(full)
+	cands := []string{norm}
+	if rel != "" && rel != "." {
+		cands = append(cands, filepath.ToSlash(rel))
+	}
+	for _, pat := range excl {
+		if pat == "" {
+			continue
+		}
+		for _, c := range cands {
+			if ok, _ := filepath.Match(pat, c); ok {
+				return true
+			}
+		}
+		for _, seg := range strings.Split(norm, "/") {
+			if ok, _ := filepath.Match(pat, seg); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+var nExcluded int // 被 --exclude 排除的条目数(打包结束时报告)
+
+func collectPaths(inputs []string, excl []string) (files []string, dirs []string, links []string) {
 	for _, p := range inputs {
 		fi, err := os.Lstat(p)
 		if err != nil {
 			fatal("stat %s: %v", p, err)
+		}
+		if excluded(p, "", excl) {
+			nExcluded++
+			continue
 		}
 		if fi.Mode()&os.ModeSymlink != 0 {
 			links = append(links, p)
@@ -210,6 +253,17 @@ func collectPaths(inputs []string) (files []string, dirs []string, links []strin
 		if fi.IsDir() {
 			filepath.Walk(p, func(q string, info os.FileInfo, err error) error {
 				if err != nil {
+					return nil
+				}
+				rel := ""
+				if r, e := filepath.Rel(p, q); e == nil {
+					rel = r
+				}
+				if q != p && excluded(q, rel, excl) {
+					nExcluded++
+					if info.IsDir() {
+						return filepath.SkipDir
+					}
 					return nil
 				}
 				if info.Mode()&os.ModeSymlink != 0 {
@@ -304,12 +358,12 @@ func hashReader(r io.Reader) [16]byte {
 	return out
 }
 
-func pack(inputs []string, outPath, mode string) {
+func pack(inputs []string, outPath, mode string, excl []string) {
 	spec, ok := modes[mode]
 	if !ok {
 		fatal("未知模式 %s", mode)
 	}
-	files, dirs, links := collectPaths(inputs)
+	files, dirs, links := collectPaths(inputs, excl)
 	if len(files) == 0 && len(dirs) == 0 && len(links) == 0 {
 		fatal("没有可打包的文件")
 	}
@@ -744,6 +798,9 @@ func pack(inputs []string, outPath, mode string) {
 	runCleanups() // 成功路径也要删临时文件(清理钩子本身幂等, 重复执行无副作用)
 	fmt.Printf("打包完成: %s  原始 %d B -> %d B  压率 %s  模式=%s  唯一块=%d(可压%d/原样%d)\n",
 		outPath, raw, sz.Size(), ratio, mode, len(chunkMetas), nComp, nStored)
+	if nExcluded > 0 {
+		fmt.Printf("排除 %d 个条目(--exclude)\n", nExcluded)
+	}
 	if len(skipped) > 0 {
 		fmt.Printf("跳过 %d 个条目(无权限或非普通文件): %s%s\n",
 			len(skipped), strings.Join(skipped[:minInt(3, len(skipped))], ", "),

@@ -151,6 +151,23 @@ if "$BIN" extract edge.hcax rx5 edge/deep/rand.bin nope 2>&1 | grep -qE '警告.
    cmp -s edge/deep/rand.bin rx5/edge/deep/rand.bin; then
   ok "extract 部分落空: 警告但仍抽出命中的"; else bad "extract 部分落空处理"; fi
 
+# --exclude: 命中目录 -> 整棵子树跳过; 命中基名 -> 全局生效; 模式按"归档内看到的路径"写
+mkdir -p exc/.git/objects exc/node_modules/pkg exc/src exc/build
+printf 'g\n' > exc/.git/objects/o.bin
+printf 'n\n' > exc/node_modules/pkg/i.js
+printf 's\n' > exc/src/a.go
+printf 't\n' > exc/src/x.tmp
+printf 'b\n' > exc/build/a.o
+if "$BIN" pack exc.hcax exc -m fast --exclude .git --exclude node_modules \
+    --exclude '*.tmp' --exclude 'build/*' >/dev/null 2>&1; then
+  ok "--exclude 打包成功"; else bad "--exclude 打包失败"; fi
+L=$("$BIN" list exc.hcax 2>/dev/null)
+if printf '%s\n' "$L" | grep -q 'exc/src/a.go' && \
+   ! printf '%s\n' "$L" | grep -qE '\.git|node_modules|\.tmp|build/a\.o'; then
+  ok "--exclude 三种模式都生效(目录/基名/相对根路径)"; else bad "--exclude 过滤不完整"; fi
+if "$BIN" pack exc.hcax exc -m fast --exclude .git 2>/dev/null | grep -q '排除 1 个条目'; then
+  ok "--exclude 报告排除数量"; else bad "--exclude 未报告数量"; fi
+
 # ---------------------------------------------------------------- 4. 损坏检测
 note "4. 损坏检测"
 cp "$A" corrupt.hcax
