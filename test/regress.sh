@@ -260,6 +260,21 @@ rm -rf repd_out
 if "$BIN" unpack repd.hcax repd_out >/dev/null 2>&1 && cmp -s repd/r.bin repd_out/repd/r.bin; then
   ok "高重复度往返一致"; else bad "高重复度往返不一致"; fi
 
+# 归档文件自身不能进归档: `hcax pack arch.hcax .` 老实现会把上一次的归档也收进去,
+# 于是每打一次包就胖一圈(154 -> 278 -> 389...), 还把上一版内容当新数据存下来
+mkdir -p selfd && printf 'data\n' > selfd/a.txt
+sz() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1"; }
+( cd selfd && "$BIN" pack arch.hcax . -m fast >/dev/null 2>&1 )
+s1=$(sz selfd/arch.hcax)
+( cd selfd && "$BIN" pack arch.hcax . -m fast >/dev/null 2>&1 )
+s2=$(sz selfd/arch.hcax)
+( cd selfd && "$BIN" pack arch.hcax . -m fast >/dev/null 2>&1 )
+s3=$(sz selfd/arch.hcax)
+if [ -n "$s1" ] && [ "$s1" = "$s2" ] && [ "$s2" = "$s3" ]; then
+  ok "归档自身不打进自己(重复打包大小稳定: $s1 B)"; else bad "归档自我包含: $s1 -> $s2 -> $s3"; fi
+if "$BIN" list selfd/arch.hcax 2>/dev/null | grep -q 'arch\.hcax'; then
+  bad "归档里含有自己"; else ok "归档内不含自身"; fi
+
 # ---------------------------------------------------------------- 4. 损坏检测
 note "4. 损坏检测"
 cp "$A" corrupt.hcax

@@ -53,6 +53,33 @@ func excluded(full, rel string, excl []string) bool {
 	return false
 }
 
+// 归档文件自己不能进归档: `hcax pack arch.hcax .` 会把上一次的 arch.hcax 也收进去,
+// 于是每打一次包归档就胖一圈(154B -> 278B -> 389B...), 还把上一版内容当新数据存下来。
+// tar 遇到这种情形会明确跳过并提示, 这里照做。
+func excludeSelf(files, dirs, links []string, outPath string) ([]string, []string, []string) {
+	outAbs, err := filepath.Abs(outPath)
+	if err != nil {
+		return files, dirs, links
+	}
+	n := 0
+	drop := func(in []string) []string {
+		out := make([]string, 0, len(in))
+		for _, p := range in {
+			if abs, e := filepath.Abs(p); e == nil && abs == outAbs {
+				n++
+				continue
+			}
+			out = append(out, p)
+		}
+		return out
+	}
+	files, dirs, links = drop(files), drop(dirs), drop(links)
+	if n > 0 {
+		fmt.Fprintf(os.Stderr, "警告: 跳过归档文件自身 %s(不能把自己打进自己)\n", outPath)
+	}
+	return files, dirs, links
+}
+
 var nExcluded int // 被 --exclude 排除的条目数(打包结束时报告)
 
 func collectPaths(inputs []string, excl []string) (files []string, dirs []string, links []string) {
@@ -212,6 +239,7 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 		fatal("未知模式 %s", mode)
 	}
 	files, dirs, links := collectPaths(inputs, excl)
+	files, dirs, links = excludeSelf(files, dirs, links, outPath)
 	if len(files) == 0 && len(dirs) == 0 && len(links) == 0 {
 		fatal("没有可打包的文件")
 	}
