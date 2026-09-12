@@ -597,8 +597,6 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 	if err != nil {
 		fatal("create %s: %v", outPath, err)
 	}
-	defer out.Close()
-
 	// 元数据(块表+文件表) 序列化后一并压缩(v6): 明文元数据往往占归档一半以上, 压缩收益极大
 	// 流级校验哈希(替代逐块哈希: 逐块哈希是随机数, 不可压缩, 大量小文件时开销极大)
 	var solidHash, rawHash [8]byte
@@ -628,29 +626,46 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 
 	// header(v6, 48B): magic ver code window flag
 	//                | metaCompLen metaRawLen compLen rawLen | nChunks nFiles
-	out.WriteString(magic)
-	out.Write([]byte{wv, spec.code, byte(spec.window), 0})
-	binary.Write(out, binary.LittleEndian, uint64(len(metaFrame)))
-	binary.Write(out, binary.LittleEndian, uint64(len(metaRaw)))
-	binary.Write(out, binary.LittleEndian, uint64(len(frame)))
-	binary.Write(out, binary.LittleEndian, uint64(rawRegionSize))
-	binary.Write(out, binary.LittleEndian, uint32(len(chunkMetas)))
-	binary.Write(out, binary.LittleEndian, uint32(len(fileEntries)))
-	// 布局: metaFrame | dataFrame | rawRegion | dictRegion
-	out.Write(metaFrame)
-	out.Write(frame)
-	if rawRegionSize > 0 {
-		rsf.Seek(0, io.SeekStart)
-		io.Copy(out, rsf)
-	}
-	out.Write(dictBuf.Bytes())
-	// trailer
-	out.WriteString(trailerMag)
-	binary.Write(out, binary.LittleEndian, totalUncomp)
-	binary.Write(out, binary.LittleEndian, uint32(len(fileEntries)))
-	binary.Write(out, binary.LittleEndian, uint32(len(chunkMetas)))
+	var hdr bytes.Buffer
+	hdr.WriteString(magic)
+	hdr.Write([]byte{wv, spec.code, byte(spec.window), 0})
+	binary.Write(&hdr, binary.LittleEndian, uint64(len(metaFrame)))
+	binary.Write(&hdr, binary.LittleEndian, uint64(len(metaRaw)))
+	binary.Write(&hdr, binary.LittleEndian, uint64(len(frame)))
+	binary.Write(&hdr, binary.LittleEndian, uint64(rawRegionSize))
+	binary.Write(&hdr, binary.LittleEndian, uint32(len(chunkMetas)))
+	binary.Write(&hdr, binary.LittleEndian, uint32(len(fileEntries)))
+	// trailer: "XACH" + totalUncomp(8) + nFiles(4) + nChunks(4)
+	var trl bytes.Buffer
+	trl.WriteString(trailerMag)
+	binary.Write(&trl, binary.LittleEndian, totalUncomp)
+	binary.Write(&trl, binary.LittleEndian, uint32(len(fileEntries)))
+	binary.Write(&trl, binary.LittleEndian, uint32(len(chunkMetas)))
 
-	sz, _ := out.Stat()
+	// 布局: metaFrame | dataFrame | rawRegion | dictRegion
+	mustWrite(out, hdr.Bytes(), "头部")
+	mustWrite(out, metaFrame, "元数据帧")
+	mustWrite(out, frame, "数据帧")
+	if rawRegionSize > 0 {
+		if _, err := rsf.Seek(0, io.SeekStart); err != nil {
+			fatal("临时文件定位失败: %v", err)
+		}
+		mustCopy(out, rsf, "原样区")
+	}
+	mustWrite(out, dictBuf.Bytes(), "训练字典区")
+	mustWrite(out, trl.Bytes(), "尾部")
+	if err := out.Sync(); err != nil {
+		fatal("刷盘失败(磁盘可能已满): %v", err)
+	}
+	sz, serr := out.Stat()
+	// 先 Stat 再 Close: Close 之后 fd 失效, 取不到大小了
+	if err := out.Close(); err != nil {
+		fatal("关闭归档失败(磁盘可能已满): %v", err)
+	}
+	if serr != nil {
+		fatal("取归档大小失败: %v", serr)
+	}
+
 	raw := totalUncomp
 	// 全是空文件/空目录时 raw==0, 直接除会得到 +Inf% —— 显示成 "-" 更诚实
 	ratio := "-"

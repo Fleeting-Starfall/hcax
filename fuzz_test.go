@@ -309,3 +309,25 @@ func TestRandomCorruptionDoesNotCrash(t *testing.T) {
 		t.Error("40 次随机损坏一次都没被检测出来 —— 损坏检测可能形同虚设")
 	}
 }
+
+// ---------- 写盘失败必须被报告, 不能静默产出截断文件 ----------
+
+func TestMustWriteReportsError(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer w.Close()
+	r.Close() // 读端关掉 -> 写会返回 EPIPE(Go 对非 std fd 忽略 SIGPIPE)
+
+	if !runCatchingFatal(func() { mustWrite(w, []byte("hello"), "测试") }) {
+		t.Error("写入失败却没有报错 —— 磁盘满时会静默产出截断文件")
+	}
+	if !runCatchingFatal(func() { mustCopy(w, bytes.NewReader([]byte("hello")), "测试") }) {
+		t.Error("Copy 失败却没有报错")
+	}
+	// 空切片不该触发写入(否则每个空文件都会多一次无谓的 Write 调用)
+	if runCatchingFatal(func() { mustWrite(w, nil, "测试") }) {
+		t.Error("写空内容不该报错")
+	}
+}

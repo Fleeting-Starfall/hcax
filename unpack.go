@@ -467,7 +467,12 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	if err != nil {
 		fatal("create %s: %v", target, err)
 	}
-	defer out.Close()
+	// Close 也要检查: 数据在内核页缓存里, Close 之前的 Write 成功不代表真的落盘
+	defer func() {
+		if err := out.Close(); err != nil {
+			fatal("关闭 %s 失败(磁盘可能已满): %v", fe.name, err)
+		}
+	}()
 	// 文件级光栅变换(v7): 变换跨块生效, 必须先拼出整文件再逆变换
 	if len(fe.chunks) > 0 && (fe.xform == xfRasterMed || fe.xform == xfRasterRctMed) {
 		buf := []byte{}
@@ -480,7 +485,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 		if uint64(len(buf)) != fe.size {
 			fatal("文件 %s 大小不符: 期望 %d 实际 %d", fe.name, fe.size, len(buf))
 		}
-		out.Write(buf)
+		mustWrite(out, buf, fe.name)
 		os.Chmod(target, os.FileMode(fe.mode))
 		os.Chtimes(target, entryTime(fe), entryTime(fe))
 		return
@@ -500,12 +505,12 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 			if uint64(len(buf)) != fe.size {
 				fatal("文件 %s 大小不符: 期望 %d 实际 %d", fe.name, fe.size, len(buf))
 			}
-			out.Write(buf)
+			mustWrite(out, buf, fe.name)
 			os.Chmod(target, os.FileMode(fe.mode))
 			os.Chtimes(target, entryTime(fe), entryTime(fe))
 			return
 		}
-		out.Write(first)
+		mustWrite(out, first, fe.name)
 		if uint64(len(first)) == fe.size {
 			os.Chmod(target, os.FileMode(fe.mode))
 			os.Chtimes(target, entryTime(fe), entryTime(fe))
@@ -514,7 +519,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 		var written2 uint64 = uint64(len(first))
 		for _, ix := range fe.chunks[1:] {
 			cb := a.readChunk(ix, verify)
-			out.Write(cb)
+			mustWrite(out, cb, fe.name)
 			written2 += uint64(len(cb))
 		}
 		if written2 != fe.size {
