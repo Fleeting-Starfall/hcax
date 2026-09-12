@@ -6,7 +6,9 @@ package main
 // 纯算法, 无 AI/大模型, 纯 CPU。编解码完全对称(确定性)。
 
 import (
+	"bytes"
 	"encoding/binary"
+	"io"
 	"math"
 )
 
@@ -417,7 +419,10 @@ func cmCompress(data []byte) []byte {
 	return out
 }
 
-func cmDecompress(frame []byte) []byte {
+// cmDecompressTo 把解压结果顺序写入 w(而非整份返回)。
+// CM 是逐 bit 串行解码, 无法随机访问, 但输出天然是流式的 —— 写 w 即可让解压
+// 不再要求"输出全量常驻内存"(解包侧落临时文件所需)。
+func cmDecompressTo(w io.Writer, frame []byte) error {
 	if len(frame) < 9 || frame[0] != 1 {
 		fatal("cm 帧格式错误")
 	}
@@ -429,7 +434,8 @@ func cmDecompress(frame []byte) []byte {
 	c.dec = &arDec{}
 	c.dec.init(frame[9:])
 	c.c0 = 1
-	out := make([]byte, 0, n)
+	var buf [64 << 10]byte
+	bn := 0
 	for j := uint64(0); j < n; j++ {
 		var b byte
 		for i := 7; i >= 0; i-- {
@@ -438,8 +444,27 @@ func cmDecompress(frame []byte) []byte {
 			c.update(bit, pm, st)
 			b = (b << 1) | byte(bit)
 		}
-		out = append(out, b)
+		buf[bn] = b
+		bn++
+		if bn == len(buf) {
+			if _, err := w.Write(buf[:bn]); err != nil {
+				return err
+			}
+			bn = 0
+		}
 		c.byteDone(b)
 	}
-	return out
+	if bn > 0 {
+		_, err := w.Write(buf[:bn])
+		return err
+	}
+	return nil
+}
+
+func cmDecompress(frame []byte) []byte {
+	var out bytes.Buffer
+	if err := cmDecompressTo(&out, frame); err != nil {
+		fatal("cm 解压: %v", err)
+	}
+	return out.Bytes()
 }

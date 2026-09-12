@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/klauspost/compress/zstd"
+	"github.com/ulikunitz/xz"
 )
 
 type chunker struct {
@@ -45,6 +46,8 @@ type fileEntry struct {
 	mode   uint32
 	chunks []uint32
 	isDir  bool // 目录条目(空目录也保留)
+	isLink bool // v9: 符号链接条目(存链接目标, 不存文件内容)
+	link   string
 	// xform: 文件级预处理标记(v7)。光栅图(BMP/TGA/PNM)在分块之前对整文件做过
 	// 二维预测/色彩去相关, 该变换跨块生效, 故必须记在文件级而非块级。
 	// 非光栅文件恒为 xfNone。
@@ -80,6 +83,9 @@ func serializeMeta(chunks []*chunkMeta, files []fileEntry, solidHash, rawHash [8
 			f |= 1
 		}
 		f |= (fe.xform & 0x0f) << 1 // v7: 文件级光栅变换
+		if fe.isLink {
+			f |= 0x20 // v9: 符号链接
+		}
 		b.WriteByte(f)
 		binary.Write(&b, binary.LittleEndian, fe.size)
 		binary.Write(&b, binary.LittleEndian, uint32(fe.mtime))
@@ -87,6 +93,11 @@ func serializeMeta(chunks []*chunkMeta, files []fileEntry, solidHash, rawHash [8
 		binary.Write(&b, binary.LittleEndian, uint32(len(fe.chunks)))
 		for _, ix := range fe.chunks {
 			binary.Write(&b, binary.LittleEndian, ix)
+		}
+		if fe.isLink { // v9: 链接目标跟在该条目之后
+			lb := []byte(fe.link)
+			binary.Write(&b, binary.LittleEndian, uint16(len(lb)))
+			b.Write(lb)
 		}
 	}
 	return b.Bytes()
@@ -131,6 +142,7 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 		if ver >= 7 {
 			files[i].xform = (f >> 1) & 0x0f
 		}
+		files[i].isLink = ver >= 9 && f&0x20 != 0
 		files[i].size = binary.LittleEndian.Uint64(m[pos : pos+8])
 		pos += 8
 		files[i].mtime = uint64(binary.LittleEndian.Uint32(m[pos : pos+4]))
@@ -145,25 +157,41 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 			pos += 4
 		}
 		files[i].chunks = idxs
+		if files[i].isLink {
+			tl := int(binary.LittleEndian.Uint16(m[pos : pos+2]))
+			pos += 2
+			files[i].link = string(m[pos : pos+tl])
+			pos += tl
+		}
 	}
 	return chunks, files, sh, rh
 }
 
 // ---------- pack ----------
 
-// 收集输入的文件与目录(目录也收集 -> 空目录不会丢失)
-func collectPaths(inputs []string) (files []string, dirs []string) {
+// 收集输入的文件/目录/符号链接(目录也收集 -> 空目录不会丢失)。
+// 符号链接单独归类: 用 Lstat 而非 Stat, 保证"链接本身"被记录, 而不是跟随它去读目标内容。
+// 旧实现把链接当普通文件读: 指向目录的链接会让 Read 返回 EISDIR 直接打包失败;
+// 指向文件的链接则把目标内容复制一份存进归档, 解包后变成普通文件 —— 语义错误且浪费空间。
+
+func collectPaths(inputs []string) (files []string, dirs []string, links []string) {
 	for _, p := range inputs {
-		fi, err := os.Stat(p)
+		fi, err := os.Lstat(p)
 		if err != nil {
 			fatal("stat %s: %v", p, err)
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			links = append(links, p)
+			continue
 		}
 		if fi.IsDir() {
 			filepath.Walk(p, func(q string, info os.FileInfo, err error) error {
 				if err != nil {
 					return nil
 				}
-				if info.IsDir() {
+				if info.Mode()&os.ModeSymlink != 0 {
+					links = append(links, q)
+				} else if info.IsDir() {
 					dirs = append(dirs, q)
 				} else {
 					files = append(files, q)
@@ -237,11 +265,15 @@ func pack(inputs []string, outPath, mode string) {
 	if !ok {
 		fatal("未知模式 %s", mode)
 	}
-	files, dirs := collectPaths(inputs)
-	if len(files) == 0 && len(dirs) == 0 {
+	files, dirs, links := collectPaths(inputs)
+	if len(files) == 0 && len(dirs) == 0 && len(links) == 0 {
 		fatal("没有可打包的文件")
 	}
-	root := commonRoot(files)
+	// 归档根 = **输入参数**的公共父目录(与 tar/zip 一致): pack out.hcax dir -> 存 dir/a/b/c。
+	// 旧实现用 commonRoot(**文件**) —— 当所有文件都在子目录里时(如 src/main/go/*.go),
+	// 公共根会被推到 src/main/go, 该层之上的目录全部退化成 basename:
+	// src/main/go/main.go 存成 main.go, 且 go/ 这一层彻底消失 —— 目录结构被拍平(数据损坏)。
+	root := commonRoot(inputs)
 	be := newBackend(spec)
 
 	chunkMap := map[[16]byte]*chunkMeta{}
@@ -260,17 +292,36 @@ func pack(inputs []string, outPath, mode string) {
 	if err != nil {
 		fatal("临时文件: %v", err)
 	}
-	defer os.Remove(csf.Name())
-	defer os.Remove(rsf.Name())
-	defer csf.Close()
-	defer rsf.Close()
+	// 清理交给 addCleanup: defer 在 fatal(os.Exit) 下不会执行, 会泄漏临时文件
+	addCleanup(func() {
+		csf.Close()
+		rsf.Close()
+		os.Remove(csf.Name())
+		os.Remove(rsf.Name())
+	})
 	var trainSamples [][]byte
 	var trainBytes int
 	var compSolidSize, rawRegionSize int64
 	nStored, nComp := 0, 0
 
-	blk := make([]byte, 1<<20)
+	// 先统计总字节数, 用于显示进度。打包数百 MB 的语料要跑几十秒,
+	// 全程没有任何反馈会让人误以为卡死 —— 进度只写 stderr, 不污染 stdout 的机器可读输出。
+	var totalBytes uint64
 	for _, fp := range files {
+		if fi, e := os.Lstat(fp); e == nil {
+			totalBytes += uint64(fi.Size())
+		}
+	}
+	showProgress := totalBytes >= 32<<20
+	var lastReport uint64
+
+	blk := make([]byte, 1<<20)
+	for fi, fp := range files {
+		if showProgress && totalUncomp-lastReport >= 16<<20 {
+			lastReport = totalUncomp
+			fmt.Fprintf(os.Stderr, "\r  分块中 %d/%d 文件, %.0f%%   ",
+				fi+1, len(files), 100.0*float64(totalUncomp)/float64(totalBytes))
+		}
 		f, err := os.Open(fp)
 		if err != nil {
 			fatal("open %s: %v", fp, err)
@@ -407,6 +458,9 @@ func pack(inputs []string, outPath, mode string) {
 		})
 		totalUncomp += uint64(st.Size())
 	}
+	if showProgress {
+		fmt.Fprintf(os.Stderr, "\r  分块中 %d/%d 文件, 100%%   \n", len(files), len(files))
+	}
 	if os.Getenv("HCAX_T") != "" {
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)
@@ -426,6 +480,24 @@ func pack(inputs []string, outPath, mode string) {
 		fileEntries = append(fileEntries, fileEntry{
 			name: rel, size: 0, mtime: uint64(di.ModTime().Unix()),
 			mode: uint32(di.Mode().Perm()), isDir: true,
+		})
+	}
+
+	// 符号链接(v9): 只存链接目标字符串, 不读内容、不占数据块。
+	// size 记为链接目标的长度(与 tar 一致, 仅作信息展示, 不代表归档里的数据量)。
+	for _, lp := range links {
+		tgt, err := os.Readlink(lp)
+		if err != nil {
+			fatal("读取符号链接 %s: %v", lp, err)
+		}
+		li, err := os.Lstat(lp)
+		if err != nil {
+			fatal("stat %s: %v", lp, err)
+		}
+		fileEntries = append(fileEntries, fileEntry{
+			name: storedName(lp, root), size: uint64(len(tgt)),
+			mtime: uint64(li.ModTime().Unix()), mode: uint32(li.Mode().Perm()),
+			isLink: true, link: tgt,
 		})
 	}
 
@@ -561,10 +633,19 @@ func pack(inputs []string, outPath, mode string) {
 		binary.Write(&dictBuf, binary.LittleEndian, uint32(0))
 	}
 
+	// 只在含符号链接时才升到 v9: 普通归档仍写 v8, 旧版二进制照样能解开
+	wv := byte(verCompat)
+	for i := range fileEntries {
+		if fileEntries[i].isLink {
+			wv = version
+			break
+		}
+	}
+
 	// header(v6, 48B): magic ver code window flag
 	//                | metaCompLen metaRawLen compLen rawLen | nChunks nFiles
 	out.WriteString(magic)
-	out.Write([]byte{version, spec.code, byte(spec.window), 0})
+	out.Write([]byte{wv, spec.code, byte(spec.window), 0})
 	binary.Write(out, binary.LittleEndian, uint64(len(metaFrame)))
 	binary.Write(out, binary.LittleEndian, uint64(len(metaRaw)))
 	binary.Write(out, binary.LittleEndian, uint64(len(frame)))
@@ -587,6 +668,7 @@ func pack(inputs []string, outPath, mode string) {
 
 	sz, _ := out.Stat()
 	raw := totalUncomp
+	runCleanups() // 成功路径也要删临时文件(清理钩子本身幂等, 重复执行无副作用)
 	fmt.Printf("打包完成: %s  原始 %d B -> %d B  压率 %.2f%%  模式=%s  唯一块=%d(可压%d/原样%d)\n",
 		outPath, raw, sz.Size(), 100.0*float64(sz.Size())/float64(raw), mode, len(chunkMetas), nComp, nStored)
 }
@@ -598,7 +680,9 @@ func openArchive(path string) *archive {
 	if err != nil {
 		fatal("open %s: %v", path, err)
 	}
-	defer f.Close()
+	// 句柄需在整个解包过程存活(原样区/数据区按需 ReadAt), 故不能用 defer 关闭:
+	// defer 在 fatal(os.Exit) 下不执行, 交给统一清理钩子。
+	addCleanup(func() { f.Close() })
 	hdr := make([]byte, 48)
 	if _, err := io.ReadFull(f, hdr[:8]); err != nil {
 		fatal("读头失败: %v", err)
@@ -607,7 +691,7 @@ func openArchive(path string) *archive {
 		fatal("不是 HCAX 文件")
 	}
 	ver := hdr[4]
-	if ver < 2 || ver > 8 {
+	if ver < 2 || ver > version {
 		fatal("版本不兼容: %d", ver)
 	}
 	spec := modeSpec{code: hdr[5], window: int(hdr[6])}
@@ -651,6 +735,7 @@ func openArchive(path string) *archive {
 						if dec, e := zstd.NewReader(bytes.NewReader(nil), zstd.WithDecoderDicts(d)); e == nil {
 							be.zDecDict = dec
 						}
+						be.dictBytes = d // 流式解压时需用它重建解码器
 					}
 				}
 			}
@@ -666,24 +751,10 @@ func openArchive(path string) *archive {
 			fatal("元数据长度不符: 期望 %d 实际 %d", metaRawLen, len(metaRaw))
 		}
 		chunks, files, sh, rh := parseMeta(metaRaw, nChunks, nFiles, ver)
-		// 3) 数据区
-		f.Seek(dataOff, io.SeekStart)
-		var compSolid []byte
-		if compLen > 0 {
-			fr := make([]byte, compLen)
-			if _, err := io.ReadFull(f, fr); err != nil {
-				fatal("读数据区失败: %v", err)
-			}
-			compSolid = be.decompress(fr)
-		}
-		rawRegion := make([]byte, rawLen)
-		if rawLen > 0 {
-			if _, err := io.ReadFull(f, rawRegion); err != nil {
-				fatal("读原样区失败: %v", err)
-			}
-		}
-		return &archive{spec: spec, be: be, dataStart: dataOff, compSolid: compSolid,
-			rawRegion: rawRegion, chunks: chunks, files: files, hashLen: 0,
+		// 3) 数据区: 只记录位置, 不读不解压 —— 按需(惰性)解压见 ensureSolid
+		return &archive{spec: spec, be: be, src: f, dataStart: dataOff,
+			compLen: int64(compLen), rawOff: rawOff, rawLen: int64(rawLen),
+			chunks: chunks, files: files, hashLen: 0,
 			solidHash: sh, rawHash: rh, ver: ver}
 	}
 
@@ -776,36 +847,112 @@ func openArchive(path string) *archive {
 				if dec, e := zstd.NewReader(bytes.NewReader(nil), zstd.WithDecoderDicts(d)); e == nil {
 					be.zDecDict = dec
 				}
+				be.dictBytes = d
 			}
 		}
 	}
 
-	// 现在回读数据区并解压(字典已就绪)
-	var compSolid []byte
-	f.Seek(dataStart, io.SeekStart)
-	if compLen > 0 {
-		frame := make([]byte, compLen)
-		if _, err := io.ReadFull(f, frame); err != nil {
-			fatal("读数据区失败: %v", err)
-		}
-		compSolid = be.decompress(frame)
+	// 数据区同样只记位置(惰性解压): 旧版布局为 [数据区][原样区][块表][文件表][字典区]
+	return &archive{spec: spec, be: be, src: f, dataStart: dataStart,
+		compLen: int64(compLen), rawOff: dataStart + int64(compLen), rawLen: int64(rawLen),
+		chunks: chunks, files: files, hashLen: 16, ver: ver}
+}
+
+// 惰性解压固实流到至少 need 字节为止。
+// 首次调用时才建临时文件与解压器; 后续若已解压够长则直接返回(零成本)。
+// 关键收益: (1) list/verify 这类不需要数据的命令不再解压; (2) extract 只抽归档前部的
+// 文件时, 解压到其块末尾即可停止, 不必解完整条流; (3) 解包峰值内存有界(数据在临时文件)。
+
+func (a *archive) ensureSolid(need uint64) {
+	if a.solidEOF || int64(need) <= a.solidSize {
+		return
 	}
-	rawRegion := make([]byte, rawLen)
-	if rawLen > 0 {
-		if _, err := io.ReadFull(f, rawRegion); err != nil {
-			fatal("读原样区失败: %v", err)
+	if a.solidFile == nil {
+		tf, err := os.CreateTemp("", "hcax-solid-")
+		if err != nil {
+			fatal("临时文件: %v", err)
+		}
+		a.solidFile = tf
+		addCleanup(func() {
+			tf.Close()
+			os.Remove(tf.Name())
+		})
+		var r io.Reader
+		var closeFn func()
+		if a.spec.backend == "lzma2" {
+			fr := io.NewSectionReader(a.src, a.dataStart, a.compLen)
+			xr, err := xz.NewReader(fr)
+			if err != nil {
+				fatal("xz reader: %v", err)
+			}
+			r, closeFn = xr, nil
+		} else {
+			fr := io.NewSectionReader(a.src, a.dataStart, a.compLen)
+			r, closeFn, err = a.be.decompressReader(fr)
+			if err != nil {
+				fatal("解压器: %v", err)
+			}
+		}
+		a.solidR = r
+		if closeFn != nil {
+			addCleanup(closeFn)
 		}
 	}
-	return &archive{spec: spec, be: be, dataStart: dataStart, compSolid: compSolid, rawRegion: rawRegion, chunks: chunks, files: files, hashLen: 16, ver: ver}
+	want := int64(need) - a.solidSize
+	n, err := io.CopyN(a.solidFile, a.solidR, want)
+	a.solidSize += n
+	if err != nil {
+		if err == io.EOF {
+			a.solidEOF = true
+		} else {
+			fatal("解压固实流: %v", err)
+		}
+	}
+}
+
+// 把固实流完整解压到底(校验等需要全量数据的场景)
+func (a *archive) drainSolid() {
+	for !a.solidEOF {
+		a.ensureSolid(uint64(a.solidSize) + 1<<20)
+	}
+}
+
+// 预先解压到"这批文件所需的最大偏移", 使后续 readChunk 不再触发解压。
+// 抽取归档前部的少量文件时, 可省掉解压整条流的开销。
+func (a *archive) prepareFor(files []fileEntry) {
+	var maxEnd uint64
+	for _, fe := range files {
+		for _, ix := range fe.chunks {
+			if ix >= uint32(len(a.chunks)) {
+				continue
+			}
+			cm := a.chunks[ix]
+			if cm.stored {
+				continue
+			}
+			if e := cm.offset + uint64(cm.uncomp); e > maxEnd {
+				maxEnd = e
+			}
+		}
+	}
+	if maxEnd > 0 {
+		a.ensureSolid(maxEnd)
+	}
 }
 
 func (a *archive) readChunk(idx uint32, verify bool) []byte {
 	cm := a.chunks[idx]
-	var out []byte
+	out := make([]byte, cm.uncomp)
 	if cm.stored {
-		out = a.rawRegion[cm.offset : cm.offset+uint64(cm.uncomp)]
+		// 原样区不解压, 直接从归档文件按偏移读 —— 零额外内存
+		if _, err := a.src.ReadAt(out, a.rawOff+int64(cm.offset)); err != nil {
+			fatal("读原样区: %v", err)
+		}
 	} else {
-		out = a.compSolid[cm.offset : cm.offset+uint64(cm.uncomp)]
+		a.ensureSolid(cm.offset + uint64(cm.uncomp))
+		if _, err := a.solidFile.ReadAt(out, int64(cm.offset)); err != nil {
+			fatal("读固实流: %v", err)
+		}
 	}
 	out = applyXform(cm.xform, out, true)
 	if verify && a.hashLen > 0 { // 旧版: 逐块校验; v6 走流级校验(verifyStream)
@@ -826,14 +973,16 @@ func (a *archive) verifyStream() {
 	if a.hashLen != 0 {
 		return
 	}
-	if len(a.compSolid) > 0 {
-		h := hash16(a.compSolid)
+	if a.compLen > 0 {
+		a.drainSolid() // 校验需要全量数据
+		a.solidFile.Seek(0, io.SeekStart)
+		h := hashReader(a.solidFile)
 		if !bytes.Equal(h[:8], a.solidHash[:]) {
 			fatal("固实流校验失败(数据损坏)")
 		}
 	}
-	if len(a.rawRegion) > 0 {
-		h := hash16(a.rawRegion)
+	if a.rawLen > 0 {
+		h := hashReader(io.NewSectionReader(a.src, a.rawOff, a.rawLen))
 		if !bytes.Equal(h[:8], a.rawHash[:]) {
 			fatal("原样区校验失败(数据损坏)")
 		}
@@ -841,10 +990,10 @@ func (a *archive) verifyStream() {
 }
 
 func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
-	target := filepath.Join(outDir, fe.name)
-	if strings.HasPrefix(fe.name, "/") || strings.Contains(fe.name, "..") {
+	if !safeName(fe.name) {
 		fatal("非法路径: %s", fe.name)
 	}
+	target := joinOut(outDir, fe.name)
 	// 目录条目(含空目录): 直接建目录
 	if fe.isDir {
 		if err := os.MkdirAll(target, 0o755); err != nil {
@@ -853,8 +1002,26 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 		os.Chmod(target, os.FileMode(fe.mode))
 		return
 	}
+	// 符号链接(v9): 重建链接本身, 不写内容。
+	// 注: Go 标准库没有 lutimes, 链接自身的 mtime 无法还原(只还原普通文件/目录的)。
+	if fe.isLink {
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			fatal("mkdir: %v", err)
+		}
+		os.Remove(target) // 覆盖同名已存在的文件/链接
+		if err := os.Symlink(fe.link, target); err != nil {
+			fatal("symlink %s: %v", fe.name, err)
+		}
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 		fatal("mkdir: %v", err)
+	}
+	// 防"先建链接再写穿": 归档里若先有条目在 target 处建了符号链接(比如 -> /etc),
+	// 后续同名文件条目经 os.Create 会跟随该链接写到链接指向的目录里去。
+	// 写文件前先把已存在的符号链接摘掉, 保证只会写解包目录内部。
+	if li, e := os.Lstat(target); e == nil && li.Mode()&os.ModeSymlink != 0 {
+		os.Remove(target)
 	}
 	out, err := os.Create(target)
 	if err != nil {
@@ -932,9 +1099,11 @@ func unpack(archivePath, outDir string, verify bool, only []string) {
 	}
 	os.MkdirAll(outDir, 0o755)
 	if len(only) == 0 {
+		// 全量解包: 顺序读取, 固实流按需推进即可
 		for _, fe := range a.files {
 			a.extractFile(fe, outDir, verify)
 		}
+		runCleanups()
 		fmt.Printf("解包完成: %d 文件 -> %s  模式=%s 校验=%v\n", len(a.files), outDir, modeName(a.spec.code), verify)
 		return
 	}
@@ -942,14 +1111,19 @@ func unpack(archivePath, outDir string, verify bool, only []string) {
 	for _, o := range only {
 		set[o] = true
 	}
-	n := 0
+	var want []fileEntry
 	for _, fe := range a.files {
 		if set[fe.name] || set[filepath.Base(fe.name)] {
-			a.extractFile(fe, outDir, verify)
-			n++
+			want = append(want, fe)
 		}
 	}
-	fmt.Printf("抽取完成: %d 文件 -> %s  模式=%s 校验=%v\n", n, outDir, modeName(a.spec.code), verify)
+	// 只解到目标文件的块末尾为止: 抽归档前部的小文件不必解压整条固实流
+	a.prepareFor(want)
+	for _, fe := range want {
+		a.extractFile(fe, outDir, verify)
+	}
+	runCleanups()
+	fmt.Printf("抽取完成: %d 文件 -> %s  模式=%s 校验=%v\n", len(want), outDir, modeName(a.spec.code), verify)
 }
 
 func modeName(code byte) string {
@@ -965,7 +1139,14 @@ func listArchive(archivePath string) {
 	a := openArchive(archivePath)
 	var tot uint64
 	for _, fe := range a.files {
-		fmt.Printf("  %12d  %s\n", fe.size, fe.name)
+		switch {
+		case fe.isDir:
+			fmt.Printf("  %12s  %s/\n", "<dir>", fe.name)
+		case fe.isLink:
+			fmt.Printf("  %12s  %s -> %s\n", "<link>", fe.name, fe.link)
+		default:
+			fmt.Printf("  %12d  %s\n", fe.size, fe.name)
+		}
 		tot += fe.size
 	}
 	fmt.Printf("共 %d 文件, 原大小 %d B, 唯一块 %d\n", len(a.files), tot, len(a.chunks))
@@ -988,7 +1169,60 @@ func verifyArchive(archivePath string) {
 	fmt.Printf("校验通过: %d 块全部哈希一致, 解压数据 %d B\n", len(a.chunks), tot)
 }
 
+// ---------- 清理钩子 ----------
+// fatal() 用 os.Exit(1) 终止进程, 而 Go 的 defer 在 os.Exit 时**不会执行**。
+// 自 v8e 起打包会把固实流/原样区落到临时文件(可达数百 MB), 一旦走到任何 fatal 分支
+// (读文件失败、磁盘满、格式损坏...) 这些临时文件就会永久留在 TMPDIR。
+// 这里改用显式注册的清理钩子: 正常结束与 fatal 两条路径都会执行。
+
+var cleanupFns []func()
+
+func addCleanup(f func()) {
+	cleanupFns = append(cleanupFns, f)
+}
+
+func runCleanups() {
+	for i := len(cleanupFns) - 1; i >= 0; i-- {
+		cleanupFns[i]()
+	}
+	cleanupFns = nil
+}
+
 func fatal(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, "错误: "+format+"\n", args...)
+	runCleanups()
 	os.Exit(1)
+}
+
+// ---------- 归档内文件名校验 ----------
+// 老实现是 strings.Contains(name, "..") 一刀切: 会把 "a..b.txt"、"..hidden" 这类
+// 完全合法的文件名误判为路径穿越攻击。后果是"能打包、解不开"——数据被自己锁死。
+// 正确做法是逐段判断: 任何一段恰好等于 ".." 才算逃逸; 同时拒绝绝对路径。
+// 反斜杠一并检查, 防止 Windows 风格路径名在 Unix 上被当成普通字符放过。
+
+func safeName(name string) bool {
+	if name == "" {
+		return false
+	}
+	if filepath.IsAbs(name) {
+		return false
+	}
+	for _, sep := range []string{"/", "\\"} {
+		for _, p := range strings.Split(name, sep) {
+			if p == ".." {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// 拼出解包目标路径, 并二次确认结果仍在 outDir 之内(纵深防御)
+func joinOut(outDir, name string) string {
+	target := filepath.Join(outDir, filepath.FromSlash(name))
+	root := filepath.Clean(outDir) + string(os.PathSeparator)
+	if !strings.HasPrefix(target, root) {
+		fatal("非法路径(逃逸出解包目录): %s", name)
+	}
+	return target
 }

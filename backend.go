@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"io"
+	"os"
 	"os/exec"
 	"runtime"
 	"sync"
@@ -39,7 +40,7 @@ var modes = map[string]modeSpec{
 	"best":  {1, "zstd", 19, 27, false, false},
 	"max":   {2, "lzma2", 9, 27, false, true},
 	"ultra": {3, "lzma2", 9, 27, false, false}, // v8b: 关固实(去重), 内存从 ~1.8GB 降到 ~max 级(~86MB); 仍单流全流选参保压率(区别于 max 的并行)
-	"text":  {4, "cm", 0, 0, false, false}, // 上下文混合: 对文本/代码/源数据极高压缩率(纯算法, 慢)
+	"text":  {4, "cm", 0, 0, false, false},     // 上下文混合: 对文本/代码/源数据极高压缩率(纯算法, 慢)
 }
 
 type backend struct {
@@ -54,6 +55,7 @@ type backend struct {
 	pbParam   string        // lzma2 pb(position bits), 自适应选取
 	trainDict []byte        // zstd(best)训练字典正文(流式压缩时复用以建输出编码器)
 	hasDict   bool
+	dictBytes []byte // 归档里的训练字典正文(流式**解压**时需重建带字典的解码器)
 }
 
 func newBackend(spec modeSpec) *backend {
@@ -307,11 +309,11 @@ func (b *backend) compress(cb []byte) []byte {
 	// lzma2 档: 系统 xz (lzma2, xz 容器) 取得接近 7z 的极高压缩率; 缺失则回退 ulikunitz xz。
 	// 精调 lzma2 参数(dict/nice/lc/lp/pb) + dict 按量收敛, 比 -9e 预设再小约 0.34%, 同速。
 	if b.spec.backend == "lzma2" {
-	if out := b.xzCompress(bytes.NewReader(cb), b.lcParam, b.pbParam, b.dictParam); out != nil {
-		return out
-	}
-	var buf bytes.Buffer
-	w, err := xz.NewWriter(&buf)
+		if out := b.xzCompress(bytes.NewReader(cb), b.lcParam, b.pbParam, b.dictParam); out != nil {
+			return out
+		}
+		var buf bytes.Buffer
+		w, err := xz.NewWriter(&buf)
 		if err != nil {
 			fatal("xz writer: %v", err)
 		}
@@ -498,18 +500,69 @@ func (b *backend) decompress(frame []byte) []byte {
 	return out
 }
 
+// 流式解压: 返回一个按后端封装好的 reader, 供"边解压边落盘"使用。
+// 与 decompress(整份在内存) 的区别在于输出不再要求常驻 —— 这是解包侧内存有界的前提。
+// 返回的 closeFn 负责释放解码器资源(zstd 会起后台 goroutine), 可为 nil。
+
+func (b *backend) decompressReader(r io.Reader) (io.Reader, func(), error) {
+	switch b.spec.backend {
+	case "cm":
+		// CM 必须先拿到完整压缩帧(自描述长度头在帧首), 但输出是流式的:
+		// 用 pipe 把 cmDecompressTo 的输出接到 reader 上, 内存只留一个 64KiB 缓冲。
+		frame, err := io.ReadAll(r)
+		if err != nil {
+			return nil, nil, err
+		}
+		pr, pw := io.Pipe()
+		go func() {
+			pw.CloseWithError(cmDecompressTo(pw, frame))
+		}()
+		return pr, func() { pr.Close() }, nil
+	case "zstd":
+		opts := []zstd.DOption{}
+		if len(b.dictBytes) > 0 {
+			opts = append(opts, zstd.WithDecoderDicts(b.dictBytes))
+		}
+		d, err := zstd.NewReader(r, opts...)
+		if err != nil {
+			return nil, nil, err
+		}
+		return d, func() { d.Close() }, nil
+	default: // lzma2: xz 容器, 本身即流式
+		xr, err := xz.NewReader(r)
+		if err != nil {
+			return nil, nil, err
+		}
+		return xr, nil, nil
+	}
+}
+
 // ---------- container structs ----------
 
 type archive struct {
 	spec      modeSpec
 	be        *backend
 	dataStart int64
-	compSolid []byte
-	rawRegion []byte
+
+	// 归档文件句柄: 原样区/数据区按需 ReadAt, 不再整段读进内存
+	src     *os.File
+	compLen int64 // 压缩帧字节数
+	rawOff  int64 // 原样区在归档文件中的偏移
+	rawLen  int64
+
+	// 固实流解压结果落临时文件(与打包侧 v8e 对称), 且**惰性解压**:
+	// 只有真正要读某个块时才解压到该块末尾为止。
+	// 此前 openArchive 无条件把整条固实流 + 原样区解进内存 —— list 一个归档
+	// 要吃掉全量数据的内存, extract 单个小文件也要解压整条流。
+	solidFile *os.File
+	solidR    io.Reader // 解压器(保留以便续解压)
+	solidSize int64     // 已解压字节数
+	solidEOF  bool      // 流已到底
+
 	chunks    []chunkMeta
 	files     []fileEntry
 	ver       byte // 归档格式版本(v7 起文件级变换显式记录; 更早版本靠启发式判断)
-	hashLen   int // 逐块哈希长度: 旧版=16, v6=0(改用流级校验)
+	hashLen   int  // 逐块哈希长度: 旧版=16, v6=0(改用流级校验)
 	solidHash [8]byte
 	rawHash   [8]byte
 }

@@ -9,7 +9,10 @@ import (
 const (
 	magic      = "HCAX"
 	trailerMag = "XACH"
-	version    = 8 // v8: 修复大文件打包内存爆涨(门控 zstd 128MiB 历史缓冲→1MiB); 复用块缓冲(sync.Pool) + 去重前置 + 块数据及时释放; 兼容读 v2~v7
+	version    = 9 // v9: 符号链接条目(文件表 flag bit5 + 链接目标)。兼容读 v2~v9
+	// 仅当归档内**确实存在符号链接**时才写 v9; 没有链接的归档仍写 v8,
+	// 这样旧版二进制照样能解开新工具打的包(格式演进不破坏既有生态)。
+	verCompat = 8
 
 	chunkBits = 16
 	chunkMin  = 8 * 1024
@@ -92,7 +95,7 @@ func (c *chunker) write(p []byte) {
 		cut := 0
 		i := c.scanned
 		for ; i < end; i++ {
-			c.rh = (c.rh<<1) + c.gear[c.pending[i]]
+			c.rh = (c.rh << 1) + c.gear[c.pending[i]]
 			if i >= c.start+c.minS && (c.rh&c.mask) == 0 {
 				cut = i + 1
 				break
