@@ -154,6 +154,19 @@ if "$BIN" list trunc.hcax >/dev/null 2>&1; then bad "截断的归档被接受了
 if "$BIN" list trunc.hcax 2>&1 | grep -qE '截断|尾部'; then ok "截断报错信息明确"; else bad "截断报错信息含糊"; fi
 
 # ---------------------------------------------------------------- 5. 资源
+
+# 损坏的头部: 长度字段/条目数被改成荒谬值, 必须明确报错而不是 OOM 或 panic
+cp "$A" badhdr.hcax
+python3 - "$PWD/badhdr.hcax" <<'PYX'
+import struct,sys
+p=sys.argv[1]
+d=bytearray(open(p,'rb').read())
+struct.pack_into('<I', d, 40, 0xFFFFFFF0)   # nChunks 荒谬
+open(p,'wb').write(bytes(d))
+PYX
+if "$BIN" list badhdr.hcax >/dev/null 2>&1; then bad "荒谬 nChunks 被接受"; else ok "荒谬 nChunks 被拒绝"; fi
+if "$BIN" list badhdr.hcax 2>&1 | grep -qE '损坏|异常'; then ok "头部损坏报错明确"; else bad "头部损坏报错含糊"; fi
+
 note "5. 资源与卫生"
 count_tmp() { find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'hcax-solid-*' -o -maxdepth 1 -name 'hcax-raw-*' 2>/dev/null | wc -l | tr -d ' '; }
 before=$(count_tmp)

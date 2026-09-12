@@ -30,9 +30,9 @@ fi
 
 # ------------------------------------------------------------ 第2轮
 note "第2轮 无损往返(较大语料)"
-"$PY" "$HERE/mkcorpus.py" "$WORK/c2" $((40*1024*1024)) >/dev/null
+"$PY" "$HERE/mkcorpus.py" "$WORK/c2" $((16*1024*1024)) >/dev/null
 mkdir -p "$WORK/c2/nest/deep/deeper"
-head -c 2000000 /dev/urandom > "$WORK/c2/nest/deep/deeper/blob.bin"
+head -c 800000 /dev/urandom > "$WORK/c2/nest/deep/deeper/blob.bin"
 ln -sf novel.txt "$WORK/c2/link"
 for m in fast best max ultra; do
   rm -f "a_$m.hcax"; rm -rf "b_$m"

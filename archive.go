@@ -103,6 +103,16 @@ func serializeMeta(chunks []*chunkMeta, files []fileEntry, solidHash, rawHash [8
 	return b.Bytes()
 }
 
+// 元数据是从"压缩帧"解压出来的字节流, 一旦归档损坏, 解压出的内容就是任意字节。
+// 老实现逐字段裸解析, 越界直接 panic 崩掉(而不是报"归档损坏")。
+// 这里在每处读取前做边界检查, 把 panic 转成明确的错误。
+
+func need(m []byte, pos, n int, what string) {
+	if pos < 0 || n < 0 || pos+n > len(m) {
+		fatal("元数据损坏: 解析%s时越界(偏移 %d 需要 %d 字节, 元数据共 %d 字节)", what, pos, n, len(m))
+	}
+}
+
 func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileEntry, [8]byte, [8]byte) {
 	pos := 0
 	var sh, rh [8]byte
@@ -113,6 +123,7 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 	chunks := make([]chunkMeta, nChunks)
 	var compOff, rawOff uint64
 	for i := range chunks {
+		need(m, pos, 5, "块表项")
 		chunks[i].uncomp = binary.LittleEndian.Uint32(m[pos : pos+4])
 		pos += 4
 		f := m[pos]
@@ -132,8 +143,10 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 	}
 	files := make([]fileEntry, nFiles)
 	for i := range files {
+		need(m, pos, 2, "文件名长度")
 		nl := int(binary.LittleEndian.Uint16(m[pos : pos+2]))
 		pos += 2
+		need(m, pos, nl+1+8+4+2+4, "文件表项")
 		files[i].name = string(m[pos : pos+nl])
 		pos += nl
 		f := m[pos]
@@ -151,15 +164,24 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 		pos += 2
 		nc := int(binary.LittleEndian.Uint32(m[pos : pos+4]))
 		pos += 4
+		need(m, pos, 4*nc, "文件块索引")
+		if nc > 0 && uint32(nc) > nChunks {
+			fatal("元数据损坏: 文件 %s 引用了 %d 个块, 但块表只有 %d 项", files[i].name, nc, nChunks)
+		}
 		idxs := make([]uint32, nc)
 		for j := range idxs {
 			idxs[j] = binary.LittleEndian.Uint32(m[pos : pos+4])
 			pos += 4
+			if idxs[j] >= nChunks {
+				fatal("元数据损坏: 文件 %s 引用了不存在的块 %d(共 %d 块)", files[i].name, idxs[j], nChunks)
+			}
 		}
 		files[i].chunks = idxs
 		if files[i].isLink {
+			need(m, pos, 2, "链接目标长度")
 			tl := int(binary.LittleEndian.Uint16(m[pos : pos+2]))
 			pos += 2
+			need(m, pos, tl, "链接目标")
 			files[i].link = string(m[pos : pos+tl])
 			pos += tl
 		}
@@ -719,6 +741,7 @@ func openArchive(path string) *archive {
 		dictOff := rawOff + int64(rawLen)
 
 		checkTailMagic(f, rawOff+int64(rawLen))
+		checkHeaderBounds(f, metaCompLen, metaRawLen, compLen, rawLen, nChunks, nFiles)
 
 		// 1) 先装载训练字典(元数据帧可能就是用该字典压的)
 		if _, err := f.Seek(dictOff, io.SeekStart); err == nil {
@@ -892,6 +915,32 @@ func checkTailMagic(f *os.File, dataEnd int64) {
 	}
 	if string(tb) != trailerMag {
 		fatal("尾部魔数不符: 归档被截断或损坏(尾部 %d 字节处不是 %s)", off, trailerMag)
+	}
+}
+
+// 头部字段合理性: 损坏/恶意归档的长度字段可以是任意 64 位值, 直接拿去 make([]byte, N)
+// 会瞬间 OOM 或分配出荒谬的大小; 条目数过大也会让解析失控。在读数据之前先挡掉。
+
+func checkHeaderBounds(f *os.File, metaCompLen, metaRawLen, compLen, rawLen uint64, nChunks, nFiles uint32) {
+	fi, err := f.Stat()
+	if err != nil {
+		return
+	}
+	sz := uint64(fi.Size())
+	if metaCompLen > sz || compLen > sz || rawLen > sz {
+		fatal("头部长度字段异常(归档损坏): metaComp=%d comp=%d raw=%d, 文件仅 %d B",
+			metaCompLen, compLen, rawLen, sz)
+	}
+	if 48+metaCompLen+compLen+rawLen+20 > sz {
+		fatal("头部布局超出文件大小(归档损坏或截断)")
+	}
+	if metaRawLen > 1<<30 {
+		fatal("元数据长度异常(%d B): 归档损坏", metaRawLen)
+	}
+	// 块表项至少 5B, 文件表项至少 21B —— 据此给条目数设上界
+	if uint64(nChunks)*5 > metaRawLen || uint64(nFiles)*16 > metaRawLen {
+		fatal("头部条目数与元数据长度矛盾(nChunks=%d nFiles=%d, 元数据 %d B): 归档损坏",
+			nChunks, nFiles, metaRawLen)
 	}
 }
 
