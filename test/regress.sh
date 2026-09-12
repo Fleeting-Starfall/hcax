@@ -177,6 +177,35 @@ if printf '%s\n' "$L" | grep -q 'exc/src/a.go' && \
 if "$BIN" pack exc.hcax exc -m fast --exclude .git 2>/dev/null | grep -q '排除 1 个条目'; then
   ok "--exclude 报告排除数量"; else bad "--exclude 未报告数量"; fi
 
+# v10 元数据: 特殊权限位(sticky/setuid/setgid)与纳秒时间戳
+# 老实现用 os.FileMode.Perm(), 只取 0777 —— 这三个位在归档里被静默丢掉
+mkdir -p perm
+printf 'sticky\n' > perm/st.bin && chmod 1755 perm/st.bin
+printf 'ns\n' > perm/ns.bin
+"$PY" -c "import os; os.utime('perm/ns.bin', ns=(1700000000123456789, 1700000000123456789))"
+verbyte() { "$PY" -c "import sys; print(open(sys.argv[1],'rb').read(8)[4])" "$1"; }
+if "$BIN" pack perm.hcax perm -m fast >/dev/null 2>&1; then ok "含 sticky 位可打包"; else bad "含 sticky 打包失败"; fi
+if [ "$(verbyte perm.hcax)" = "10" ]; then ok "含特殊权限位自动升 v10"; else bad "特殊权限位未触发 v10"; fi
+if [ "$(verbyte o_max_corpus.hcax)" = "8" ]; then ok "普通归档仍写 v8(不无故与旧版绝缘)"; else bad "普通归档版本异常"; fi
+rm -rf perm_out
+if "$BIN" unpack perm.hcax perm_out >/dev/null 2>&1 && \
+   stat -f '%Sp' perm_out/perm/st.bin 2>/dev/null | grep -q 't$'; then
+  ok "sticky 位还原"; else bad "sticky 位丢失"; fi
+# 亚秒时间戳默认按秒存(与 tar 一致)。注意: 上面那个归档因为有 sticky 已经是 v10,
+# 而 v10 一旦启用就会顺带把纳秒存下来 —— 所以这里另建一个"普普通通"的归档来验证。
+mkdir -p plain1 && printf 'ns\n' > plain1/ns.bin
+"$PY" -c "import os; os.utime('plain1/ns.bin', ns=(1700000000123456789, 1700000000123456789))"
+rm -rf plain1_out
+if "$BIN" pack plain1.hcax plain1 -m fast >/dev/null 2>&1 && \
+   "$BIN" unpack plain1.hcax plain1_out >/dev/null 2>&1 && \
+   [ "$("$PY" -c "import os; print(os.stat('plain1_out/plain1/ns.bin').st_mtime_ns)")" = "1700000000000000000" ]; then
+  ok "默认按秒存时间戳"; else bad "默认时间戳精度异常"; fi
+rm -rf permns_out
+if "$BIN" pack permns.hcax perm -m fast -T >/dev/null 2>&1 && \
+   "$BIN" unpack permns.hcax permns_out >/dev/null 2>&1 && \
+   [ "$("$PY" -c "import os; print(os.stat('permns_out/perm/ns.bin').st_mtime_ns)")" = "1700000000123456789" ]; then
+  ok "-T 纳秒时间戳逐位还原"; else bad "-T 纳秒时间戳"; fi
+
 # ---------------------------------------------------------------- 4. 损坏检测
 note "4. 损坏检测"
 cp "$A" corrupt.hcax

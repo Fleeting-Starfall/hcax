@@ -69,6 +69,11 @@ if [ -x "$REF" ]; then
   # 含链接的归档应当被老版本明确拒绝(而不是解出错误数据)
   if "$REF" list a_max.hcax >/dev/null 2>&1; then
     bad "含链接的 v9 归档被老版接受了(应当拒绝)"; else ok "含链接的 v9 归档被老版明确拒绝"; fi
+  # v10 归档(含特殊权限位)必须被老版本明确拒绝, 而不是解出错位的元数据
+  mkdir -p pv10 && printf 'x\n' > pv10/s.bin && chmod 1755 pv10/s.bin
+  "$BIN" pack pv10.hcax pv10 -m fast >/dev/null 2>&1
+  if "$REF" list pv10.hcax >/dev/null 2>&1; then
+    bad "v10 归档被老版接受了(应当拒绝)"; else ok "v10 归档被老版明确拒绝"; fi
   # CM(text) 码流必须与参考版逐字节一致: CM 只能做"不改变数值路径"的实现优化,
   # 一旦改了模型/混合逻辑, 旧 text 归档就再也解不开了 —— 这条用例专门拦它
   head -c 300000 c2/novel.txt > t.txt

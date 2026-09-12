@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math/rand"
+	"os"
 	"testing"
 )
 
@@ -274,7 +275,7 @@ func TestMetaRoundTrip(t *testing.T) {
 	var sh, rh [8]byte
 	copy(sh[:], []byte{1, 2, 3, 4, 5, 6, 7, 8})
 	copy(rh[:], []byte{8, 7, 6, 5, 4, 3, 2, 1})
-	raw := serializeMeta(chunks, files, sh, rh)
+	raw := serializeMeta(chunks, files, sh, rh, 10)
 
 	gotChunks, gotFiles, gotSH, gotRH := parseMeta(raw, uint32(len(chunks)), uint32(len(files)), version)
 
@@ -314,5 +315,52 @@ func TestMetaRoundTrip(t *testing.T) {
 			}
 			compOff += uint64(c.uncomp)
 		}
+	}
+}
+
+// ---------- 版本决策 ----------
+
+// 版本策略是"能不升就不升": 升级意味着旧版二进制读不了, 必须有真理由。
+func TestWriteVer(t *testing.T) {
+	plain := []fileEntry{{name: "a.txt", mode: 0644, nano: 1700000000_123456789}}
+	withLink := append([]fileEntry{}, plain...)
+	withLink = append(withLink, fileEntry{name: "l", isLink: true, link: "a.txt"})
+	sticky := []fileEntry{{name: "s", mode: uint32(os.ModeSticky) | 0755}}
+	future := []fileEntry{{name: "f", mode: 0644, nano: (1 << 33) * int64(1e9)}}
+
+	cases := []struct {
+		name    string
+		files   []fileEntry
+		precise bool
+		want    byte
+	}{
+		{"普通文件(哪怕带亚秒时间戳)仍写 v8", plain, false, 8},
+		{"含符号链接升 v9", withLink, false, 9},
+		{"含 sticky 位升 v10", sticky, false, 10},
+		{"2038 之后的时间戳升 v10", future, false, 10},
+		{"-T 显式要求纳秒则升 v10", plain, true, 10},
+	}
+	for _, c := range cases {
+		if got := writeVer(c.files, c.precise); got != c.want {
+			t.Errorf("%s: 得到 v%d, 期望 v%d", c.name, got, c.want)
+		}
+	}
+}
+
+// v8 归档必须只落地"老格式装得下"的元数据(权限截到 0777、时间截到秒),
+// 否则写出去的字节流老版本按自己的布局解析会错位。
+func TestMetaRoundTripV8(t *testing.T) {
+	files := []fileEntry{
+		{name: "a.txt", size: 5, mtime: 12345, mode: 0644},
+		{name: "s", size: 1, mtime: 12345, mode: uint32(os.ModeSticky) | 0755},
+	}
+	var sh, rh [8]byte
+	raw := serializeMeta(nil, files, sh, rh, 8)
+	_, got, _, _ := parseMeta(raw, 0, uint32(len(files)), 8)
+	if got[0].mtime != 12345 {
+		t.Errorf("v8 时间往返不一致: %d", got[0].mtime)
+	}
+	if got[1].mode != 0755 {
+		t.Errorf("v8 应把权限截到 0777, 实际 %o", got[1].mode)
 	}
 }

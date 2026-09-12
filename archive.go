@@ -44,8 +44,9 @@ type chunkMeta struct {
 type fileEntry struct {
 	name   string
 	size   uint64
-	mtime  uint64
-	mode   uint32
+	mtime  uint64 // Unix 秒(仅用于显示; v10 的精确时间在 nano 里)
+	nano   int64  // v10: Unix 纳秒。0 = 该条目没有可用时间戳
+	mode   uint32 // 权限位 + setuid/setgid/sticky(Go os.FileMode 的位布局)
 	chunks []uint32
 	isDir  bool // 目录条目(空目录也保留)
 	isLink bool // v9: 符号链接条目(存链接目标, 不存文件内容)
@@ -60,7 +61,7 @@ type fileEntry struct {
 //   - 块偏移不再存储: 可压块在固实流中、原样块在原样区中都是按顺序紧凑排列, 解包时累加即得
 //   - 不再逐块存哈希(每块 8B 随机数完全不可压, 大量小文件时开销巨大);
 //     改为流级校验: 固实流 + 原样区 各存 8B 哈希。verify 时校验整条流。
-func serializeMeta(chunks []*chunkMeta, files []fileEntry, solidHash, rawHash [8]byte) []byte {
+func serializeMeta(chunks []*chunkMeta, files []fileEntry, solidHash, rawHash [8]byte, ver byte) []byte {
 	var b bytes.Buffer
 	b.Write(solidHash[:])
 	b.Write(rawHash[:])
@@ -90,8 +91,14 @@ func serializeMeta(chunks []*chunkMeta, files []fileEntry, solidHash, rawHash [8
 		}
 		b.WriteByte(f)
 		binary.Write(&b, binary.LittleEndian, fe.size)
-		binary.Write(&b, binary.LittleEndian, uint32(fe.mtime))
-		binary.Write(&b, binary.LittleEndian, uint16(fe.mode))
+		if ver >= 10 {
+			// v10: 纳秒时间戳 + 完整模式位(含 setuid/setgid/sticky)
+			binary.Write(&b, binary.LittleEndian, entryNano(fe))
+			binary.Write(&b, binary.LittleEndian, fe.mode)
+		} else {
+			binary.Write(&b, binary.LittleEndian, uint32(fe.mtime))
+			binary.Write(&b, binary.LittleEndian, uint16(fe.mode&0o777))
+		}
 		binary.Write(&b, binary.LittleEndian, uint32(len(fe.chunks)))
 		for _, ix := range fe.chunks {
 			binary.Write(&b, binary.LittleEndian, ix)
@@ -160,10 +167,21 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 		files[i].isLink = ver >= 9 && f&0x20 != 0
 		files[i].size = binary.LittleEndian.Uint64(m[pos : pos+8])
 		pos += 8
-		files[i].mtime = uint64(binary.LittleEndian.Uint32(m[pos : pos+4]))
-		pos += 4
-		files[i].mode = uint32(binary.LittleEndian.Uint16(m[pos : pos+2]))
-		pos += 2
+		if ver >= 10 {
+			need(m, pos, 12, "文件表项(v10 时间/权限)")
+			files[i].nano = int64(binary.LittleEndian.Uint64(m[pos : pos+8]))
+			pos += 8
+			files[i].mode = binary.LittleEndian.Uint32(m[pos : pos+4])
+			pos += 4
+			if files[i].nano != 0 {
+				files[i].mtime = uint64(files[i].nano / 1e9)
+			}
+		} else {
+			files[i].mtime = uint64(binary.LittleEndian.Uint32(m[pos : pos+4]))
+			pos += 4
+			files[i].mode = uint32(binary.LittleEndian.Uint16(m[pos : pos+2]))
+			pos += 2
+		}
 		nc := int(binary.LittleEndian.Uint32(m[pos : pos+4]))
 		pos += 4
 		need(m, pos, 4*nc, "文件块索引")
@@ -349,6 +367,35 @@ func storedName(fp, root string) string {
 	return rel
 }
 
+// 取文件模式位: 只要权限位 + setuid/setgid/sticky。
+// 老实现用 os.FileMode.Perm(), 它只取 0777 —— 于是 setuid/setgid/sticky 三个位
+// 在归档里被静默丢掉(备份 /usr/bin 这类目录后, 程序会莫名失去提权位)。
+// 类型位(目录/链接/设备)不存: 由 isDir/isLink 标志位表达, 存档更省。
+func entryMode(fi os.FileInfo) uint32 {
+	const keep = os.ModePerm | os.ModeSetuid | os.ModeSetgid | os.ModeSticky
+	return uint32(fi.Mode() & keep)
+}
+
+// 写入用的纳秒时间戳: 有些条目(如单元测试直接构造的)只填了整秒的 mtime,
+// 这里统一补成纳秒, 免得写进 v10 归档后时间变成 0。
+func entryNano(fe fileEntry) int64 {
+	if fe.nano != 0 {
+		return fe.nano
+	}
+	if fe.mtime != 0 {
+		return int64(fe.mtime) * 1e9
+	}
+	return 0
+}
+
+// 还原时间戳: v10 用纳秒精度, 老归档只有整秒
+func entryTime(fe fileEntry) time.Time {
+	if fe.nano != 0 {
+		return time.Unix(0, fe.nano)
+	}
+	return time.Unix(int64(fe.mtime), 0)
+}
+
 // 流式计算整条数据的 16 字节校验哈希(sha256 前 16B): 固实流/原样区落临时文件后,
 // 不再把全量数据读进内存即可完成流级校验(替代原先的 hash16(全量切片))。
 func hashReader(r io.Reader) [16]byte {
@@ -359,7 +406,7 @@ func hashReader(r io.Reader) [16]byte {
 	return out
 }
 
-func pack(inputs []string, outPath, mode string, excl []string) {
+func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 	spec, ok := modes[mode]
 	if !ok {
 		fatal("未知模式 %s", mode)
@@ -528,7 +575,8 @@ func pack(inputs []string, outPath, mode string, excl []string) {
 			f.Close()
 			fileEntries = append(fileEntries, fileEntry{
 				name: rel, size: uint64(st.Size()), mtime: uint64(st.ModTime().Unix()),
-				mode: uint32(st.Mode().Perm()), chunks: curChunks, xform: fileXform,
+				nano: st.ModTime().UnixNano(),
+				mode: entryMode(st), chunks: curChunks, xform: fileXform,
 			})
 			totalUncomp += uint64(st.Size())
 			continue
@@ -556,7 +604,8 @@ func pack(inputs []string, outPath, mode string, excl []string) {
 
 		fileEntries = append(fileEntries, fileEntry{
 			name: rel, size: uint64(st.Size()), mtime: uint64(st.ModTime().Unix()),
-			mode: uint32(st.Mode().Perm()), chunks: curChunks,
+			nano: st.ModTime().UnixNano(),
+			mode: entryMode(st), chunks: curChunks,
 		})
 		totalUncomp += uint64(st.Size())
 	}
@@ -581,7 +630,8 @@ func pack(inputs []string, outPath, mode string, excl []string) {
 		}
 		fileEntries = append(fileEntries, fileEntry{
 			name: rel, size: 0, mtime: uint64(di.ModTime().Unix()),
-			mode: uint32(di.Mode().Perm()), isDir: true,
+			nano: di.ModTime().UnixNano(),
+			mode: entryMode(di), isDir: true,
 		})
 	}
 
@@ -598,7 +648,8 @@ func pack(inputs []string, outPath, mode string, excl []string) {
 		}
 		fileEntries = append(fileEntries, fileEntry{
 			name: storedName(lp, root), size: uint64(len(tgt)),
-			mtime: uint64(li.ModTime().Unix()), mode: uint32(li.Mode().Perm()),
+			mtime: uint64(li.ModTime().Unix()), nano: li.ModTime().UnixNano(),
+			mode:   entryMode(li),
 			isLink: true, link: tgt,
 		})
 	}
@@ -743,7 +794,8 @@ func pack(inputs []string, outPath, mode string, excl []string) {
 		h := hashReader(rsf)
 		copy(rawHash[:], h[:8])
 	}
-	metaRaw := serializeMeta(chunkMetas, fileEntries, solidHash, rawHash)
+	wv := writeVer(fileEntries, precise)
+	metaRaw := serializeMeta(chunkMetas, fileEntries, solidHash, rawHash, wv)
 	metaFrame := be.compress(metaRaw)
 
 	// 训练字典区(原始存放: 字典本身接近不可压)
@@ -754,15 +806,6 @@ func pack(inputs []string, outPath, mode string, excl []string) {
 		dictBuf.Write(trainDict)
 	} else {
 		binary.Write(&dictBuf, binary.LittleEndian, uint32(0))
-	}
-
-	// 只在含符号链接时才升到 v9: 普通归档仍写 v8, 旧版二进制照样能解开
-	wv := byte(verCompat)
-	for i := range fileEntries {
-		if fileEntries[i].isLink {
-			wv = version
-			break
-		}
 	}
 
 	// header(v6, 48B): magic ver code window flag
@@ -1267,7 +1310,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 		}
 		out.Write(buf)
 		os.Chmod(target, os.FileMode(fe.mode))
-		os.Chtimes(target, time.Unix(int64(fe.mtime), 0), time.Unix(int64(fe.mtime), 0))
+		os.Chtimes(target, entryTime(fe), entryTime(fe))
 		return
 	}
 	if len(fe.chunks) > 0 {
@@ -1287,13 +1330,13 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 			}
 			out.Write(buf)
 			os.Chmod(target, os.FileMode(fe.mode))
-			os.Chtimes(target, time.Unix(int64(fe.mtime), 0), time.Unix(int64(fe.mtime), 0))
+			os.Chtimes(target, entryTime(fe), entryTime(fe))
 			return
 		}
 		out.Write(first)
 		if uint64(len(first)) == fe.size {
 			os.Chmod(target, os.FileMode(fe.mode))
-			os.Chtimes(target, time.Unix(int64(fe.mtime), 0), time.Unix(int64(fe.mtime), 0))
+			os.Chtimes(target, entryTime(fe), entryTime(fe))
 			return
 		}
 		var written2 uint64 = uint64(len(first))
@@ -1306,7 +1349,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 			fatal("文件 %s 大小不符: 期望 %d 实际 %d", fe.name, fe.size, written2)
 		}
 		os.Chmod(target, os.FileMode(fe.mode))
-		os.Chtimes(target, time.Unix(int64(fe.mtime), 0), time.Unix(int64(fe.mtime), 0))
+		os.Chtimes(target, entryTime(fe), entryTime(fe))
 		return
 	}
 	var written uint64
@@ -1314,7 +1357,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 		fatal("文件 %s 大小不符: 期望 %d 实际 %d", fe.name, fe.size, written)
 	}
 	os.Chmod(target, os.FileMode(fe.mode))
-	os.Chtimes(target, time.Unix(int64(fe.mtime), 0), time.Unix(int64(fe.mtime), 0))
+	os.Chtimes(target, entryTime(fe), entryTime(fe))
 }
 
 // 归一用户给出的抽取目标: 反斜杠按分隔符处理, 去掉结尾多余的分隔符,
@@ -1416,14 +1459,13 @@ func modeName(code byte) string {
 // 归档里只存了权限位(0777)和 mtime, 类型由标志位决定 —— 拼回一个 os.FileMode
 // 只为借用它的 String() 打印 "drwxr-xr-x" 这种人眼一眼能读的形式。
 func modeString(fe fileEntry) string {
-	var m os.FileMode
+	m := os.FileMode(fe.mode)
 	switch {
 	case fe.isDir:
-		m = os.ModeDir
+		m |= os.ModeDir
 	case fe.isLink:
-		m = os.ModeSymlink
+		m |= os.ModeSymlink
 	}
-	m |= os.FileMode(fe.mode & 0o7777)
 	return m.String()
 }
 

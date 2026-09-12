@@ -16,6 +16,7 @@ func usage() {
 	fmt.Println("    text   : 上下文混合(CM)建模, 不靠'重复'而靠'预测', 对非重复文本/代码再省 8~16%(纯算法, 较慢)")
 	fmt.Println("  --exclude 模式: 可重复, glob 匹配。按完整路径/路径分段/基名 任一命中即排除;")
 	fmt.Println("                  命中目录时整棵子树跳过。例: --exclude .git --exclude '*.tmp'")
+	fmt.Println("  -T/--precise-times: 时间戳存到纳秒(会把归档升到 v10, 旧版二进制读不了)")
 	fmt.Println("  hcax unpack 输入.hcax 输出目录 [--verify]")
 	fmt.Println("  hcax extract 输入.hcax 输出目录 [文件...] [--verify]")
 	fmt.Println("  hcax list   输入.hcax [-l]      # -l/--long: 权限 + 修改时间 + 分类统计")
@@ -35,8 +36,11 @@ func main() {
 		var out string
 		var inputs []string
 		var excl []string
+		precise := false
 		for i := 2; i < len(os.Args); i++ {
 			switch os.Args[i] {
+			case "-T", "--precise-times":
+				precise = true
 			case "-m":
 				mode = os.Args[i+1]
 				i++
@@ -57,7 +61,7 @@ func main() {
 		if out == "" || len(inputs) == 0 {
 			fatal("pack 需要 输出 和 输入")
 		}
-		pack(inputs, out, mode, excl)
+		pack(inputs, out, mode, excl, precise)
 	case "unpack":
 		verify := false
 		var a, o string
