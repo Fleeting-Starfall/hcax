@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"sync"
 	"testing"
 )
 
@@ -526,4 +527,26 @@ func TestAbsurdChunkSizeRejected(t *testing.T) {
 	// 正常大小必须放行(别把这条检查写成误伤)
 	raw2 := serializeMeta([]*chunkMeta{{uncomp: 4096}}, files, sh, rh, 8)
 	parseMeta(raw2, 1, 1, 8)
+}
+
+// ---------- 系统 xz 缺失时必须报警, 不能静默降级 ----------
+
+func TestXZFallbackWarns(t *testing.T) {
+	// 系统 xz 不在 PATH 时, max/ultra 会回退到内置的纯 Go lzma2。
+	// 这不是"慢一点"而已 —— 同一语料实测 26.89% -> 33.40%, 归档凭空大 24%。
+	// 此前这条路径完全静默, 用户以为自己在用最强档。这里锁住"必须报一次警"。
+	//
+	// exec.LookPath 每次调用都现读 PATH, 把它指向一个空目录就必然找不到 xz,
+	// 于是这条用例在"装了 xz / 没装 xz"的机器上都能稳定触发回退分支。
+	t.Setenv("PATH", t.TempDir())
+
+	before := xzWarnCount
+	xzWarnOnce = sync.Once{} // sync.Once 触发后无法重置, 换一个新的让本用例独立计数
+	b := &backend{}
+	if out := b.xzCompress(bytes.NewReader([]byte("hello, world")), "3", "2", "2MiB"); out != nil {
+		t.Fatal("PATH 里没有 xz, xzCompress 必须返回 nil, 好让上层走到回退实现")
+	}
+	if xzWarnCount != before+1 {
+		t.Errorf("系统 xz 缺失时必须恰好警告一次(实际新增 %d 次)", xzWarnCount-before)
+	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -120,7 +121,8 @@ func (b *backend) shouldStore(cb []byte) bool {
 	if len(cb) == 0 {
 		return true
 	}
-	// CM(text) 靠统计预测, 对高熵数据(随机/已压缩)既压不动又极慢(逐 bit 建模 ~0.5MB/s)。
+	// CM(text) 靠统计预测, 对高熵数据(随机/已压缩)既压不动又极慢(逐 bit 建模
+	// ~1.3MB/s, 实测值见 README §8; 早期注释写的 0.5MB/s 是估算, 已更正)。
 	// 让这类块走原样存储, 免得 CM 在压不出结果的数据上白耗时间。
 	// (此前只有 lzma2 档做原样判定, text 档一律硬送进 CM。)
 	if b.spec.backend == "cm" {
@@ -218,11 +220,32 @@ func stridedSampleFrom(r io.ReaderAt, size int64, max int) []byte {
 	return out
 }
 
+// xzFallbackWarn 记录"本进程是否已经警告过 xz 回退"; 只报一次, 免得 max 档
+// 每条固实流都刷一行。测试用 xzWarnCount 断言警告确实发出过。
+var (
+	xzWarnOnce  sync.Once
+	xzWarnCount int
+)
+
+// warnXZFallback: 系统 xz 不可用时必须让用户知道。
+// 这不是"锦上添花"—— 实测同一语料: 有系统 xz 压率 26.89%, 回退到内置纯 Go lzma2
+// 后 33.40%, 归档凭空大 24%。此前是**完全静默**的, 用户以为自己在用最强档。
+func warnXZFallback(reason string) {
+	xzWarnOnce.Do(func() {
+		xzWarnCount++
+		fmt.Fprintf(os.Stderr,
+			"警告: %s; max/ultra 已回退到内置的纯 Go lzma2 实现\n"+
+				"       压率会明显变差(实测同一语料 26.89%% -> 33.40%%, 归档大 24%%)。\n"+
+				"       装上系统 xz 可恢复: brew install xz / apt-get install xz-utils\n", reason)
+	})
+}
+
 // 用系统 xz 按指定 lc/pb 压缩; 不可用或出错时返回 nil(以便走回退路径)
 
 func (b *backend) xzCompress(r io.Reader, lc, pb, dict string) []byte {
 	xzbin, err := exec.LookPath("xz")
 	if err != nil {
+		warnXZFallback("未能在 PATH 中找到 xz")
 		return nil
 	}
 	// v8d: 弃用极端模式 -e(nice=273, 深度 256MiB) —— 实测对 30MB 多样数据压率零收益(与 -9 完全一致),
@@ -235,6 +258,7 @@ func (b *backend) xzCompress(r io.Reader, lc, pb, dict string) []byte {
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	if err := cmd.Run(); err != nil || out.Len() == 0 {
+		warnXZFallback("系统 xz 执行失败")
 		return nil
 	}
 	return out.Bytes()

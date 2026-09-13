@@ -12,6 +12,16 @@ PY="${PYTHON:-python3}"
 REF="${HCAX_REF:-$HOME/.hcax-ref/hcax-v8}"
 BIN="$ROOT/hcax"
 
+# 下面紧接着就是 rm -rf "$WORK"。第一个参数是**工作目录**, 误把二进制传进来
+# (bash test/verify3.sh ./hcax) 就会把刚编译好的 hcax 删掉, 然后全线 FAIL,
+# 报错还指向完全不相干的地方, 很难查。这里挡一道。
+case "$WORK" in
+  "$BIN"|"$ROOT"|""|"/"|"."|"..")
+    echo "verify3.sh: 拒绝把 '$WORK' 当作工作目录删除(第一个参数应为工作目录, 不是二进制)" >&2
+    echo "用法: bash test/verify3.sh [工作目录]" >&2
+    exit 1 ;;
+esac
+
 PASS=0; FAIL=0
 ok(){ printf '  \033[32mPASS\033[0m %s\n' "$1"; PASS=$((PASS+1)); }
 bad(){ printf '  \033[31mFAIL\033[0m %s\n' "$1"; FAIL=$((FAIL+1)); }

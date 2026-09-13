@@ -159,6 +159,9 @@ func (c *counterTbl) update(idx uint32, bit int) {
 	if n > 1023 {
 		n = 1023
 	}
+	// 这里保留 int64 中间量: 在 arm64 上改 int32 反而更慢(32 位运算要额外
+	// 符号扩展), 实测 4 轮配对比较每轮都慢 3~5%。乘积上界 65534*32768
+	// 虽仍在 int32 内, 但没有任何收益, 别"优化"这里。
 	p += int32((int64(tgt-p) * int64(cmRcp[n])) >> 16)
 	if p < 1 {
 		p = 1
@@ -199,13 +202,11 @@ func (a *apm) pp(pr int32, cx int) int32 {
 }
 
 func (a *apm) update(bit int, rate int) {
-	g := int32(1) << uint(rate)
 	if bit == 1 {
 		a.t[a.idx] += uint16((65535 - int32(a.t[a.idx])) >> uint(rate))
 	} else {
 		a.t[a.idx] -= uint16(int32(a.t[a.idx]) >> uint(rate))
 	}
-	_ = g
 }
 
 // ---------------- 上下文混合编解码器 ----------------

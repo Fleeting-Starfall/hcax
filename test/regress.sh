@@ -507,6 +507,28 @@ else
   bad "语料里缺少 photo24.bmp(光栅路径无端到端覆盖)"
 fi
 
+# ------------------------------------------------- 系统 xz 缺失时的降级告警
+note "系统 xz 缺失时的降级告警"
+# max/ultra 依赖系统 xz。找不到时此前是**完全静默**地回退到纯 Go lzma2,
+# 而这两档的压率差 24%(26.89% vs 33.40%)—— 用户以为在用最强档, 实际归档大一圈。
+# 把 PATH 指向空目录即可稳定构造"没有 xz"的环境, 与机器是否真装了 xz 无关。
+emptybin="$(mktemp -d)"
+rm -f noxz.hcax
+noxz_err="$(PATH="$emptybin" "$BIN" pack noxz.hcax corpus -m max 2>&1 >/dev/null)"
+nwarn="$(printf '%s\n' "$noxz_err" | grep -c '警告')"
+if [ "$nwarn" -ge 1 ]; then
+  ok "系统 xz 缺失时发出降级告警"
+else
+  bad "系统 xz 缺失时静默降级 —— 压率差 24% 却没有任何提示"
+fi
+# 只报一次: max 档会压缩多条固实流, 刷屏的警告等于没有警告
+if [ "$nwarn" -eq 1 ]; then
+  ok "降级告警只报一次(不刷屏)"
+else
+  bad "降级告警出现了 $nwarn 次(应恰好 1 次)"
+fi
+rmdir "$emptybin"
+
 # ---------------------------------------------------------------- 汇总
 note "汇总: $PASS 通过 / $FAIL 失败"
 [ "$FAIL" -eq 0 ]
