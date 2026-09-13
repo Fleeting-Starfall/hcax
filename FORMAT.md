@@ -1,7 +1,9 @@
 # hcax 容器格式规范
 
-本文描述 `.hcax` 归档的**字节级布局**。实现见 `format.go`（容器读写）、`pack.go`（写）、`unpack.go`（读）、`backend.go`（后端）、
-`chunker.go`（格式常量）。当前写入版本 **v12**，可读取 **v2 ~ v12**。
+本文描述 `.hcax` 归档的**字节级布局**。实现见 `format.go`（容器读写 + 版本常量）、
+`pack.go`（写）、`unpack.go`（读）、`backend.go`（后端与参数自适应）、
+`chunker.go`（CDC 分块）、`raster.go` + `preprocess.go`（变换）。
+当前写入版本 **v12**，可读取 **v2 ~ v12**。
 
 约定：所有整数均为 **小端（little-endian）**，无对齐填充。路径分隔符按打包时的平台记录
 （Unix 为 `/`），解包时用 `filepath.FromSlash` 转换。
@@ -37,7 +39,9 @@
 | 0 | 4 | magic | `HCAX` |
 | 4 | 1 | version | 格式版本 |
 | 5 | 1 | code | 模式代码：0=fast 1=best 2=max 3=ultra 4=text |
-| 6 | 1 | window | zstd window log / lzma2 dict 提示 |
+| 6 | 1 | window | zstd 窗口 log₂（解压 zstd 帧时要按它建解码器）。fast/text 为 0（用
+  编码器默认/最小窗口），其余档为 27。**lzma2 档不用它**——字典大小由
+  `dictFor(可压数据量)` 在打包时决定，并写进 xz 帧头，解压方从帧头读 |
 | 7 | 1 | — | 保留，恒 0 |
 | 8 | 8 | metaCompLen | 元数据帧压缩后长度 |
 | 16 | 8 | metaRawLen | 元数据解压后长度 |
