@@ -723,10 +723,12 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 		}
 	}
 
-	out, err := os.Create(outPath)
-	if err != nil {
-		fatal("create %s: %v", outPath, err)
-	}
+	// 原子落盘: 先写同目录临时文件, 全部写成功后再 rename。
+	// 直接 os.Create(outPath) 会先把已有的同名归档截断成 0 —— 万一中途失败
+	// (磁盘满最常见), 旧备份没了、新的又只写了一半, 一次失败毁两份。见 util.go。
+	aw := openArchiveForWrite(outPath)
+	out := aw.f
+	addCleanup(aw.abort) // 失败路径删掉半成品; 成功时 commit 已把 tmp 置空, 空操作
 	// 元数据(块表+文件表) 序列化后一并压缩(v6): 明文元数据往往占归档一半以上, 压缩收益极大
 	// 流级校验哈希(替代逐块哈希: 逐块哈希是随机数, 不可压缩, 大量小文件时开销极大)
 	var solidHash, rawHash [8]byte
@@ -795,6 +797,7 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 	if serr != nil {
 		fatal("取归档大小失败: %v", serr)
 	}
+	aw.commit() // 到此才算"打包成功": 旧归档在这一刻才被完整的新归档替换
 
 	raw := totalUncomp
 	// 全是空文件/空目录时 raw==0, 直接除会得到 +Inf% —— 显示成 "-" 更诚实

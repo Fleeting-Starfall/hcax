@@ -553,6 +553,77 @@ func TestXZFallbackWarns(t *testing.T) {
 	}
 }
 
+// ---------- 归档落盘必须原子: 失败时不能把旧归档一起毁掉 ----------
+
+func TestArchiveWriterKeepsOldOnFailure(t *testing.T) {
+	// 老代码 os.Create(outPath) 一打开就把旧归档截成 0。打包跑到最后写盘阶段
+	// 失败(磁盘满)时, 旧备份已经没了, 新的只写了一半 —— 一次失败毁两份。
+	dir := t.TempDir()
+	out := filepath.Join(dir, "backup.hcax")
+	const old = "上一版的好归档"
+	if err := os.WriteFile(out, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	w := openArchiveForWrite(out)
+	w.f.Write([]byte("写了一半就崩了")) // 模拟写到一半失败
+	w.abort()                       // fatal() 走的就是这一步
+
+	got, err := os.ReadFile(out)
+	if err != nil || string(got) != old {
+		t.Errorf("写盘失败后旧归档被毁了: %q (err=%v)", got, err)
+	}
+	// 半成品临时文件不能留在目录里当垃圾
+	ents, _ := os.ReadDir(dir)
+	if len(ents) != 1 {
+		t.Errorf("目录里还剩 %d 个文件, 半成品没清理干净", len(ents))
+	}
+}
+
+func TestArchiveWriterCommitsAtomically(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "a.hcax")
+	if err := os.WriteFile(out, []byte("旧"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w := openArchiveForWrite(out)
+	w.f.Write([]byte("新内容"))
+	w.f.Close()
+	w.commit()
+
+	got, _ := os.ReadFile(out)
+	if string(got) != "新内容" {
+		t.Errorf("commit 后目标归档内容不对: %q", got)
+	}
+	// 覆盖已有归档时要沿用它的权限, 别顺手把 0600 改成 0644
+	fi, _ := os.Stat(out)
+	if fi.Mode().Perm() != 0o600 {
+		t.Errorf("覆盖了已有归档却改了它的权限: %v(应为 0600)", fi.Mode().Perm())
+	}
+	// tmp 置空后 abort 必须是空操作(清理钩子会无条件再调一次)
+	w.abort()
+	ents, _ := os.ReadDir(dir)
+	if len(ents) != 1 {
+		t.Errorf("commit 后又多出文件: %d 个", len(ents))
+	}
+}
+
+func TestArchiveWriterNewFilePerm(t *testing.T) {
+	// 新建的归档如果留着 CreateTemp 的 0600, 备份出来别人读不了
+	dir := t.TempDir()
+	out := filepath.Join(dir, "new.hcax")
+	w := openArchiveForWrite(out)
+	w.f.Write([]byte("x"))
+	w.f.Close()
+	w.commit()
+	fi, err := os.Stat(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode().Perm() != 0o644 {
+		t.Errorf("新建归档权限 %v, 应为 0644", fi.Mode().Perm())
+	}
+}
+
 // ---------- 系统 xz 的 stderr 绝不能混进压缩流 ----------
 
 func TestXZStderrNotMixedIntoOutput(t *testing.T) {

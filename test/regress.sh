@@ -551,6 +551,43 @@ else
   bad "外部 xz 的 stderr 混进了压缩流 —— 打包成功但归档已损坏"
 fi
 
+# ------------------------------------------------- 归档落盘的原子性
+note "归档落盘(原子替换 + 不留半成品)"
+# 老代码 os.Create(outPath) 一打开就把旧归档截成 0: 打包跑到最后写盘阶段失败时,
+# 旧备份没了、新的只写了一半。现在改成"同目录临时文件 + rename", 这两条锁住结果。
+rm -f atomic.hcax
+"$BIN" pack atomic.hcax corpus -m fast >/dev/null 2>&1
+# 新建的归档必须是 0644。临时文件是 CreateTemp 建的(固定 0600), 不改权限就
+# 直接改名的话, 备份出来的归档别人读不了
+perm=$(stat -f%Lp atomic.hcax 2>/dev/null || stat -c%a atomic.hcax 2>/dev/null)
+if [ "$perm" = "644" ]; then
+  ok "新建归档权限 0644(不是临时文件的 0600)"
+else
+  bad "新建归档权限 $perm(应 644)"
+fi
+# 判别"整体替换(rename)"还是"就地截断(os.Create)": 前者 inode 会变, 后者不变。
+# 就地截断意味着旧归档在写盘开始的那一刻就已经没了 —— 中途失败就是两份都毁。
+# (权限检查区分不了这两种: os.Create 覆盖已有文件时并不改权限, 所以只能看 inode)
+ino1=$(stat -f%i atomic.hcax 2>/dev/null || stat -c%i atomic.hcax 2>/dev/null)
+"$BIN" pack atomic.hcax corpus -m fast >/dev/null 2>&1
+ino2=$(stat -f%i atomic.hcax 2>/dev/null || stat -c%i atomic.hcax 2>/dev/null)
+if [ -n "$ino1" ] && [ "$ino1" != "$ino2" ]; then
+  ok "覆盖已有归档是整体替换(rename), 不是就地截断"
+else
+  bad "覆盖已有归档时是就地截断(旧归档在写盘开始那一刻就没了)"
+fi
+if "$BIN" verify atomic.hcax >/dev/null 2>&1; then
+  ok "重复打包同一路径后归档仍有效"
+else
+  bad "重复打包同一路径后归档坏了"
+fi
+leftover=$(find . -maxdepth 1 -name '.hcax-new-*' | wc -l | tr -d ' ')
+if [ "$leftover" -eq 0 ]; then
+  ok "目录里没有残留的 .hcax-new-* 半成品"
+else
+  bad "残留 $leftover 个 .hcax-new-* 临时文件"
+fi
+
 # ---------------------------------------------------------------- 汇总
 note "汇总: $PASS 通过 / $FAIL 失败"
 [ "$FAIL" -eq 0 ]
