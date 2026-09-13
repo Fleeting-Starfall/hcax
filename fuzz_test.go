@@ -10,9 +10,12 @@ import (
 	"bytes"
 	"math/rand"
 	"os"
+	"path"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 )
 
 // ---------- 把 fatal 变成 panic, 好在测试里断言"干净地失败" ----------
@@ -64,6 +67,8 @@ func buildRandomTree(t *testing.T, rng *rand.Rand, root string) {
 		t.Fatal(err)
 	}
 	var files []string // 已建的普通文件, 供符号链接/硬链接引用
+	var dirs []string  // 目录: 权限与 mtime 必须等整棵树建完再设 ——
+	// 往目录里加东西会把它自己的 mtime 冲掉, 提前设成只读更是直接写不进去
 	var build func(dir string, depth int)
 	build = func(dir string, depth int) {
 		used := map[string]bool{}
@@ -76,6 +81,7 @@ func buildRandomTree(t *testing.T, rng *rand.Rand, root string) {
 				if err := os.MkdirAll(p, 0o755); err != nil {
 					t.Fatal(err)
 				}
+				dirs = append(dirs, p)
 				build(p, depth+1)
 			case len(files) > 0 && rng.Intn(8) == 0: // 符号链接
 				target, _ := filepath.Rel(dir, files[rng.Intn(len(files))])
@@ -107,24 +113,78 @@ func buildRandomTree(t *testing.T, rng *rand.Rand, root string) {
 						buf[j] = byte('a' + (j+rng.Intn(3))%20)
 					}
 				}
-				if err := os.WriteFile(p, buf, 0o644); err != nil {
+				mode := os.FileMode(0o644)
+				switch rng.Intn(4) {
+				case 0:
+					mode = 0o600
+				case 1:
+					mode = 0o755
+				case 2:
+					mode = 0o400 // 只读: 解包时若顺序不对就会写不进去
+				}
+				if err := os.WriteFile(p, buf, mode); err != nil {
 					t.Fatal(err)
 				}
+				randMeta(t, rng, p)
 				files = append(files, p)
 			}
 		}
 	}
 	build(root, 0)
+	// 目录的元数据最后统一设(与解包侧 applyDirMeta 对称): 深的先设,
+	// 免得父目录先被改成只读后子目录设不动
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i]) > len(dirs[j]) })
+	for _, d := range dirs {
+		mode := os.FileMode(0o755)
+		switch rng.Intn(3) {
+		case 0:
+			mode = 0o700
+		case 1:
+			mode = 0o500 // 只读目录: 解包时若权限提前生效就会写不进子文件
+		}
+		if err := os.Chmod(d, mode); err != nil {
+			t.Fatal(err)
+		}
+		randMeta(t, rng, d)
+	}
+}
+
+// 只读目录(0500)会让 t.TempDir() 收尾时删不掉子文件。解出来的那棵树同样有
+// 0500 目录, 所以要对整个临时目录(不只是源树)放开权限。
+// Cleanup 后注册的先跑, 因此这条一定在 TempDir 自己删除之前执行。
+func makeWritableOnCleanup(t *testing.T, root string) {
+	t.Helper()
+	t.Cleanup(func() {
+		filepath.Walk(root, func(p string, fi os.FileInfo, err error) error {
+			if err == nil && fi.IsDir() {
+				os.Chmod(p, 0o755)
+			}
+			return nil
+		})
+	})
+}
+
+// 随机 mtime(整秒: 默认按秒存, 用整秒才好逐字节比对)。
+// 权限/时间还原是"目录元数据延迟落地"那类改动的唯一防线 —— 光比对内容测不出来。
+func randMeta(t *testing.T, rng *rand.Rand, p string) {
+	t.Helper()
+	sec := 978307200 + rng.Int63n(20*365*24*3600) // 2001-01-01 起 20 年内
+	ts := time.Unix(sec, 0)
+	if err := os.Chtimes(p, ts, ts); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // ---------- 目录树比对 ----------
 
 type node struct {
-	kind byte // 'f' 文件, 'd' 目录, 'l' 链接
-	size int64
-	link string
-	data []byte
-	ino  uint64
+	kind  byte // 'f' 文件, 'd' 目录, 'l' 链接
+	size  int64
+	link  string
+	data  []byte
+	ino   uint64
+	mode  os.FileMode
+	mtime int64 // Unix 秒
 }
 
 func scanTree(t *testing.T, root string) map[string]node {
@@ -141,12 +201,14 @@ func scanTree(t *testing.T, root string) map[string]node {
 		switch {
 		case fi.Mode()&os.ModeSymlink != 0:
 			tgt, _ := os.Readlink(p)
+			// 链接自身的 mtime 还原不了(Go 没有 lutimes), 不比对
 			out[rel] = node{kind: 'l', link: tgt}
 		case fi.IsDir():
-			out[rel] = node{kind: 'd'}
+			out[rel] = node{kind: 'd', mode: fi.Mode().Perm(), mtime: fi.ModTime().Unix()}
 		default:
 			data, _ := os.ReadFile(p)
-			out[rel] = node{kind: 'f', size: fi.Size(), data: data, ino: inoOf(fi)}
+			out[rel] = node{kind: 'f', size: fi.Size(), data: data, ino: inoOf(fi),
+				mode: fi.Mode().Perm(), mtime: fi.ModTime().Unix()}
 		}
 		return nil
 	})
@@ -160,7 +222,13 @@ func inoOf(fi os.FileInfo) uint64 {
 	return 0
 }
 
+// checkMeta=false 时只比对"有没有、内容对不对"(用于部分抽取: 只抽了文件的
+// 时候, 父目录是顺手建出来的, 归档里的目录条目没被抽中, 时间与权限自然不该有)
 func diffTrees(t *testing.T, want, got map[string]node, ctx string) {
+	diffTreesOpt(t, want, got, ctx, true)
+}
+
+func diffTreesOpt(t *testing.T, want, got map[string]node, ctx string, checkMeta bool) {
 	t.Helper()
 	var keys []string
 	for k := range want {
@@ -168,25 +236,32 @@ func diffTrees(t *testing.T, want, got map[string]node, ctx string) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		w, ok := got[k]
-		if !ok {
+		w := want[k]
+		g, ok := got[k] // 注意: 老代码写成 w, ok := got[k], 于是全程拿 got 跟自己比,
+		if !ok {        //       内容/权限/时间一项都没真比对 —— 这个用例一直是空转的
 			t.Errorf("%s: 缺少条目 %s", ctx, k)
 			continue
 		}
-		g := w
-		_ = g
-		if w.kind != got[k].kind {
-			t.Errorf("%s: %s 类型不符 (%c vs %c)", ctx, k, w.kind, got[k].kind)
+		if w.kind != g.kind {
+			t.Errorf("%s: %s 类型不符 (%c vs %c)", ctx, k, w.kind, g.kind)
 			continue
 		}
 		switch w.kind {
 		case 'l':
-			if w.link != got[k].link {
-				t.Errorf("%s: %s 链接目标不符 (%q vs %q)", ctx, k, w.link, got[k].link)
+			if w.link != g.link {
+				t.Errorf("%s: %s 链接目标不符 (%q vs %q)", ctx, k, w.link, g.link)
 			}
 		case 'f':
-			if w.size != got[k].size || !bytes.Equal(w.data, got[k].data) {
-				t.Errorf("%s: %s 内容不符 (%d vs %d 字节)", ctx, k, w.size, got[k].size)
+			if w.size != g.size || !bytes.Equal(w.data, g.data) {
+				t.Errorf("%s: %s 内容不符 (%d vs %d 字节)", ctx, k, w.size, g.size)
+			}
+		}
+		if checkMeta && (w.kind == 'f' || w.kind == 'd') {
+			if w.mode != g.mode {
+				t.Errorf("%s: %s 权限不符 (%o vs %o)", ctx, k, w.mode, g.mode)
+			}
+			if w.mtime != g.mtime {
+				t.Errorf("%s: %s mtime 不符 (%d vs %d)", ctx, k, w.mtime, g.mtime)
 			}
 		}
 	}
@@ -203,6 +278,7 @@ func TestRandomTreeRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(20260913))
 	for iter := 0; iter < 4; iter++ {
 		dir := t.TempDir()
+		makeWritableOnCleanup(t, dir)
 		src := filepath.Join(dir, "src")
 		buildRandomTree(t, rng, src)
 		want := scanTree(t, src)
@@ -219,6 +295,143 @@ func TestRandomTreeRoundTrip(t *testing.T) {
 			// 硬链接必须还原成共享 inode(能解出内容还不够, 结构也得对)
 			checkHardlinks(t, want, filepath.Join(out, "src"), filepath.Join(out, "src"))
 		}
+	}
+}
+
+// ---------- 用例 1b: 部分抽取 —— 抽谁就得谁, 一个不多一个不少 ----------
+// extract 的匹配规则(全路径 / 基名 / 目录前缀)是 R13 之后才有的, 之前"抽一个
+// 子目录"只会建出空目录还报成功。这里让随机树自己去撞这些分支。
+
+func TestRandomPartialExtract(t *testing.T) {
+	rng := rand.New(rand.NewSource(4242))
+	for iter := 0; iter < 6; iter++ {
+		dir := t.TempDir()
+		makeWritableOnCleanup(t, dir)
+		src := filepath.Join(dir, "src")
+		buildRandomTree(t, rng, src)
+		want := scanTree(t, src)
+		arc := filepath.Join(dir, "a.hcax")
+		if runCatchingFatal(func() { pack([]string{src}, arc, "fast", nil, false) }) {
+			t.Fatalf("第%d轮 打包失败", iter)
+		}
+		// 归档内的路径带 src/ 前缀
+		var all []string
+		for k := range want {
+			all = append(all, filepath.ToSlash(filepath.Join("src", k)))
+		}
+		sort.Strings(all)
+		if len(all) == 0 {
+			continue
+		}
+		// 随机挑 1~3 个目标, 交替用"全路径"和"基名"两种问法
+		asks := map[string]bool{}
+		for i := 0; i < 1+rng.Intn(3); i++ {
+			a := all[rng.Intn(len(all))]
+			if rng.Intn(2) == 0 {
+				a = path.Base(a)
+			}
+			asks[a] = true
+		}
+		var only []string
+		for a := range asks {
+			only = append(only, a)
+		}
+		// 期望集: 逐个条目过一遍 matchEntry(与解包侧同一套规则)
+		exp := map[string]node{}
+		for k, v := range want {
+			full := filepath.ToSlash(filepath.Join("src", k))
+			for _, a := range only {
+				if matchEntry(full, a) {
+					exp[full] = v
+					break
+				}
+			}
+		}
+		out := filepath.Join(dir, "out")
+		if runCatchingFatal(func() { unpack(arc, out, false, only) }) {
+			t.Fatalf("第%d轮 抽取失败 only=%v", iter, only)
+		}
+		got := scanTree(t, out)
+		// 空目录在抽取结果里是顺带建出来的, 归档里没抽中它 —— 扫出来多算, 先剔掉
+		for k, v := range got {
+			if v.kind == 'd' {
+				if _, ok := exp[k]; !ok {
+					delete(got, k)
+				}
+			}
+		}
+		diffTreesOpt(t, exp, got, "iter"+string(rune('0'+iter))+" only="+joinStr(only), false)
+	}
+}
+
+func joinStr(s []string) string {
+	out := ""
+	for i, x := range s {
+		if i > 0 {
+			out += ","
+		}
+		out += x
+	}
+	return out
+}
+
+// ---------- 用例 1c: --exclude 随机模式 ----------
+// 排除规则要按"全路径 / 相对打包根 / 任一路径分段"三种方式匹配, 手写的用例
+// 只测了一种。让随机树去撞, 断言"匹配上的一定不在、没匹配上的一定在且内容对"。
+
+func TestRandomExcludePack(t *testing.T) {
+	rng := rand.New(rand.NewSource(31337))
+	for iter := 0; iter < 6; iter++ {
+		dir := t.TempDir()
+		makeWritableOnCleanup(t, dir)
+		src := filepath.Join(dir, "src")
+		buildRandomTree(t, rng, src)
+		want := scanTree(t, src)
+		// 取一个真实存在的扩展名做模式, 保证既排得掉又不至于全排光
+		exts := map[string]bool{}
+		for k := range want {
+			if e := filepath.Ext(k); e != "" {
+				exts[e] = true
+			}
+		}
+		var extList []string
+		for e := range exts {
+			extList = append(extList, e)
+		}
+		sort.Strings(extList)
+		if len(extList) == 0 {
+			continue
+		}
+		pat := "*" + extList[rng.Intn(len(extList))]
+		arc := filepath.Join(dir, "a.hcax")
+		if runCatchingFatal(func() { pack([]string{src}, arc, "fast", []string{pat}, false) }) {
+			t.Fatalf("第%d轮 打包失败", iter)
+		}
+		exp := map[string]node{}
+		for k, v := range want {
+			// 模式会跟路径的**任一分段**匹配, 所以一旦某个目录名命中,
+			// 它下面整棵子树都不会进归档 —— 期望集必须照这个算, 否则会误报"缺少条目"
+			drop := false
+			for _, seg := range strings.Split(filepath.ToSlash(k), "/") {
+				if ok, _ := filepath.Match(pat, seg); ok {
+					drop = true
+					break
+				}
+			}
+			if drop {
+				continue
+			}
+			exp[k] = v
+		}
+		if len(exp) == 0 {
+			continue // 这一轮会把整棵树排光, 换个模式再试
+		}
+		out := filepath.Join(dir, "out")
+		if runCatchingFatal(func() { unpack(arc, out, false, nil) }) {
+			t.Fatalf("第%d轮 解包失败", iter)
+		}
+		diffTrees(t, exp, scanTree(t, filepath.Join(out, "src")),
+			"iter"+string(rune('0'+iter))+" exclude="+pat)
 	}
 }
 
@@ -257,6 +470,7 @@ func checkHardlinks(t *testing.T, want map[string]node, srcRoot, outRoot string)
 func TestRandomCorruptionDoesNotCrash(t *testing.T) {
 	rng := rand.New(rand.NewSource(777))
 	dir := t.TempDir()
+	makeWritableOnCleanup(t, dir)
 	src := filepath.Join(dir, "src")
 	buildRandomTree(t, rng, src)
 	arc := filepath.Join(dir, "a.hcax")
