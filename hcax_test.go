@@ -424,6 +424,26 @@ func TestMetaRoundTrip(t *testing.T) {
 // ---------- 版本决策 ----------
 
 // 版本策略是"能不升就不升": 升级意味着旧版二进制读不了, 必须有真理由。
+// dictFor 的档位是有实测依据的, 不是随手写的: 多样语料上 4MiB 之后加字典零收益,
+// 可执行文件上 8→16MiB 还能再省 4%。这里把档位钉住, 免得以后被"顺手调小"。
+func TestDictFor(t *testing.T) {
+	cases := []struct {
+		n    int
+		want string
+	}{
+		{1 << 20, "2MiB"},
+		{4 << 20, "4MiB"},
+		{15 << 20, "4MiB"},
+		{16 << 20, "16MiB"}, // 20MB 的 Mach-O 从这里拿到 16MiB, 省 4%
+		{500 << 20, "16MiB"},
+	}
+	for _, c := range cases {
+		if got := dictFor(c.n); got != c.want {
+			t.Errorf("dictFor(%d) = %s, 期望 %s", c.n, got, c.want)
+		}
+	}
+}
+
 func TestWriteVer(t *testing.T) {
 	plain := []fileEntry{{name: "a.txt", mode: 0644, nano: 1700000000_123456789}}
 	withLink := append([]fileEntry{}, plain...)

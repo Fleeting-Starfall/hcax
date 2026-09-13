@@ -138,11 +138,17 @@ func (b *backend) shouldStore(cb []byte) bool {
 	return byteEntropy(cb) > 7.95
 }
 
-// lzma2 dict 按可压数据量收敛: 实测 30MB 多样数据上, dict 从 1MiB→32MiB 仅压率改善 ~1%,
-// 但耗时 3s→29s、每进程内存 159MB→311MB 暴涨。lzma2 匹配距离受限于 dict, 而 hcax 块均 64KiB,
-// 8MiB dict 已覆盖 ~128 个块的历史, 跨块冗余足够捕获; 故大幅压低字典上限 —— 这是 max/ultra
-// 大语料"打包慢(123s)/内存高(1.9GB)"的根因(dict=256MiB 单流 + 32MiB 起步并行组)。
-// 实测: dict 上限 16MiB 与 256MiB 压率差 < 0.03%, 速度/内存收益巨大。
+// lzma2 dict 按可压数据量收敛。lzma2 的匹配距离受限于 dict, hcax 块均 64KiB,
+// 4MiB 已覆盖 ~64 个块的历史 —— 对"多样语料"(文本/JSON/源码混合)再往上加字典
+// 实测毫无收益(12.6MB 语料: 4/8/16/32MiB 压缩结果**完全一样**), 只涨内存。
+//
+// 但可执行文件是另一回事: 20MB 的 Mach-O 上, dict 8MiB→16MiB 还能再省 4.0%
+// (6,659,708 -> 6,395,092 B), 32MiB 则一分不省。这类数据的重复是"长距离"的
+// (相同函数体/字符串表隔得很远), 只有字典够大才连得上。
+//
+// 所以 >=16MiB 的可压数据一律给 16MiB: 耗时不变(实测 3.30s vs 3.36s),
+// 代价是 xz 子进程峰值内存从 ~121MB 涨到 ~208MB(只影响 >=16MiB 的输入;
+// 更小的输入仍走 4MiB / 2MiB, 峰值 ~72MB)。
 
 func dictFor(n int) string {
 	switch {
@@ -150,8 +156,6 @@ func dictFor(n int) string {
 		return "2MiB"
 	case n < 16<<20:
 		return "4MiB"
-	case n < 64<<20:
-		return "8MiB"
 	default:
 		return "16MiB"
 	}

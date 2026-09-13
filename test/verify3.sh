@@ -99,6 +99,25 @@ else
   bad "70MB 语料没造出来, mmt 路径无覆盖"
 fi
 
+# 真实可执行文件: 语料里全是"人造"数据, BCJ-x86 从没在真代码上跑过。
+# 这里直接用刚编出来的 hcax 自己(4.5MB Mach-O)当语料, 不依赖环境里有什么。
+mkdir -p c2exe && cp "$BIN" c2exe/hcax.bin
+if [ -s c2exe/hcax.bin ]; then
+  rm -f aexe.hcax; rm -rf bexe
+  if "$BIN" pack aexe.hcax c2exe -m max >/dev/null 2>&1; then
+    ok "[真实可执行文件] 打包"
+  else
+    bad "[真实可执行文件] 打包失败"
+  fi
+  if "$BIN" unpack aexe.hcax bexe >/dev/null 2>&1 && cmp -s c2exe/hcax.bin bexe/c2exe/hcax.bin; then
+    ok "[真实可执行文件] 往返逐字节一致(BCJ-x86 端到端)"
+  else
+    bad "[真实可执行文件] 往返不一致"
+  fi
+else
+  bad "没拿到可执行文件当语料"
+fi
+
 # ------------------------------------------------------------ 第3轮
 note "第3轮 兼容矩阵"
 if [ -x "$REF" ]; then
