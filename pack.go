@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 )
@@ -68,6 +69,60 @@ func dedupPaths(in []string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+// 固实流是"把所有文件拼成一条再压缩", 于是**相邻的块是什么**直接影响压率:
+// 一段文本后面紧跟一段随机二进制, 压缩器刚建立起来的上下文就被打断;
+// 同类文件挨在一起, lzma2/zstd 能少花不少比特。
+// 排序键: 扩展名 -> 大小量级 -> 原路径。最后一项保证同输入结果稳定(可复现)。
+// 目录/链接条目不参与(它们不产生数据块, 顺序只影响元数据, 保持遍历序更直观)。
+func orderForCompression(files []string, spec modeSpec) []string {
+	if os.Getenv("HCAX_NO_ORDER") != "" { // A/B 对照用
+		return files
+	}
+	// CM(text) 不走这套: 它的模型是**沿流自适应**的, 实测重排后反而差 7%
+	// (12MB 混合语料 3.39MB -> 3.64MB)。固实流的"同类相邻"直觉对它不成立。
+	if spec.backend == "cm" {
+		return files
+	}
+	type ent struct {
+		p    string
+		ext  string
+		size int64
+	}
+	es := make([]ent, 0, len(files))
+	for _, p := range files {
+		var sz int64
+		if fi, e := os.Lstat(p); e == nil {
+			sz = fi.Size()
+		}
+		es = append(es, ent{p: p, ext: strings.ToLower(filepath.Ext(p)), size: sz})
+	}
+	sort.SliceStable(es, func(i, j int) bool {
+		if es[i].ext != es[j].ext {
+			return es[i].ext < es[j].ext
+		}
+		bi, bj := sizeBucket(es[i].size), sizeBucket(es[j].size)
+		if bi != bj {
+			return bi < bj
+		}
+		return es[i].p < es[j].p
+	})
+	out := make([]string, len(es))
+	for i := range es {
+		out[i] = es[i].p
+	}
+	return out
+}
+
+// 大小按 2 的幂分桶(同一量级的文件放一起), 避免"1KB 和 100MB 交替"
+func sizeBucket(n int64) int {
+	b := 0
+	for n > 1<<20 && b < 40 {
+		n >>= 1
+		b++
+	}
+	return b
 }
 
 // 输入去重之后仍可能撞名: pack out.hcax dup dup/f.txt —— dup/f.txt 既从遍历 dup
@@ -282,7 +337,9 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 		fatal("未知模式 %s", mode)
 	}
 	inputs = dedupPaths(inputs)
+
 	files, dirs, links := collectPaths(inputs, excl)
+	files = orderForCompression(files, spec)
 	files, dirs, links = excludeSelf(files, dirs, links, outPath)
 	files, dirs, links = dropDupNames(files, dirs, links, commonRoot(inputs))
 	if len(files) == 0 && len(dirs) == 0 && len(links) == 0 {
