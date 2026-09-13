@@ -208,14 +208,16 @@ const (
 	magic      = "HCAX"
 	trailerMag = "XACH"
 
-	// 兼容读 v2~v11。写的时候能不升就不升 —— 每升一版就等于跟旧版二进制绝缘:
+	// 兼容读 v2~v12。写的时候能不升就不升 —— 每升一版就等于跟旧版二进制绝缘:
 	//   普通归档写 v8; 含符号链接写 v9; 含 setuid/setgid/sticky 或 2038 后的
-	//   时间戳写 v10; 含硬链接写 v11。
-	version   = 11
+	//   时间戳写 v10; 含硬链接写 v11; 含逐行光栅变换(8/9 号)写 v12 —— 旧版二进制
+	//   不认识这两个变换号, 会把它当未知变换直接报错, 不如在开档时就拒绝。
+	version   = 12
 	verCompat = 8
 	verLinks  = 9  // 需要符号链接条目
 	verExt    = 10 // 需要扩展时间/权限
 	verHard   = 11 // 需要硬链接条目
+	verRow    = 12 // 需要逐行光栅变换(xform 8/9)
 
 	headerSize = 24 // v2 头长; v3+ 头长 32(后续再读 8 字节 rawLen)
 
@@ -239,6 +241,9 @@ func writeVer(files []fileEntry, precise bool) byte {
 		}
 		if fe.isHard && v < verHard {
 			v = verHard
+		}
+		if fe.xform >= xfRasterRowMed && v < verRow {
+			v = verRow
 		}
 		if v >= verExt {
 			continue

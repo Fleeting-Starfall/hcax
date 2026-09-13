@@ -186,7 +186,8 @@ printf 'ns\n' > perm/ns.bin
 verbyte() { "$PY" -c "import sys; print(open(sys.argv[1],'rb').read(8)[4])" "$1"; }
 if "$BIN" pack perm.hcax perm -m fast >/dev/null 2>&1; then ok "含 sticky 位可打包"; else bad "含 sticky 打包失败"; fi
 if [ "$(verbyte perm.hcax)" = "10" ]; then ok "含特殊权限位自动升 v10"; else bad "特殊权限位未触发 v10"; fi
-if [ "$(verbyte o_max_corpus.hcax)" = "8" ]; then ok "普通归档仍写 v8(不无故与旧版绝缘)"; else bad "普通归档版本异常"; fi
+# 注意用 tree 语料(纯 JSON + 随机块)而不是 corpus —— corpus 里有位图, 会正当升 v12
+if [ "$(verbyte o_max_tree.hcax)" = "8" ]; then ok "普通归档仍写 v8(不无故与旧版绝缘)"; else bad "普通归档版本异常"; fi
 rm -rf perm_out
 if "$BIN" unpack perm.hcax perm_out >/dev/null 2>&1 && \
    stat -f '%Sp' perm_out/perm/st.bin 2>/dev/null | grep -q 't$'; then
@@ -378,6 +379,40 @@ chmod 000 leakdir/no.txt
 after2=$(count_tmp)
 if [ "$after2" -le "$before" ]; then ok "失败路径也无临时文件泄漏(前$before 后$after2)"; else bad "失败路径泄漏临时文件(前$before 后$after2)"; fi
 chmod 644 leakdir/no.txt
+
+# 光栅图(BMP)端到端: 24bpp 宽 101 的行跨距 304 不是 3 的倍数,
+# 逐行变换(8/9 号)就是为它加的; 一旦退化成"整块每 3 字节一组", 压率会掉 6%
+if [ -f corpus/photo24.bmp ]; then
+  if cmp -s corpus/photo24.bmp r_best_corpus/corpus/photo24.bmp; then
+    ok "24bpp BMP(带行填充)往返逐字节一致"
+  else
+    bad "24bpp BMP 往返损坏"
+  fi
+  if cmp -s corpus/photo32.bmp r_best_corpus/corpus/photo32.bmp; then
+    ok "32bpp BMP(无行填充)往返逐字节一致"
+  else
+    bad "32bpp BMP 往返损坏"
+  fi
+  # 含逐行光栅变换 -> v12; 不含的普通归档仍应是 v8(防止"一律升版本"的回归)
+  if "$BIN" info o_best_corpus.hcax 2>/dev/null | grep -q 'v12'; then
+    ok "含逐行光栅变换的归档写 v12"; else bad "含逐行光栅变换却没升 v12"; fi
+  rm -f norast.hcax
+  mkdir -p norast && printf 'plain text only\n' > norast/a.txt
+  "$BIN" pack norast.hcax norast -m fast >/dev/null 2>&1
+  if "$BIN" info norast.hcax 2>/dev/null | grep -q 'v8'; then
+    ok "无光栅文件时仍写 v8(没有无谓升版本)"; else bad "无光栅文件也升了版本"; fi
+  # 打包一个"行填充非 3 倍数"的 BMP 后照片体积必须明显小于原始 BMP
+  bsz=$(sz corpus/photo24.bmp)
+  rm -f bmp1.hcax; "$BIN" pack bmp1.hcax corpus/photo24.bmp -m best >/dev/null 2>&1
+  asz=$(sz bmp1.hcax)
+  if [ "$asz" -lt "$bsz" ]; then
+    ok "24bpp BMP 被压缩($bsz -> $asz B)"
+  else
+    bad "24bpp BMP 没被压缩($bsz -> $asz B)"
+  fi
+else
+  bad "语料里缺少 photo24.bmp(光栅路径无端到端覆盖)"
+fi
 
 # ---------------------------------------------------------------- 汇总
 note "汇总: $PASS 通过 / $FAIL 失败"

@@ -9,6 +9,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"math"
 	"math/rand"
 	"os"
 	"testing"
@@ -238,24 +239,126 @@ func makeTestBMP(w, h, bpp int) []byte {
 }
 
 func TestRasterRoundTrip(t *testing.T) {
+	// 宽度取 13..20: 24bpp 时行填充分别是 3/2/1/0/3/2/1/0 字节,
+	// 覆盖"行跨距不是 3 的倍数"(宽%4 ∈ {1,2})这个最容易出错的情形
 	for _, bpp := range []int{8, 24, 32} {
-		src := makeTestBMP(17, 9, bpp)
-		for _, xf := range []byte{xfRasterMed, xfRasterRctMed} {
-			buf := append([]byte(nil), src...)
-			if !rasterApply(xf, buf, true) {
-				continue // 该 bpp 不支持此变换(如灰度图无 RCT)
-			}
-			if bytes.Equal(buf, src) {
-				t.Fatalf("bpp=%d xform=%d: 正向变换后数据没变(可能是空操作)", bpp, xf)
-			}
-			if !rasterApply(xf, buf, false) {
-				t.Fatalf("bpp=%d xform=%d: 逆变换失败", bpp, xf)
-			}
-			if !bytes.Equal(buf, src) {
-				t.Fatalf("bpp=%d xform=%d: 逆变换后与原文不一致(图片会损坏)", bpp, xf)
+		for _, w := range []int{13, 14, 15, 16, 17, 18, 19, 20} {
+			src := makeTestBMP(w, 9, bpp)
+			for _, xf := range []byte{xfRasterMed, xfRasterRctMed, xfRasterRowMed, xfRasterRowRctMed} {
+				buf := append([]byte(nil), src...)
+				if !rasterApply(xf, buf, true) {
+					continue // 该 bpp 不支持此变换(如灰度图无 RCT)
+				}
+				if bytes.Equal(buf, src) {
+					t.Fatalf("bpp=%d w=%d xform=%d: 正向变换后数据没变(可能是空操作)", bpp, w, xf)
+				}
+				if !rasterApply(xf, buf, false) {
+					t.Fatalf("bpp=%d w=%d xform=%d: 逆变换失败", bpp, w, xf)
+				}
+				if !bytes.Equal(buf, src) {
+					t.Fatalf("bpp=%d w=%d xform=%d: 逆变换后与原文不一致(图片会损坏)", bpp, w, xf)
+				}
 			}
 		}
 	}
+}
+
+// 逐行变换(8/9)必须保留行尾填充字节原样 —— 填充恒为 0, 被残差化反而变大。
+func TestRasterRowAwareKeepsPadding(t *testing.T) {
+	src := makeTestBMP(17, 9, 24) // stride=52, 每行 1 字节填充
+	g, ok := rasterInfo(src)
+	if !ok || g.stride-g.rowBytes != 1 {
+		t.Fatalf("构造的 BMP 应当有 1 字节行填充, 实际 stride=%d rowBytes=%d", g.stride, g.rowBytes)
+	}
+	for _, xf := range []byte{xfRasterRowMed, xfRasterRowRctMed} {
+		buf := append([]byte(nil), src...)
+		if !rasterApply(xf, buf, true) {
+			t.Fatalf("xform=%d: 正向变换失败", xf)
+		}
+		for y := 0; y < g.rows; y++ {
+			p := g.dataOff + y*g.stride + g.rowBytes
+			if buf[p] != src[p] {
+				t.Fatalf("xform=%d: 第 %d 行填充字节被改动了(%d -> %d)", xf, y, src[p], buf[p])
+			}
+		}
+	}
+}
+
+// 逐行变换存在的意义: 宽%4∈{1,2} 的 24bpp BMP 上, 旧的扁平 RCT 会让通道相位逐行漂移,
+// MED 的竖直预测因此失效, 结果比"不做色彩去相关"还差一大截。这里锁住这个收益。
+func TestRasterRowAwareBeatsFlat(t *testing.T) {
+	for _, w := range []int{101, 102} { // pad=1 / pad=2
+		src := makePhotoBMP(w, 120, 24)
+		sz := func(xf byte) int {
+			if xf == xfNone {
+				return gateSize(nil, src)
+			}
+			b := append([]byte(nil), src...)
+			if !rasterApply(xf, b, true) {
+				t.Fatalf("w=%d xform=%d: 变换失败", w, xf)
+			}
+			return gateSize(nil, b)
+		}
+		flat, row := sz(xfRasterRctMed), sz(xfRasterRowRctMed)
+		if row >= flat {
+			t.Errorf("w=%d: 逐行 RCT(%d) 未优于扁平 RCT(%d)", w, row, flat)
+		}
+		if row >= sz(xfRasterRowMed) {
+			t.Errorf("w=%d: 逐行 RCT(%d) 未优于只做 MED(%d)", w, row, sz(xfRasterRowMed))
+		}
+		// 关键: 扁平版本被门控淘汰后, 现状最多只能选 MED; 逐行版应当明显更好
+		best := flat
+		if v := sz(xfRasterRowMed); v < best {
+			best = v
+		}
+		if v := sz(xfNone); v < best {
+			best = v
+		}
+		if float64(row) > float64(best)*0.97 {
+			t.Errorf("w=%d: 逐行 RCT(%d) 相对旧路径最优值(%d) 收益不足 3%%", w, row, best)
+		}
+	}
+}
+
+// 照片风格 BMP: 通道间高度相关(R≈G≈B) + 低频渐变 + 少量噪声, 用来测压率而非只测可逆性
+func makePhotoBMP(w, h, bpp int) []byte {
+	ch := bpp / 8
+	if ch < 3 {
+		ch = 3
+	}
+	stride := ((w*ch + 3) / 4) * 4
+	off := 14 + 40
+	b := make([]byte, off+stride*h)
+	b[0], b[1] = 'B', 'M'
+	binary.LittleEndian.PutUint32(b[2:], uint32(len(b)))
+	binary.LittleEndian.PutUint32(b[10:], uint32(off))
+	binary.LittleEndian.PutUint32(b[14:], 40)
+	binary.LittleEndian.PutUint32(b[18:], uint32(w))
+	binary.LittleEndian.PutUint32(b[22:], uint32(h))
+	binary.LittleEndian.PutUint16(b[26:], 1)
+	binary.LittleEndian.PutUint16(b[28:], uint16(bpp))
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			v := 128 + 60*math.Sin(float64(x)/13+float64(y)/29)*math.Cos(float64(y)/41) +
+				20*math.Sin(float64(x)/3+7+float64(y)/5)
+			nz := float64((x*31+y*17)%7 - 3)
+			o := off + y*stride + x*ch
+			b[o] = byte(clampByte(v-10+nz/2))
+			b[o+1] = byte(clampByte(v + nz))
+			b[o+2] = byte(clampByte(v + 8 + nz))
+		}
+	}
+	return b
+}
+
+func clampByte(v float64) int {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return int(v)
 }
 
 // ---------- 元数据序列化/解析往返 ----------
@@ -327,6 +430,8 @@ func TestWriteVer(t *testing.T) {
 	withLink = append(withLink, fileEntry{name: "l", isLink: true, link: "a.txt"})
 	sticky := []fileEntry{{name: "s", mode: uint32(os.ModeSticky) | 0755}}
 	future := []fileEntry{{name: "f", mode: 0644, nano: (1 << 33) * int64(1e9)}}
+	rowXform := []fileEntry{{name: "p.bmp", mode: 0644, xform: xfRasterRowRctMed}}
+	oldXform := []fileEntry{{name: "p.bmp", mode: 0644, xform: xfRasterRctMed}}
 
 	cases := []struct {
 		name    string
@@ -339,6 +444,8 @@ func TestWriteVer(t *testing.T) {
 		{"含 sticky 位升 v10", sticky, false, 10},
 		{"2038 之后的时间戳升 v10", future, false, 10},
 		{"-T 显式要求纳秒则升 v10", plain, true, 10},
+		{"旧的扁平光栅变换(6/7)不升版本", oldXform, false, 8},
+		{"逐行光栅变换(8/9)升 v12", rowXform, false, 12},
 	}
 	for _, c := range cases {
 		if got := writeVer(c.files, c.precise); got != c.want {

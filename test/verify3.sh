@@ -73,8 +73,9 @@ if [ -L b_max/c2/link ]; then ok "符号链接还原"; else bad "符号链接未
 # ------------------------------------------------------------ 第3轮
 note "第3轮 兼容矩阵"
 if [ -x "$REF" ]; then
-  # 兼容矩阵必须用**不含符号链接**的语料: 含链接会走 v9, 老版本按设计拒绝读取
-  "$PY" "$HERE/mkcorpus.py" "$WORK/c3" $((8*1024*1024)) >/dev/null
+  # 兼容矩阵必须用**不含符号链接、不含位图**的语料: 含链接走 v9、含位图走 v12,
+  # 老版本按设计都会拒绝读取, 那就测不到"v8 归档双向互通"了
+  "$PY" "$HERE/mkcorpus.py" "$WORK/c3" $((8*1024*1024)) noimg >/dev/null
   rm -f old.hcax new.hcax; rm -rf o1 o2
   "$REF" pack old.hcax c3 -m max >/dev/null 2>&1
   "$BIN" pack new.hcax c3 -m max >/dev/null 2>&1
@@ -96,6 +97,13 @@ if [ -x "$REF" ]; then
     "$BIN" pack pv11.hcax pv11 -m fast >/dev/null 2>&1
     if "$REF" list pv11.hcax >/dev/null 2>&1; then
       bad "v11 归档被老版接受了(应当拒绝)"; else ok "v11(硬链接)归档被老版明确拒绝"; fi
+  fi
+  # v12(逐行光栅变换)归档同样必须被老版本明确拒绝
+  mkdir -p pv12 && cp c2/photo24.bmp pv12/ 2>/dev/null
+  if [ -s pv12/photo24.bmp ]; then
+    "$BIN" pack pv12.hcax pv12 -m fast >/dev/null 2>&1
+    if "$REF" list pv12.hcax >/dev/null 2>&1; then
+      bad "v12 归档被老版接受了(应当拒绝)"; else ok "v12(逐行光栅)归档被老版明确拒绝"; fi
   fi
   # CM(text) 码流必须与参考版逐字节一致: CM 只能做"不改变数值路径"的实现优化,
   # 一旦改了模型/混合逻辑, 旧 text 归档就再也解不开了 —— 这条用例专门拦它
