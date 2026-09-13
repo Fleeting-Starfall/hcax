@@ -457,7 +457,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	// 等所有条目(含它下面的文件)都写完再统一补 —— 否则往里写文件既写不进
 	// (只读目录), 也会把 mtime 冲成"现在"。
 	if fe.isDir {
-		if err := os.MkdirAll(target, 0o755); err != nil {
+		if err := mkdirUnderOut(outDir, target); err != nil {
 			fatal("mkdir: %v", err)
 		}
 		a.dirTodos = append(a.dirTodos, dirTodo{path: target, mode: fe.mode, nano: entryNano(fe)})
@@ -466,7 +466,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	// 符号链接(v9): 重建链接本身, 不写内容。
 	// 注: Go 标准库没有 lutimes, 链接自身的 mtime 无法还原(只还原普通文件/目录的)。
 	if fe.isLink {
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		if err := mkdirUnderOut(outDir, filepath.Dir(target)); err != nil {
 			fatal("mkdir: %v", err)
 		}
 		os.Remove(target) // 覆盖同名已存在的文件/链接
@@ -475,7 +475,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 		}
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+	if err := mkdirUnderOut(outDir, filepath.Dir(target)); err != nil {
 		fatal("mkdir: %v", err)
 	}
 	// 硬链接(v11): 尽量还原成共享 inode 的硬链接。
@@ -658,6 +658,36 @@ func (a *archive) applyDirMeta() {
 			}
 		}
 	}
+}
+
+// 在解包目录内建目录, 途中任何一段若是符号链接就先摘掉。
+//
+// os.MkdirAll 会**跟随**符号链接: 恶意归档可以先放一个条目 link -> /etc(或 -> ../..),
+// 再放一个 "link/xxx" 的文件/目录条目, MkdirAll 就会顺着链接把目录建到解包目录
+// 外面去, 随后的 os.Create 也就写穿了。原先只在"写文件前检查 target 本身是不是
+// 链接", 挡不住"链接出现在路径中间"这一种。
+//
+// 归档里出现"符号链接之下还有条目"本身就不合法(打包侧 Walk 不跟随链接, 写不出
+// 这种结构), 所以直接把挡路的链接摘掉, 与上面写文件时的处理保持一致。
+func mkdirUnderOut(outDir, target string) error {
+	root := filepath.Clean(outDir)
+	if target != root && !strings.HasPrefix(target, root+string(os.PathSeparator)) {
+		return fmt.Errorf("路径逃逸出解包目录: %s", target)
+	}
+	cur := root
+	rest := strings.TrimPrefix(target, root)
+	for _, seg := range strings.Split(rest, string(os.PathSeparator)) {
+		if seg == "" || seg == "." {
+			continue
+		}
+		cur = filepath.Join(cur, seg)
+		if li, e := os.Lstat(cur); e == nil && li.Mode()&os.ModeSymlink != 0 {
+			if e := os.Remove(cur); e != nil {
+				return e
+			}
+		}
+	}
+	return os.MkdirAll(target, 0o755)
 }
 
 func overwriteNote(n int) string {
