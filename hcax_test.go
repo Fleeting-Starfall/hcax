@@ -12,6 +12,8 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sync"
 	"testing"
 )
@@ -548,5 +550,34 @@ func TestXZFallbackWarns(t *testing.T) {
 	}
 	if xzWarnCount != before+1 {
 		t.Errorf("系统 xz 缺失时必须恰好警告一次(实际新增 %d 次)", xzWarnCount-before)
+	}
+}
+
+// ---------- 系统 xz 的 stderr 绝不能混进压缩流 ----------
+
+func TestXZStderrNotMixedIntoOutput(t *testing.T) {
+	// 构造一个"往 stderr 打一条警告、但照常完成压缩"的 xz。若把 cmd.Stderr 接到
+	// 与 stdout 同一个 buffer, 这条警告会拼进压缩流头部 —— 打包成功、归档大几十
+	// 字节, 解包时才报 invalid header magic bytes。数据损坏是静默发生的。
+	real, err := exec.LookPath("xz")
+	if err != nil {
+		t.Skip("本机没有系统 xz(或不在 PATH), 这条用例需要一个真实的 xz 来转发")
+	}
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "xz")
+	script := "#!/bin/sh\necho 'xz: (模拟) 一条无害的警告' >&2\nexec " + real + " \"$@\"\n"
+	if err := os.WriteFile(shim, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	b := &backend{}
+	out := b.xzCompress(bytes.NewReader([]byte("hello, world, hello, world")), "3", "2", "2MiB")
+	if out == nil {
+		t.Fatal("xz 明明成功了, 不该返回 nil")
+	}
+	const xzMagic = "\xFD" + "7zXZ" + "\x00"
+	if len(out) < 6 || string(out[:6]) != xzMagic {
+		t.Errorf("压缩流开头不是 xz magic, stderr 混进来了: %q", out[:min(len(out), 32)])
 	}
 }

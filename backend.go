@@ -254,11 +254,19 @@ func (b *backend) xzCompress(r io.Reader, lc, pb, dict string) []byte {
 	// v8e: 入参改为 io.Reader —— 固实流落临时文件后, xz 直接从文件流读取, 不再把全量固实流读进内存。
 	cmd := exec.Command(xzbin, "-c", "-", "--lzma2=preset=9,dict="+dict+",nice=64,lc="+lc+",lp=0,pb="+pb)
 	cmd.Stdin = r
-	var out bytes.Buffer
+	// stdout 与 stderr 必须是两个 buffer。此前两者共用一个, 于是 xz 往 stderr
+	// 写的任何东西(哪怕只是一条无害警告)都会被拼进压缩流 —— 打包照样"成功",
+	// 归档凭空大几十字节, 直到解包时才报 invalid header magic bytes。
+	// 数据损坏是静默发生的, 所以这里分开接: stdout 是数据, stderr 只用于诊断。
+	var out, errb bytes.Buffer
 	cmd.Stdout = &out
-	cmd.Stderr = &out
+	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil || out.Len() == 0 {
-		warnXZFallback("系统 xz 执行失败")
+		reason := "系统 xz 执行失败"
+		if msg := bytes.TrimSpace(errb.Bytes()); len(msg) > 0 {
+			reason += "(xz 说: " + string(msg) + ")"
+		}
+		warnXZFallback(reason)
 		return nil
 	}
 	return out.Bytes()

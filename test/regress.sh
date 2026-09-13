@@ -529,6 +529,28 @@ else
 fi
 rmdir "$emptybin"
 
+# 系统 xz 往 stderr 写东西(哪怕只是一条无害警告)时, 不能让它混进压缩流。
+# 此前 cmd.Stdout 与 cmd.Stderr 共用一个 buffer, 警告被拼进 lzma2 数据头部:
+# 打包"成功", 归档大几十字节, 直到解包才报 invalid header magic bytes —— 静默损坏。
+shimdir="$WORK/shimxz"
+mkdir -p "$shimdir"
+cat > "$shimdir/xz" <<SHIM
+#!/bin/sh
+echo 'xz: (模拟) 一条无害的警告' >&2
+exec $PY -c 'import sys,lzma; sys.stdout.buffer.write(lzma.compress(sys.stdin.buffer.read(), format=lzma.FORMAT_XZ))'
+SHIM
+chmod +x "$shimdir/xz"
+rm -f shimxz.hcax
+PATH="$shimdir:$PATH" "$BIN" pack shimxz.hcax corpus -m max >/dev/null 2>&1
+rm -rf shimxzout
+# 解包是纯 Go, 与 PATH 无关; 这里要的就是"打包产物能被正确解开"
+if "$BIN" unpack shimxz.hcax shimxzout >/dev/null 2>&1 &&
+   diff -r corpus shimxzout/corpus >/dev/null 2>&1; then
+  ok "外部 xz 的 stderr 未混入压缩流(警告不会静默损坏归档)"
+else
+  bad "外部 xz 的 stderr 混进了压缩流 —— 打包成功但归档已损坏"
+fi
+
 # ---------------------------------------------------------------- 汇总
 note "汇总: $PASS 通过 / $FAIL 失败"
 [ "$FAIL" -eq 0 ]
