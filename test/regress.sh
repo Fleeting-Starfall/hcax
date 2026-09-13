@@ -288,6 +288,14 @@ if [ "$("$BIN" list dupd2.hcax 2>/dev/null | grep -c 'dupd/f.txt')" = "1" ]; the
 if "$BIN" list dupd3.hcax 2>/dev/null | grep -q 'dupd/f.txt'; then
   ok "输入重叠时提示并保留一份"; else bad "输入重叠处理异常"; fi
 
+# 命令行参数缺值: -m 后面不给值曾经直接 index out of range 崩掉
+if "$BIN" pack needarg.hcax edge -m 2>&1 | grep -qE '需要一个模式参数|错误'; then
+  ok "-m 缺参数时明确报错(不崩)"; else bad "-m 缺参数时崩溃或提示含糊"; fi
+if "$BIN" pack needarg.hcax edge --exclude 2>&1 | grep -qE '需要一个模式参数|错误'; then
+  ok "--exclude 缺参数时明确报错"; else bad "--exclude 缺参数处理异常"; fi
+if "$BIN" pack onlyout.hcax 2>&1 | grep -q '需要 输出 和 输入'; then
+  ok "缺输入时提示用法"; else bad "缺输入时提示含糊"; fi
+
 # ---------------------------------------------------------------- 4. 损坏检测
 note "4. 损坏检测"
 cp "$A" corrupt.hcax

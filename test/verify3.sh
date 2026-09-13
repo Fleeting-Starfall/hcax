@@ -28,6 +28,18 @@ else
   echo "$out" | grep FAIL | sed 's/^/  /'; FAIL=$((FAIL+1)); bad "regress.sh 有失败项"
 fi
 
+# 跨平台: fileid_unix.go / fileid_windows.go 分了 build tag, 但平时只编 darwin,
+# 哪个平台的代码坏了要等别人交叉编译时才发现
+xok=1
+while read -r goos goarch; do
+  if ! (cd "$ROOT" && GOOS="$goos" GOARCH="$goarch" go build -o /dev/null . >/dev/null 2>&1); then
+    xok=0; bad "GOOS=$goos GOARCH=$goarch 编译失败"; fi
+done <<'XARCH'
+windows amd64
+linux amd64
+XARCH
+[ "$xok" -eq 1 ] && ok "windows / linux 交叉编译通过"
+
 # 单元测试(含随机目录树往返 / 随机损坏不崩): 端到端脚本跑一遍要几十秒,
 # 而很多 bug(R18 那种"打得开解不开")在毫秒级的用例里就能撞出来
 if (cd "$ROOT" && go test ./... >"$WORK/gotest.log" 2>&1); then

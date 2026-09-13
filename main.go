@@ -42,6 +42,10 @@ func main() {
 			case "-T", "--precise-times":
 				precise = true
 			case "-m":
+				// 少了这个判断, `hcax pack out dir -m` 会直接 index out of range 崩掉
+				if i+1 >= len(os.Args) {
+					fatal("-m 需要一个模式参数(fast|best|max|ultra|text)")
+				}
 				mode = os.Args[i+1]
 				i++
 			case "--exclude":
