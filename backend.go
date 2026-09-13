@@ -579,10 +579,22 @@ type archive struct {
 	progTotal uint64
 	overwrote int // 本次解包改写掉的、输出目录里已存在的条目数
 
+	// 目录条目的权限/时间戳不能"边解边设": 往目录里写文件会把它的 mtime 改成
+	// "现在", 提前 chmod 成只读(0555)更会让后面的子文件写不进去。都推到最后
+	// 统一落地(见 applyDirMeta)。
+	dirTodos []dirTodo
+
 	chunks    []chunkMeta
 	files     []fileEntry
 	ver       byte // 归档格式版本(v7 起文件级变换显式记录; 更早版本靠启发式判断)
 	hashLen   int  // 逐块哈希长度: 旧版=16, v6=0(改用流级校验)
 	solidHash [8]byte
 	rawHash   [8]byte
+}
+
+// 待补的目录元数据(权限 + mtime)
+type dirTodo struct {
+	path string
+	mode uint32
+	nano int64
 }

@@ -124,6 +124,25 @@ if [ -f r_edge/edge/link_file ] && cmp -s edge/one.bin r_edge/edge/one.bin; then
   ok "链接指向的内容可正常访问"; else bad "链接内容异常"
 fi
 
+# 目录的权限与 mtime: 边解边设会被"随后写入子文件"冲成当前时间,
+# 提前 chmod 成只读(0555)更会让子文件根本写不进去 —— 必须推到最后统一补
+mkdir -p dirmeta/ro
+printf 'inside\n' > dirmeta/ro/f.txt
+chmod 0555 dirmeta/ro
+"$PY" -c "import os; os.utime('dirmeta/ro', (1577836800, 1577836800))"
+rm -f dirmeta.hcax; rm -rf r_dirmeta
+"$BIN" pack dirmeta.hcax dirmeta -m fast >/dev/null 2>&1
+"$BIN" unpack dirmeta.hcax r_dirmeta >/dev/null 2>&1
+if [ -f r_dirmeta/dirmeta/ro/f.txt ] && cmp -s dirmeta/ro/f.txt r_dirmeta/dirmeta/ro/f.txt; then
+  ok "只读目录(0555)里的文件仍能解出"; else bad "只读目录里的文件没解出来"; fi
+if stat -f '%Sp' r_dirmeta/dirmeta/ro 2>/dev/null | grep -q 'xr-xr-x'; then
+  ok "目录权限还原(0555)"; else bad "目录权限未还原"; fi
+dmt_src=$("$PY" -c "import os;print(int(os.stat('dirmeta/ro').st_mtime))")
+dmt_out=$("$PY" -c "import os;print(int(os.stat('r_dirmeta/dirmeta/ro').st_mtime))")
+if [ "$dmt_src" = "$dmt_out" ]; then
+  ok "目录 mtime 还原(不再全部变成解包时刻)"; else bad "目录 mtime 丢失: $dmt_src -> $dmt_out"; fi
+chmod 755 dirmeta/ro
+
 # ---------------------------------------------------------------- 3. 命令
 note "3. 命令行为"
 A=o_max_corpus.hcax

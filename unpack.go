@@ -12,7 +12,9 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 )
 
 func openArchive(path string) *archive {
@@ -451,12 +453,14 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 			a.overwrote++
 		}
 	}
-	// 目录条目(含空目录): 直接建目录
+	// 目录条目(含空目录): 先按可写权限建出来, 权限与 mtime 记下来,
+	// 等所有条目(含它下面的文件)都写完再统一补 —— 否则往里写文件既写不进
+	// (只读目录), 也会把 mtime 冲成"现在"。
 	if fe.isDir {
 		if err := os.MkdirAll(target, 0o755); err != nil {
 			fatal("mkdir: %v", err)
 		}
-		os.Chmod(target, os.FileMode(fe.mode))
+		a.dirTodos = append(a.dirTodos, dirTodo{path: target, mode: fe.mode, nano: entryNano(fe)})
 		return
 	}
 	// 符号链接(v9): 重建链接本身, 不写内容。
@@ -633,6 +637,29 @@ func (a *archive) setProgress(items []fileEntry) {
 	a.progTotal = tot
 }
 
+// 目录的权限与 mtime 最后统一补(见 archive.dirTodos)。
+// 顺序: 深的在前 —— 万一某个父目录的权限挡住了子目录, 子目录已经先设完了。
+func (a *archive) applyDirMeta() {
+	todos := a.dirTodos
+	a.dirTodos = nil
+	sort.SliceStable(todos, func(i, j int) bool {
+		return len(todos[i].path) > len(todos[j].path)
+	})
+	for _, d := range todos {
+		if d.mode != 0 {
+			if err := os.Chmod(d.path, os.FileMode(d.mode)); err != nil {
+				fmt.Fprintf(os.Stderr, "警告: 无法设置目录权限 %s: %v\n", d.path, err)
+			}
+		}
+		if d.nano != 0 {
+			t := time.Unix(0, d.nano)
+			if err := os.Chtimes(d.path, t, t); err != nil {
+				fmt.Fprintf(os.Stderr, "警告: 无法设置目录时间 %s: %v\n", d.path, err)
+			}
+		}
+	}
+}
+
 func overwriteNote(n int) string {
 	if n == 0 {
 		return ""
@@ -652,6 +679,7 @@ func unpack(archivePath, outDir string, verify bool, only []string) {
 		for _, fe := range a.files {
 			a.extractFile(fe, outDir, verify)
 		}
+		a.applyDirMeta()
 		runCleanups()
 		fmt.Printf("解包完成: %d 条目 -> %s  模式=%s 校验=%v%s\n",
 			len(a.files), outDir, modeName(a.spec.code), verify, overwriteNote(a.overwrote))
@@ -679,6 +707,7 @@ func unpack(archivePath, outDir string, verify bool, only []string) {
 	for _, fe := range want {
 		a.extractFile(fe, outDir, verify)
 	}
+	a.applyDirMeta()
 	runCleanups()
 	fmt.Printf("抽取完成: %d 文件 -> %s  模式=%s 校验=%v%s\n",
 		len(want), outDir, modeName(a.spec.code), verify, overwriteNote(a.overwrote))

@@ -343,7 +343,7 @@ func makePhotoBMP(w, h, bpp int) []byte {
 				20*math.Sin(float64(x)/3+7+float64(y)/5)
 			nz := float64((x*31+y*17)%7 - 3)
 			o := off + y*stride + x*ch
-			b[o] = byte(clampByte(v-10+nz/2))
+			b[o] = byte(clampByte(v - 10 + nz/2))
 			b[o+1] = byte(clampByte(v + nz))
 			b[o+2] = byte(clampByte(v + 8 + nz))
 		}
