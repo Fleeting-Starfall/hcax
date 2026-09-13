@@ -32,14 +32,23 @@ hcax pack backup.hcax ~/Documents -m max
 # 解包到目录
 hcax unpack backup.hcax ./restore
 
-# 只看内容
-hcax list backup.hcax
+# 只看内容（-l 显示权限/时间/分类统计）
+hcax list backup.hcax -l
 
-# 校验完整性（逐块哈希）
+# 校验完整性（v6+ 为流级哈希；读老归档时自动退回逐块校验）
 hcax verify backup.hcax
+
+# 看归档内部布局（各区占多少字节）
+hcax info backup.hcax
 
 # 只抽取其中某个文件（无需全解）
 hcax extract backup.hcax ./out report.pdf
+
+# 抽一整个子目录（给目录名即可，抽出整棵子树）
+hcax extract backup.hcax ./out src/lib
+
+# 备份时排除 .git / node_modules / 临时文件（可重复给）
+hcax pack src.hcax ./proj -m max --exclude .git --exclude node_modules --exclude '*.tmp'
 ```
 
 **构建**（需要 Go 1.27+）：
@@ -77,16 +86,24 @@ go build -o hcax .
 ### pack — 打包
 
 ```
-hcax pack <输出.hcax> <文件/目录...> [-m 模式]
+hcax pack <输出.hcax> <文件/目录...> [-m 模式] [--exclude 模式]... [-T]
 ```
 
 - `-m fast|best|max|ultra|text`（默认 `best`）
+- `--exclude <glob>`：可重复。按 完整路径 / 相对打包根的路径 / 任一路径分段 三者
+  比对，命中即排除；命中目录时整棵子树跳过（连遍历都省）。例：`--exclude .git`
+- `-T` / `--precise-times`：时间戳存到纳秒（会把归档升到 v10，旧版读不了；
+  默认按秒存，与 tar 一致）
 - 可一次给多个文件/目录，它们会被合并进同一个归档并**跨文件去重**
 - 输出会打印：原始大小 → 压缩后大小、压率、模式、唯一块数（可压/原样）
 - **目录语义与 tar/zip 一致**：`hcax pack out.hcax dir` 存的是 `dir/a/b/c.txt`，
   解包得到 `out/dir/a/b/c.txt`。打包单个文件时则只存文件名本身
 - **符号链接按链接保存**（不跟随、不复制目标内容），解包还原为链接
-- 打包超过 32 MiB 时会在 stderr 显示进度；进度不写入 stdout，不影响脚本解析
+- **硬链接按硬链接保存**：同一 inode 的多个名字只存一份块索引，解包后重新共享
+  inode（只抽其中一个时退化为内容完整的普通文件）
+- **不会把自己打进自己**：`hcax pack arch.hcax .` 会自动跳过 arch.hcax
+- 权限位含 setuid / setgid / sticky（v10+），mtime 一并还原
+- 打包/解包超过 32 MiB 时在 stderr 显示进度；进度不写 stdout，不影响脚本解析
 
 ### unpack — 解包
 
@@ -103,14 +120,29 @@ hcax unpack <输入.hcax> <输出目录> [--verify]
 hcax extract <输入.hcax> <输出目录> [文件名...] [--verify]
 ```
 
-- 只解出指定文件；支持全路径或 basename
+- 目标可以写 完整路径 / basename / **目录前缀**（给目录名抽出整棵子树）
+- 一个都没匹配上会**直接报错**（而不是"抽取完成：0 文件"骗人）；部分没匹配上
+  只给警告，命中的照常抽出
 - 因为内部是"整体解固实流再按偏移取块"，无需解压全部文件
 
 ### list — 列出内容
 
 ```
-hcax list <输入.hcax>
+hcax list <输入.hcax> [-l]
 ```
+
+- 默认按路径排序输出（打包顺序是 文件→目录→链接 三组，直接打印看着是乱的）
+- `-l` / `--long`：权限位 + 修改时间 + 链接目标（`->` 符号链接，`=>` 硬链接）
+- 汇总行给出 文件 / 目录 / 链接 的分类计数与总量
+
+### info — 容器布局
+
+```
+hcax info <输入.hcax>
+```
+
+打印版本、模式/后端、条目与块的构成，以及头部/元数据/数据区/原样区/字典区/尾部
+各占多少字节。配合 FORMAT.md 用来核对格式。
 
 ### verify — 校验
 
@@ -470,13 +502,17 @@ bash test/regress.sh ./hcax /tmp/hcax-regress
 
 ### 速度（参考，12.46MB 结构化语料）
 
-| 模式 | 打包 | 解包 |
-|---|---|---|
-| fast | ~0.8s | ~0.04s |
-| best | ~0.7s | ~0.04s |
-| max | ~3.5s | ~0.3s |
-| ultra | ~3.5s | ~0.3s |
-| text | ~1.5s/774KB（约 0.5~1 MB/s） | 同量级 |
+本机实测（Apple Silicon，12 MB 结构化语料：文本/JSON/Go 源码/结构化二进制/随机）：
+
+| 模式 | 打包 | 解包 | 归档大小 |
+|---|---|---|---|
+| fast | 0.09s | 0.01s | 5.10 MB |
+| best | 0.65s | 0.01s | 4.17 MB |
+| max | 3.08s | 1.67s | 3.45 MB |
+| ultra | 2.97s | 0.87s | 3.45 MB |
+| text | 0.32s / 774 KB（约 2.4 MB/s） | 同量级 | 86 KB |
+
+（数字随机器与语料变化，量级比绝对值更有意义。）
 
 ### 限制（诚实说明）
 
@@ -489,11 +525,14 @@ bash test/regress.sh ./hcax /tmp/hcax-regress
 ### v11 已知未做（诚实清单）
 
 1. **符号链接自身的 mtime 无法还原**：Go 标准库没有 `lutimes`，只能还原普通文件/目录的时间。
-2. **硬链接已还原（v11）**：同一 inode 的多个名字只存一份块索引，解包后重新共享 inode；只抽其中一个时退化为内容完整的普通文件。
-3. **不保存 owner / ACL / 扩展属性（xattr）**：只还原权限位与 mtime（v10 起含 setuid/setgid/sticky）。
-4. **去重无内容二次校验**：块去重只用 128-bit 哈希，碰撞概率约 2⁻⁶⁴ 量级，理论上存在但实践中可忽略。
-5. **无加密、无分卷、无增量更新**。
-6. **`text` 模式仍慢**（~0.5~1 MB/s）：这是逐 bit 上下文建模的固有代价，见 §8。
+2. **不保存 owner / ACL / 扩展属性（xattr）**：只还原权限位与 mtime（v10 起含 setuid / setgid / sticky）。
+3. **去重无内容二次校验**：块去重只用 128-bit 哈希，碰撞概率约 2⁻⁶⁴ 量级，理论上存在但实践中可忽略。
+4. **无加密、无分卷、无增量更新**。
+5. **`text` 模式仍慢**（约 2 MB/s，比 LZ 系慢一到两个数量级）：这是逐 bit 上下文建模的固有代价。
+6. **默认丢弃亚秒时间戳**：为不跟旧版二进制绝缘，时间戳按秒存（同 tar），需要纳秒请加 `-T`。
+
+（v9~v11 期间已补齐、不再属于"未做"的：符号链接、硬链接、setuid/setgid/sticky 权限位、
+打包侧 `--exclude`、解包侧内存有界、写盘失败不再静默截断。）
 
 ---
 
