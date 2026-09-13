@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -550,6 +551,155 @@ func TestXZFallbackWarns(t *testing.T) {
 	}
 	if xzWarnCount != before+1 {
 		t.Errorf("系统 xz 缺失时必须恰好警告一次(实际新增 %d 次)", xzWarnCount-before)
+	}
+}
+
+// ---------- 截断归档必须"干净失败", 不许 panic ----------
+
+// 静音: 下面要跑几千次解析, 让它们往测试输出里打印毫无意义
+func muteStdio(t *testing.T) func() {
+	t.Helper()
+	dn, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldOut, oldErr := os.Stdout, os.Stderr
+	os.Stdout, os.Stderr = dn, dn
+	return func() {
+		os.Stdout, os.Stderr = oldOut, oldErr
+		dn.Close()
+	}
+}
+
+func TestTruncatedArchiveNeverPanics(t *testing.T) {
+	// 截断归档是最容易撞出 panic 的输入: 头部说"元数据 N 字节 / 数据 M 字节",
+	// 而文件实际没那么长。panic 在"自动处理别人发来的归档"的场景里就是 DoS。
+	// 而且这类 bug 往往是"刚好截断到某个长度才崩", 手搓用例撞不到 —— 只能穷举前缀。
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 三种内容: 可压文本(进固实流) / 随机(判为原样, 进原样区) / 中等重复,
+	// 这样归档里"元数据帧 + 数据帧 + 原样区"三段都有实体, 截断才有覆盖意义。
+	rng := rand.New(rand.NewSource(20260913))
+	words := strings.Fields("the quick brown fox compress data streams context mixing " +
+		"predicts bits adaptive model archive solid chunk dedup")
+	txt := make([]byte, 0, 24000)
+	for len(txt) < 24000 {
+		txt = append(txt, words[rng.Intn(len(words))]...)
+		txt = append(txt, ' ')
+	}
+	rnd := make([]byte, 6000)
+	rng.Read(rnd)
+	mid := bytes.Repeat([]byte("repeat me "), 900)
+	for name, data := range map[string][]byte{
+		"a.txt": txt, "b.bin": rnd, "c.dat": mid,
+	} {
+		if err := os.WriteFile(filepath.Join(src, name), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 五种模式是**五套不同的编解码实现**(zstd / lzma2-xz / 自写 CM),
+	// 只测一种等于只测了三分之一。逐个穷举。
+	unmute := muteStdio(t)
+	defer unmute()
+	for _, mode := range []string{"fast", "best", "max", "ultra", "text"} {
+		t.Run(mode, func(t *testing.T) {
+			arc := filepath.Join(dir, mode+".hcax")
+			pack([]string{src}, arc, mode, nil, false)
+			full, err := os.ReadFile(arc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(full) < 512 {
+				t.Fatalf("归档只有 %d 字节, 穷举前缀测不到东西", len(full))
+			}
+			// 先验: 完整归档必须能正常列出。否则下面几万轮全是"一开始就失败",
+			// 用例看着在跑, 其实一行有效代码都没执行到。
+			if runCatchingFatal(func() { listArchive(arc, false) }) {
+				t.Fatal("完好归档反而列不出来 —— 后面的穷举全是空转")
+			}
+			t.Logf("归档 %d 字节, 穷举 %d 个前缀(每 16 个做一次完整解包)", len(full), len(full)+1)
+			// runCatchingFatal 把 fatal 转成 panic 接住, 而**真正的 panic 会原样
+			// 抛出**, 于是"崩了"直接体现为测试失败 —— 正是想要的效果。
+			for n := 0; n <= len(full); n++ {
+				p := filepath.Join(dir, "trunc.hcax")
+				if err := os.WriteFile(p, full[:n], 0o644); err != nil {
+					t.Fatal(err)
+				}
+				runCatchingFatal(func() { listArchive(p, false) })
+				// 解包路径比只读元数据深得多(建文件/解压/变换), 抽样覆盖
+				if n%16 == 0 {
+					out := filepath.Join(dir, "out")
+					os.RemoveAll(out)
+					runCatchingFatal(func() { unpack(p, out, false, nil) })
+				}
+			}
+		})
+	}
+}
+
+// ---------- 随机篡改的归档同样不许 panic ----------
+
+func TestCorruptedArchiveNeverPanics(t *testing.T) {
+	// 截断只让数据"变少"; 随机篡改能让长度字段"变大"(比如块长从 100 变成 10 亿),
+	// 触发的是另一类越界 —— 光靠截断用例撞不到。
+	// 归档里的字节是**别人给的**, 处理它的人不该因为一个坏字节就整个崩掉。
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rng := rand.New(rand.NewSource(4242))
+	words := strings.Fields("alpha beta gamma delta archive chunk dedup solid model")
+	txt := make([]byte, 0, 20000)
+	for len(txt) < 20000 {
+		txt = append(txt, words[rng.Intn(len(words))]...)
+		txt = append(txt, ' ')
+	}
+	rnd := make([]byte, 4000)
+	rng.Read(rnd)
+	for name, data := range map[string][]byte{
+		"a.txt": txt, "b.bin": rnd, "c.dat": bytes.Repeat([]byte("xyz "), 800),
+	} {
+		if err := os.WriteFile(filepath.Join(src, name), data, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	unmute := muteStdio(t)
+	defer unmute()
+	for _, mode := range []string{"fast", "best", "max", "ultra", "text"} {
+		t.Run(mode, func(t *testing.T) {
+			arc := filepath.Join(dir, mode+".hcax")
+			pack([]string{src}, arc, mode, nil, false)
+			full, err := os.ReadFile(arc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// 先验: 同 TestTruncatedArchiveNeverPanics, 防止 200 轮全是空转
+			if runCatchingFatal(func() { listArchive(arc, false) }) {
+				t.Fatal("完好归档反而列不出来 —— 后面的篡改用例全是空转")
+			}
+			const rounds = 200
+			for i := 0; i < rounds; i++ {
+				b := append([]byte(nil), full...)
+				for k, n := 0, 1+rng.Intn(3); k < n; k++ { // 每轮翻 1~3 个 bit
+					b[rng.Intn(len(b))] ^= byte(1 << uint(rng.Intn(8)))
+				}
+				p := filepath.Join(dir, "corrupt.hcax")
+				if err := os.WriteFile(p, b, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				runCatchingFatal(func() { listArchive(p, false) })
+				if i%8 == 0 {
+					out := filepath.Join(dir, "out")
+					os.RemoveAll(out)
+					runCatchingFatal(func() { unpack(p, out, false, nil) })
+				}
+			}
+		})
 	}
 }
 

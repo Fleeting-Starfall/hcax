@@ -588,6 +588,36 @@ else
   bad "残留 $leftover 个 .hcax-new-* 临时文件"
 fi
 
+# ------------------------------------------------- 截断归档必须干净失败
+note "截断归档"
+# 归档里的长度字段说"有 N 字节"而文件实际更短, 是最容易撞出 panic 的输入。
+# panic 在"自动处理别人发来的归档"的场景就是 DoS。Go 侧已按前缀穷举(见
+# hcax_test.go), 这里从命令行再兜一遍: 退出码非 0, 且输出里不能有 panic/goroutine。
+asrc=o_max_corpus.hcax
+n=$(sz "$asrc")
+panicked=0
+for frac in 2 3 10; do
+  rm -f tr.hcax
+  head -c $((n / frac)) "$asrc" > tr.hcax
+  out=$("$BIN" list tr.hcax 2>&1)
+  if printf '%s' "$out" | grep -q 'panic\|goroutine'; then
+    panicked=1
+  fi
+done
+if [ "$panicked" -eq 0 ]; then
+  ok "截断到 1/2、1/3、1/10 都不 panic"
+else
+  bad "截断归档时 panic 了(坏输入不该让程序崩)"
+fi
+# 短到连头都不完整的归档必须报错退出, 不能"看起来成功"
+rm -f tr.hcax
+head -c 8 "$asrc" > tr.hcax
+if "$BIN" list tr.hcax >/dev/null 2>&1; then
+  bad "只剩 8 字节的归档被当成有效归档了"
+else
+  ok "只剩 8 字节时报错退出(没有伪装成成功)"
+fi
+
 # ---------------------------------------------------------------- 汇总
 note "汇总: $PASS 通过 / $FAIL 失败"
 [ "$FAIL" -eq 0 ]
