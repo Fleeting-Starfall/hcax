@@ -119,6 +119,14 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 		need(m, pos, 5, "块表项")
 		chunks[i].uncomp = binary.LittleEndian.Uint32(m[pos : pos+4])
 		pos += 4
+		// 单个块的声明长度必须落在**我们自己分块器**的上界之内(CDC 最大 256KB,
+		// ultra 的整文件固实最大 256MB)。损坏/恶意归档可以随便填 0xFFFFFFFF,
+		// 而 readChunk 是"先 make([]byte, uncomp) 再发现数据不够" —— 一个 1KB 的
+		// 归档就能让人先吃掉 4GB 内存。这句把巨额分配挡在读数据之前。
+		if chunks[i].uncomp > maxChunkUncomp {
+			fatal("块 %d 声明长度 %d B 超出合理上界(%d B): 归档损坏",
+				i, chunks[i].uncomp, maxChunkUncomp)
+		}
 		f := m[pos]
 		pos++
 		chunks[i].stored = f&1 != 0
@@ -210,6 +218,10 @@ const (
 	verHard   = 11 // 需要硬链接条目
 
 	headerSize = 24 // v2 头长; v3+ 头长 32(后续再读 8 字节 rawLen)
+
+	// 单个块声明长度的上界。取自 ultra 模式 newChunkerMinMax(nil, 4MB, 256MB) 的
+	// 上限 —— 我们自己写出来的块不可能比它更大。
+	maxChunkUncomp = 256 << 20
 )
 
 // 该写哪个版本? 逐条检查: 只要有一个条目用了高版本才装得下的特性, 就整体升上去

@@ -385,3 +385,18 @@ func TestCheckLogical(t *testing.T) {
 		t.Error("目录/链接条目不该参与块长校验")
 	}
 }
+
+// ---------- 恶意/损坏归档: 声明一个巨额块, 不能先吃掉 4GB 内存 ----------
+
+func TestAbsurdChunkSizeRejected(t *testing.T) {
+	files := []fileEntry{{name: "a.txt", size: 100, mode: 0644, chunks: []uint32{0}}}
+	var sh, rh [8]byte
+	// 块表里声明 0xFFFFFFFF(~4GB): 真实数据只有 100 字节
+	raw := serializeMeta([]*chunkMeta{{uncomp: 0xFFFFFFFF}}, files, sh, rh, 8)
+	if !runCatchingFatal(func() { parseMeta(raw, 1, 1, 8) }) {
+		t.Error("声明 4GB 的块没有被拒绝 —— readChunk 会先 make 出 4GB 再发现数据不够")
+	}
+	// 正常大小必须放行(别把这条检查写成误伤)
+	raw2 := serializeMeta([]*chunkMeta{{uncomp: 4096}}, files, sh, rh, 8)
+	parseMeta(raw2, 1, 1, 8)
+}

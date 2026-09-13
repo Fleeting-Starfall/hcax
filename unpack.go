@@ -495,6 +495,13 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	}()
 	// 文件级光栅变换(v7): 变换跨块生效, 必须先拼出整文件再逆变换
 	if len(fe.chunks) > 0 && (fe.xform == xfRasterMed || fe.xform == xfRasterRctMed) {
+		// 这条路径要**整文件进内存**。打包侧有 rasterMaxBytes 门控, 写出来的归档
+		// 不可能超; 所以超限只可能是损坏或恶意构造(声明一个巨大的"光栅图",
+		// 内容全是零 —— 几 KB 的归档就能让人吃掉几十 GB 内存)。在读块之前挡掉。
+		if fe.size > rasterMaxBytes {
+			fatal("文件 %s 声明 %d B, 超过光栅变换上限(%d B): 归档损坏",
+				fe.name, fe.size, rasterMaxBytes)
+		}
 		buf := []byte{}
 		for _, ix := range fe.chunks {
 			buf = append(buf, a.readChunk(ix, verify)...)
