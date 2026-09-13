@@ -275,6 +275,19 @@ if [ -n "$s1" ] && [ "$s1" = "$s2" ] && [ "$s2" = "$s3" ]; then
 if "$BIN" list selfd/arch.hcax 2>/dev/null | grep -q 'arch\.hcax'; then
   bad "归档里含有自己"; else ok "归档内不含自身"; fi
 
+# 输入重复/重叠: 老实现会存出重复条目, 解包时后者静默覆盖前者
+mkdir -p dupd && printf 'x\n' > dupd/f.txt
+"$BIN" pack dupd.hcax dupd dupd -m fast >/dev/null 2>&1
+if [ "$("$BIN" list dupd.hcax 2>/dev/null | grep -c 'dupd/f.txt')" = "1" ]; then
+  ok "重复输入同一目录不再产生重复条目"; else bad "重复输入产生了重复条目"; fi
+"$BIN" pack dupd2.hcax dupd ./dupd dupd/ -m fast >/dev/null 2>&1
+if [ "$("$BIN" list dupd2.hcax 2>/dev/null | grep -c 'dupd/f.txt')" = "1" ]; then
+  ok "./dup 与 dup 与 dup/ 视为同一输入"; else bad "等价路径未归一"; fi
+# 目录 + 目录内文件: 归档内名字重叠
+"$BIN" pack dupd3.hcax dupd dupd/f.txt -m fast 2>/dev/null | grep -q '重复条目' && \
+if "$BIN" list dupd3.hcax 2>/dev/null | grep -q 'dupd/f.txt'; then
+  ok "输入重叠时提示并保留一份"; else bad "输入重叠处理异常"; fi
+
 # ---------------------------------------------------------------- 4. 损坏检测
 note "4. 损坏检测"
 cp "$A" corrupt.hcax

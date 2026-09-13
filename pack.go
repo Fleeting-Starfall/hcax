@@ -53,6 +53,49 @@ func excluded(full, rel string, excl []string) bool {
 	return false
 }
 
+// 同一个输入给了两遍(pack out.hcax dup dup): 老实现会把 dup 下每个文件存两份,
+// 归档里躺着重复条目, 解包时后一个静默覆盖前一个 —— 既浪费又容易让人误解。
+// 按 Clean 后的路径去重(./dup 与 dup 与 dup/ 都算同一个)。
+func dedupPaths(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, p := range in {
+		k := filepath.Clean(p)
+		if seen[k] {
+			continue
+		}
+		seen[k] = true
+		out = append(out, p)
+	}
+	return out
+}
+
+// 输入去重之后仍可能撞名: pack out.hcax dup dup/f.txt —— dup/f.txt 既从遍历 dup
+// 收集到, 又被显式点名。存两份会让解包时后者静默覆盖前者, 用户却以为两个都存了。
+// 同一个归档内名字只可能来自同一份数据, 所以保留一份即可(并提示), 不必报错。
+func dropDupNames(files, dirs, links []string, root string) ([]string, []string, []string) {
+	seen := make(map[string]bool, len(files)+len(dirs)+len(links))
+	dropped := 0
+	keep := func(in []string) []string {
+		out := make([]string, 0, len(in))
+		for _, p := range in {
+			k := storedName(p, root)
+			if seen[k] {
+				dropped++
+				continue
+			}
+			seen[k] = true
+			out = append(out, p)
+		}
+		return out
+	}
+	files, dirs, links = keep(files), keep(dirs), keep(links)
+	if dropped > 0 {
+		fmt.Fprintf(os.Stderr, "警告: 跳过 %d 个重复条目(输入重叠, 同一个归档内名字被覆盖到多次)\n", dropped)
+	}
+	return files, dirs, links
+}
+
 // 归档文件自己不能进归档: `hcax pack arch.hcax .` 会把上一次的 arch.hcax 也收进去,
 // 于是每打一次包归档就胖一圈(154B -> 278B -> 389B...), 还把上一版内容当新数据存下来。
 // tar 遇到这种情形会明确跳过并提示, 这里照做。
@@ -238,8 +281,10 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 	if !ok {
 		fatal("未知模式 %s", mode)
 	}
+	inputs = dedupPaths(inputs)
 	files, dirs, links := collectPaths(inputs, excl)
 	files, dirs, links = excludeSelf(files, dirs, links, outPath)
+	files, dirs, links = dropDupNames(files, dirs, links, commonRoot(inputs))
 	if len(files) == 0 && len(dirs) == 0 && len(links) == 0 {
 		fatal("没有可打包的文件")
 	}
