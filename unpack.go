@@ -442,6 +442,15 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	}
 	defer a.addProgress(fe.size) // 所有 return 分支都要计入进度
 	target := joinOut(outDir, fe.name)
+	// 覆盖计数: 解到非空目录时会静默改写同名条目。tar 也这样, 但至少该让人知道
+	// "这次解包动了多少已有的东西" —— 否则误以为解进了空目录, 事后发现被改了都不知道。
+	// 目录条目不计: MkdirAll 对已存在的目录是空操作(不是改写), 而且目录往往会
+	// 因为"先给文件建父目录"而提前存在, 算进去会把首次解包也报成覆盖。
+	if !fe.isDir {
+		if _, err := os.Lstat(target); err == nil {
+			a.overwrote++
+		}
+	}
 	// 目录条目(含空目录): 直接建目录
 	if fe.isDir {
 		if err := os.MkdirAll(target, 0o755); err != nil {
@@ -624,6 +633,13 @@ func (a *archive) setProgress(items []fileEntry) {
 	a.progTotal = tot
 }
 
+func overwriteNote(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("  (覆盖 %d 个已存在条目)", n)
+}
+
 func unpack(archivePath, outDir string, verify bool, only []string) {
 	a := openArchive(archivePath)
 	if verify {
@@ -637,7 +653,8 @@ func unpack(archivePath, outDir string, verify bool, only []string) {
 			a.extractFile(fe, outDir, verify)
 		}
 		runCleanups()
-		fmt.Printf("解包完成: %d 条目 -> %s  模式=%s 校验=%v\n", len(a.files), outDir, modeName(a.spec.code), verify)
+		fmt.Printf("解包完成: %d 条目 -> %s  模式=%s 校验=%v%s\n",
+			len(a.files), outDir, modeName(a.spec.code), verify, overwriteNote(a.overwrote))
 		return
 	}
 	asks := make([]string, 0, len(only))
@@ -663,5 +680,6 @@ func unpack(archivePath, outDir string, verify bool, only []string) {
 		a.extractFile(fe, outDir, verify)
 	}
 	runCleanups()
-	fmt.Printf("抽取完成: %d 文件 -> %s  模式=%s 校验=%v\n", len(want), outDir, modeName(a.spec.code), verify)
+	fmt.Printf("抽取完成: %d 文件 -> %s  模式=%s 校验=%v%s\n",
+		len(want), outDir, modeName(a.spec.code), verify, overwriteNote(a.overwrote))
 }

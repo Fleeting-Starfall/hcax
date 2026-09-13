@@ -577,6 +577,7 @@ type archive struct {
 	progDone  uint64
 	progLast  uint64
 	progTotal uint64
+	overwrote int // 本次解包改写掉的、输出目录里已存在的条目数
 
 	chunks    []chunkMeta
 	files     []fileEntry

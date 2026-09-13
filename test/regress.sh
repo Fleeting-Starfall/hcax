@@ -296,6 +296,14 @@ if "$BIN" pack needarg.hcax edge --exclude 2>&1 | grep -qE '需要一个模式�
 if "$BIN" pack onlyout.hcax 2>&1 | grep -q '需要 输出 和 输入'; then
   ok "缺输入时提示用法"; else bad "缺输入时提示含糊"; fi
 
+# 解包到非空目录: 会静默改写同名条目(与 tar 同), 至少要让人知道改了几个
+rm -rf ovw && "$BIN" unpack o_max_corpus.hcax ovw >/dev/null 2>&1
+if "$BIN" unpack o_max_corpus.hcax ovw 2>/dev/null | grep -q '覆盖 [0-9]* 个已存在条目'; then
+  ok "重复解包提示覆盖了几个已存在条目"; else bad "重复解包未提示覆盖"; fi
+rm -rf ovw2
+if "$BIN" unpack o_max_corpus.hcax ovw2 2>/dev/null | grep -q '覆盖'; then
+  bad "首次解包到空目录也报覆盖(误报)"; else ok "首次解包不报覆盖"; fi
+
 # ---------------------------------------------------------------- 4. 损坏检测
 note "4. 损坏检测"
 cp "$A" corrupt.hcax
