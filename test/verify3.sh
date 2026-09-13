@@ -69,6 +69,35 @@ if "$BIN" extract a_max.hcax x2 novel.txt records.json >/dev/null 2>&1 && \
   ok "extract 多文件一致"; else bad "extract 多文件"; fi
 # 符号链接
 if [ -L b_max/c2/link ]; then ok "符号链接还原"; else bad "符号链接未还原"; fi
+# 并行固实分组(mmt)只有 >=64MiB 可压数据才会走, 而它出过 bug(v8: 空组 -> 空帧 ->
+# 解包越界 panic), 偏偏小语料永远碰不到。这里造 70MB 把它压出来。
+"$PY" - "$WORK/c2big/big.json" <<'PYX'
+import os, sys
+p = sys.argv[1]
+os.makedirs(os.path.dirname(p), exist_ok=True)
+line = b'{"id":%08d,"name":"item-%08d","ok":true,"payload":"abcdefghij"}\n'
+with open(p, 'wb') as f:
+    i = 0
+    n = 0
+    while n < 70 * 1024 * 1024:
+        f.write(line % (i, i)); n += 58; i += 1
+PYX
+if [ -s c2big/big.json ]; then
+  rm -f abig.hcax; rm -rf bbig
+  if "$BIN" pack abig.hcax c2big -m max >/dev/null 2>&1; then
+    ok "[70MB] 打包(走 mmt 并行分组)"
+  else
+    bad "[70MB] 打包失败"
+  fi
+  if "$BIN" unpack abig.hcax bbig >/dev/null 2>&1 && cmp -s c2big/big.json bbig/c2big/big.json; then
+    ok "[70MB] 往返逐字节一致(mmt 空组回归已覆盖)"
+  else
+    bad "[70MB] 往返不一致"
+  fi
+  if "$BIN" verify abig.hcax >/dev/null 2>&1; then ok "[70MB] verify 通过"; else bad "[70MB] verify"; fi
+else
+  bad "70MB 语料没造出来, mmt 路径无覆盖"
+fi
 
 # ------------------------------------------------------------ 第3轮
 note "第3轮 兼容矩阵"

@@ -143,6 +143,21 @@ if [ "$dmt_src" = "$dmt_out" ]; then
   ok "目录 mtime 还原(不再全部变成解包时刻)"; else bad "目录 mtime 丢失: $dmt_src -> $dmt_out"; fi
 chmod 755 dirmeta/ro
 
+# 打包可复现: 同样的输入必须得到**逐字节相同**的归档。
+# 归档里到处是 map(去重表/硬链接表/字典), 只要有一处按 map 遍历顺序写出去,
+# 同一个命令跑两遍就会得到两个不同的文件 —— 备份类工具里这很要命(增量/比对全废)。
+rm -f det1.hcax det2.hcax
+for dm in fast max text; do
+  rm -f det1.hcax det2.hcax
+  "$BIN" pack det1.hcax corpus -m "$dm" >/dev/null 2>&1
+  "$BIN" pack det2.hcax corpus -m "$dm" >/dev/null 2>&1
+  if cmp -s det1.hcax det2.hcax; then
+    ok "[$dm] 同输入两次打包逐字节一致(不依赖 map 遍历顺序)"
+  else
+    bad "[$dm] 两次打包结果不同(不可复现)"
+  fi
+done
+
 # ---------------------------------------------------------------- 3. 命令
 note "3. 命令行为"
 A=o_max_corpus.hcax
