@@ -364,3 +364,24 @@ func TestMetaRoundTripV8(t *testing.T) {
 		t.Errorf("v8 应把权限截到 0777, 实际 %o", got[1].mode)
 	}
 }
+
+// ---------- verify 的逻辑一致性检查 ----------
+
+func TestCheckLogical(t *testing.T) {
+	a := &archive{
+		chunks: []chunkMeta{{uncomp: 100}, {uncomp: 50}},
+		files:  []fileEntry{{name: "f", size: 150, chunks: []uint32{0, 1}}},
+	}
+	if runCatchingFatal(a.checkLogical) {
+		t.Error("一致的归档不该报错")
+	}
+	a.files[0].size = 149
+	if !runCatchingFatal(a.checkLogical) {
+		t.Error("size 与块长不符必须报错 —— 否则 verify 会把自相矛盾的归档判为通过")
+	}
+	// 目录与链接不产生数据块, 不参与这项检查
+	a.files = []fileEntry{{name: "d", isDir: true}, {name: "l", isLink: true, link: "x"}}
+	if runCatchingFatal(a.checkLogical) {
+		t.Error("目录/链接条目不该参与块长校验")
+	}
+}

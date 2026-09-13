@@ -255,6 +255,26 @@ func checkHeaderBounds(f *os.File, metaCompLen, metaRawLen, compLen, rawLen uint
 	}
 }
 
+// 逻辑一致性: 每个文件声明的 size 必须等于它引用的块长度之和。
+// 光校验"数据区字节流没变"是不够的 —— "哪个文件由哪些块拼成"存在元数据里,
+// 它若被改坏(比如 size 字段翻掉一位), 流哈希照样对得上, verify 却报"通过",
+// 于是拿着一个自相矛盾的归档当完好。这条检查只是做加法, 代价极小。
+func (a *archive) checkLogical() {
+	for _, fe := range a.files {
+		if fe.isDir || fe.isLink {
+			continue // 目录不产生块; 链接的 size 记的是目标字符串长度
+		}
+		var sum uint64
+		for _, ix := range fe.chunks {
+			sum += uint64(a.chunks[ix].uncomp)
+		}
+		if sum != fe.size {
+			fatal("元数据与数据自相矛盾: 文件 %s 声明 %d B, 但它引用的块合计 %d B",
+				fe.name, fe.size, sum)
+		}
+	}
+}
+
 // 条目数一致性校验: 尾部记录的 nFiles/nChunks 必须与头部一致(解析元数据后调用)
 func (a *archive) checkCounts() {
 	const trailerLen = 20

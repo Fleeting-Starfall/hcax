@@ -157,18 +157,28 @@ func infoArchive(archivePath string) {
 }
 
 func verifyArchive(archivePath string) {
+	t0 := time.Now()
 	a := openArchive(archivePath)
 	var tot uint64
 	for i := range a.chunks {
 		tot += uint64(a.chunks[i].uncomp)
 	}
+
+	a.checkLogical()
+	checked := "固实流/原样区哈希一致"
 	if a.hashLen == 0 {
 		a.verifyStream()
-		fmt.Printf("校验通过: 固实流/原样区哈希一致, %d 块, 解压数据 %d B\n", len(a.chunks), tot)
-		return
+	} else {
+		checked = "逐块哈希一致"
+		for i := range a.chunks {
+			_ = a.readChunk(uint32(i), true)
+		}
 	}
-	for i := range a.chunks {
-		_ = a.readChunk(uint32(i), true)
+	el := time.Since(t0)
+	rate := ""
+	if el > 0 && tot >= 1<<20 { // 小归档算出来的速率没意义(还容易显示成 0.0 MB/s)
+		rate = fmt.Sprintf(", %.1f MB/s", float64(tot)/el.Seconds()/1048576)
 	}
-	fmt.Printf("校验通过: %d 块全部哈希一致, 解压数据 %d B\n", len(a.chunks), tot)
+	fmt.Printf("校验通过: %s; %d 个条目 / %d 块, 解压数据 %d B (%s), 耗时 %v%s\n",
+		checked, len(a.files), len(a.chunks), tot, humanSize(tot), el.Round(time.Millisecond), rate)
 }
