@@ -342,6 +342,65 @@ if "$BIN" list trunc.hcax 2>&1 | grep -qE '截断|尾部'; then ok "截断报错
 
 # ---------------------------------------------------------------- 5. 资源
 
+# 原样区(不可压块)单独有流级哈希: 只测"数据区中间"可能一直落在固实流里,
+# 原样区那条校验路径就永远没人跑过。这里专门造一个有原样区的归档来测。
+mkdir -p rawcorp
+head -c 300000 /dev/urandom > rawcorp/rand.bin
+printf 'compressible text %.0s' $(seq 1 3000) > rawcorp/txt.txt
+rm -f rawcorp.hcax
+"$BIN" pack rawcorp.hcax rawcorp -m max >/dev/null 2>&1
+if "$BIN" info rawcorp.hcax 2>/dev/null | grep -q '原样区'; then
+  ok "max 档确有原样区(不可压块走原样存储)"
+else
+  bad "造不出原样区, 下面的原样区校验用例是空转的"
+fi
+"$PY" - "$PWD/rawcorp.hcax" <<'PYX'
+import sys
+p = sys.argv[1]
+d = bytearray(open(p, 'rb').read())
+d[-40] ^= 0xFF          # 尾部魔数(20B)与字典区之前 —— 一定是原样区
+open(p + '.bad', 'wb').write(bytes(d))
+PYX
+if "$BIN" verify rawcorp.hcax.bad >/dev/null 2>&1; then
+  bad "原样区被篡改后 verify 仍通过"; else ok "原样区篡改被 verify 捕获"; fi
+# list 只读元数据、不读数据区, 所以"list 正常"不等于数据完好 —— 把这点钉住,
+# 免得以后有人拿 list 当校验用
+if "$BIN" list rawcorp.hcax.bad >/dev/null 2>&1; then
+  ok "list 不读数据区(损坏仍能列出, 故不能当校验用)"
+else
+  bad "list 读了数据区(预期: 只看元数据)"
+fi
+rm -rf rcbad
+if "$BIN" unpack rawcorp.hcax.bad rcbad --verify >/dev/null 2>&1; then
+  bad "unpack --verify 放过了损坏的原样区"; else ok "unpack --verify 拦住损坏的原样区"; fi
+
+# 元数据区(压缩帧)损坏: 元数据是先解压再解析的, 解压结果长度与声明不符必须报错
+"$PY" - "$PWD/rawcorp.hcax" <<'PYX'
+import sys
+p = sys.argv[1]
+d = bytearray(open(p, 'rb').read())
+d[60] ^= 0xFF           # 头部 48B 之后即压缩的元数据帧
+open(p + '.meta', 'wb').write(bytes(d))
+PYX
+if "$BIN" list rawcorp.hcax.meta >/dev/null 2>&1; then
+  bad "元数据区损坏被接受"; else ok "元数据区损坏被拒绝"; fi
+
+# 最表层的两个字节: magic 与版本号
+"$PY" - "$PWD/rawcorp.hcax" <<'PYX'
+import sys
+p = sys.argv[1]
+d = bytearray(open(p, 'rb').read())
+d[0] = 0x41
+open(p + '.magic', 'wb').write(bytes(d))
+d2 = bytearray(open(p, 'rb').read())
+d2[4] = 99
+open(p + '.ver', 'wb').write(bytes(d2))
+PYX
+if "$BIN" list rawcorp.hcax.magic 2>&1 | grep -q '不是 HCAX'; then
+  ok "magic 不对时报'不是 HCAX 文件'"; else bad "magic 校验异常"; fi
+if "$BIN" list rawcorp.hcax.ver 2>&1 | grep -q '版本不兼容'; then
+  ok "版本号过高时报'版本不兼容'"; else bad "版本号校验异常"; fi
+
 # 损坏的头部: 长度字段/条目数被改成荒谬值, 必须明确报错而不是 OOM 或 panic
 cp "$A" badhdr.hcax
 python3 - "$PWD/badhdr.hcax" <<'PYX'
