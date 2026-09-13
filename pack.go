@@ -331,6 +331,24 @@ func hashReader(r io.Reader) [16]byte {
 	return out
 }
 
+// 按"实际读到的字节数"记账, 而不是打开时 stat 到的大小。
+//
+// 打包要跑几分钟, 期间源文件完全可能被别的过程改写或截断。老代码一律记
+// st.Size(): 文件变小了就写出"声明 N 字节、实际只有 M 字节"的归档 —— 打包
+// 照样报成功, 要等哪天真要恢复、解包时报"大小不符"才发现。这是最坏的一类
+// 失败: 它在备份的时候骗人。
+//
+// tar 管这叫 "file changed as we read it"。这里按实读记账(保证归档内部自洽,
+// 解得开), 同时给一条警告, 让用户知道这份归档只是某个瞬间的切片。
+func sizedRead(fp string, statSize int64, nread uint64) uint64 {
+	if uint64(statSize) != nread {
+		fmt.Fprintf(os.Stderr,
+			"警告: %s 在读取过程中变了(stat %d B, 实读 %d B), 按实读记账\n",
+			fp, statSize, nread)
+	}
+	return nread
+}
+
 func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 	spec, ok := modes[mode]
 	if !ok {
@@ -495,9 +513,19 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 
 		// 先探前 64 字节: 判断是否光栅图(BMP/TGA/PNM) / zstd 档文件级变换探测
 		head := make([]byte, 64)
-		np, _ := io.ReadFull(f, head)
+		np, herr := io.ReadFull(f, head)
+		// 短文件返回 ErrUnexpectedEOF(且 np 是实际读到的长度), 属于正常;
+		// 除此之外都是真的读失败了, 不能当没发生。
+		if herr != nil && herr != io.EOF && herr != io.ErrUnexpectedEOF {
+			fatal("read %s: %v", fp, herr)
+		}
 		if rasterLikely(head[:np]) && st.Size() <= rasterMaxBytes {
-			rest, _ := io.ReadAll(f)
+			// 老代码写成 rest, _ := io.ReadAll(f): 读出错就静默拿到一个短 buffer,
+			// 而 size 仍按 stat 记录 —— 打包"成功", 要等解包才报"大小不符"。
+			rest, rerr := io.ReadAll(f)
+			if rerr != nil {
+				fatal("read %s: %v", fp, rerr)
+			}
 			whole := append(append([]byte{}, head[:np]...), rest...)
 			// 光栅变换跨块生效(预测依赖整幅几何), 故在分块之前对"整文件"施加;
 			// 用门控比较候选变换, 只采用确实更小的 -> 绝不退步
@@ -521,12 +549,13 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 			}
 			ch.flush()
 			f.Close()
+			sz := sizedRead(fp, st.Size(), uint64(np)+uint64(len(rest)))
 			fileEntries = append(fileEntries, fileEntry{
-				name: rel, size: uint64(st.Size()), mtime: uint64(st.ModTime().Unix()),
+				name: rel, size: sz, mtime: uint64(st.ModTime().Unix()),
 				nano: st.ModTime().UnixNano(),
 				mode: entryMode(st), chunks: curChunks, xform: fileXform,
 			})
-			totalUncomp += uint64(st.Size())
+			totalUncomp += sz
 			continue
 		}
 		if np > 0 {
@@ -535,10 +564,12 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 			}
 			ch.write(head[:np])
 		}
+		nread := uint64(np)
 		for {
 			n, re := f.Read(blk)
 			if n > 0 {
 				ch.write(blk[:n])
+				nread += uint64(n)
 			}
 			if re == io.EOF {
 				break
@@ -550,12 +581,13 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 		ch.flush()
 		f.Close()
 
+		sz := sizedRead(fp, st.Size(), nread)
 		fileEntries = append(fileEntries, fileEntry{
-			name: rel, size: uint64(st.Size()), mtime: uint64(st.ModTime().Unix()),
+			name: rel, size: sz, mtime: uint64(st.ModTime().Unix()),
 			nano: st.ModTime().UnixNano(),
 			mode: entryMode(st), chunks: curChunks,
 		})
-		totalUncomp += uint64(st.Size())
+		totalUncomp += sz
 	}
 	if showProgress {
 		fmt.Fprintf(os.Stderr, "\r  分块中 %d/%d 文件, 100%%   \n", len(files), len(files))

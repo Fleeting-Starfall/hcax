@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // ---------- 预处理变换必须可逆(否则解包就是静默的数据损坏) ----------
@@ -530,6 +531,79 @@ func TestAbsurdChunkSizeRejected(t *testing.T) {
 	// 正常大小必须放行(别把这条检查写成误伤)
 	raw2 := serializeMeta([]*chunkMeta{{uncomp: 4096}}, files, sh, rh, 8)
 	parseMeta(raw2, 1, 1, 8)
+}
+
+// ---------- 打包期间源文件被改写: 归档必须仍自洽 ----------
+
+func TestSizedReadAccountsActualBytes(t *testing.T) {
+	unmute := muteStdio(t)
+	defer unmute()
+	// 没变 -> 原样返回 stat 的大小, 且不报警告
+	if got := sizedRead("f", 100, 100); got != 100 {
+		t.Errorf("大小没变时应原样返回 100, 实际 %d", got)
+	}
+	// 变小/变大 -> 按实读记账(归档内部才自洽)
+	if got := sizedRead("f", 100, 70); got != 70 {
+		t.Errorf("文件变小时应按实读记 70, 实际 %d", got)
+	}
+	if got := sizedRead("f", 100, 140); got != 140 {
+		t.Errorf("文件变大时应按实读记 140, 实际 %d", got)
+	}
+}
+
+func TestPackSurvivesFileChangingUnderfoot(t *testing.T) {
+	// 打包期间源文件被别的过程改写是常态(日志、数据库、正在下载的文件)。
+	// 老代码一律按打开时 stat 的大小记账, 于是写出"声明 N 字节、实际 M 字节"
+	// 的归档 —— 打包报成功, 要等解包才炸。
+	//
+	// 这条不断言"竞态一定发生"(那会变成 flaky 用例), 只断言**不变式**:
+	// 文件在变也好、没变也好, 打出来的归档都必须自洽(解得开)。
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	big := filepath.Join(src, "growing.log")
+	if err := os.WriteFile(big, bytes.Repeat([]byte("log line ................\n"), 300000), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 后台持续追加, 制造"文件在脚下变化"。必须设上限, 否则几秒就能把盘写满。
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 400; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			f, err := os.OpenFile(big, os.O_APPEND|os.O_WRONLY, 0o644)
+			if err != nil {
+				return
+			}
+			f.Write(bytes.Repeat([]byte("more log ................\n"), 2000))
+			f.Close()
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	arc := filepath.Join(dir, "a.hcax")
+	unmute := muteStdio(t)
+	pack([]string{src}, arc, "fast", nil, false)
+	unmute()
+	close(stop)
+	wg.Wait()
+
+	// 不变式: 归档必须解得开(verify=true 会连流级校验一起做)
+	out := filepath.Join(dir, "out")
+	unmute = muteStdio(t)
+	fataled := runCatchingFatal(func() { unpack(arc, out, true, nil) })
+	unmute()
+	if fataled {
+		t.Fatal("源文件在打包期间被改写后, 打出的归档解不开 —— 归档内部不自洽")
+	}
 }
 
 // ---------- 系统 xz 缺失时必须报警, 不能静默降级 ----------
