@@ -440,6 +440,7 @@ preprocess.go  预处理变换: DELTA / BCJ-x86 / 探测
 raster.go      光栅图: BMP/TGA/PNM 识别 + RCT 色彩去相关 + MED 二维预测 + 变换选优 + 字节熵
 cm.go          上下文混合(CM)压缩器: 算术编码 + 多模型 + 混合器 + SSE
 fuzz_test.go   随机化测试: 随机目录树往返 + 随机损坏必须"干净失败"不能崩
+legacy_test.go 按 FORMAT.md 手工拼 v3/v5 归档, 覆盖老版本读取分支
 FORMAT.md      容器格式规范(字节级布局 + 版本演进 + 兼容矩阵)
 test/          回归测试: mkcorpus.py(造语料) + regress.sh(一键验证)
 _legacy_prototype/  早期 v1 原型与中间产物(保留备查, 可删)
