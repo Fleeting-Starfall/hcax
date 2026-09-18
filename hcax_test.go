@@ -9,6 +9,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"math"
 	"math/rand"
 	"os"
@@ -214,9 +215,33 @@ func TestCMRoundTrip(t *testing.T) {
 		src[i] = words[rng.Intn(len(words))]
 	}
 	enc := cmCompress(src)
-	dec := cmDecompress(enc)
+	dec := cmDecompress(enc, int64(len(src)))
 	if !bytes.Equal(dec, src) {
 		t.Fatal("CM 解压结果与原文不一致")
+	}
+}
+
+// CM 帧头那 8 字节长度是**不可信**的(归档被改坏就是任意值), 而 CM 逐 bit 解码
+// 没有天然结束标记 —— 解码器读完输入会一直补 0, 唯一的终止条件就是这个长度。
+// 少了这道上限, 一个损坏的 text 归档能让 hcax list 永久挂死(实测: 单核跑满,
+// 调用栈停在 cmCodec.update)。
+func TestCMRejectsAbsurdDeclaredLength(t *testing.T) {
+	src := bytes.Repeat([]byte("abcdefgh"), 64)
+	enc := cmCompress(src)
+	// 把帧头的 8 字节长度改成天文数字
+	binary.LittleEndian.PutUint64(enc[1:9], ^uint64(0)>>4)
+	// 上限给到正常值: 必须**报错**, 不能去解码 2^60 个字节
+	if err := cmDecompressTo(io.Discard, enc, int64(len(src))); err == nil {
+		t.Fatal("声明天文数字长度的 CM 帧没有被拒绝 —— 解码器会一直跑到挂死")
+	}
+	// 反向验证: 完好的帧配上正确的上限必须正常解开, 别把这条检查写成误伤
+	good := cmCompress(src)
+	var out bytes.Buffer
+	if err := cmDecompressTo(&out, good, int64(len(src))); err != nil {
+		t.Fatalf("完好帧被误拒: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), src) {
+		t.Fatal("完好帧解出的内容不对")
 	}
 }
 
@@ -628,6 +653,26 @@ func TestXZFallbackWarns(t *testing.T) {
 	}
 }
 
+// ---------- extract 的目标路径要能容忍 ./ 前缀 ----------
+
+func TestNormAsk(t *testing.T) {
+	// 注: 不测 "d\\sub" —— filepath.ToSlash 只在 Windows 上转换(Unix 里反斜杠
+	// 是合法的文件名字符), 在 macOS/Linux 上它本来就是恒等变换。
+	cases := [][2]string{
+		{"d/sub/r.bin", "d/sub/r.bin"}, // 原样
+		{"./d/sub/r.bin", "d/sub/r.bin"},
+		{"././d", "d"},
+		{"/d/sub", "d/sub"},
+		{"d/sub/", "d/sub"}, // 目录后面的斜杠
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := normAsk(c[0]); got != c[1] {
+			t.Errorf("normAsk(%q) = %q, 期望 %q", c[0], got, c[1])
+		}
+	}
+}
+
 // ---------- 截断归档必须"干净失败", 不许 panic ----------
 
 // 静音: 下面要跑几千次解析, 让它们往测试输出里打印毫无意义
@@ -757,6 +802,7 @@ func TestCorruptedArchiveNeverPanics(t *testing.T) {
 				t.Fatal("完好归档反而列不出来 —— 后面的篡改用例全是空转")
 			}
 			const rounds = 200
+			t0 := time.Now()
 			for i := 0; i < rounds; i++ {
 				b := append([]byte(nil), full...)
 				for k, n := 0, 1+rng.Intn(3); k < n; k++ { // 每轮翻 1~3 个 bit
@@ -772,6 +818,13 @@ func TestCorruptedArchiveNeverPanics(t *testing.T) {
 					os.RemoveAll(out)
 					runCatchingFatal(func() { unpack(p, out, false, nil) })
 				}
+			}
+			// 不许"只是变慢": 200 个几十 KB 的归档在正常情况下几秒就跑完了。
+			// 曾经有个真实的坑 —— CM 帧头长度字段被改坏后解码器不会停,
+			// 一个损坏的 text 归档能让 hcax list 永久挂死(单核跑满)。
+			// 那不会 panic, 只会卡住, 所以必须单独设一道时间闸门。
+			if d := time.Since(t0); d > 60*time.Second {
+				t.Errorf("%s 模式 200 轮用了 %v —— 有输入让解码器陷进去了", mode, d)
 			}
 		})
 	}

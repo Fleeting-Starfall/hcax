@@ -100,7 +100,10 @@ func listArchive(archivePath string, long bool) {
 // 无法判断"到底是数据压得好, 还是元数据占了大头"、"有没有走原样存储"这些问题。
 func infoArchive(archivePath string) {
 	a := openArchive(archivePath)
-	fi, _ := a.src.Stat()
+	fi, fierr := a.src.Stat()
+	if fierr != nil || fi == nil {
+		fatal("取归档大小失败: %v", fierr)
+	}
 	sz := fi.Size()
 	var nStored, nComp, rawSum uint64
 	var nLink, nDir int

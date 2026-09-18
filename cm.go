@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"math"
 )
@@ -440,11 +441,23 @@ func cmCompress(data []byte) []byte {
 // cmDecompressTo 把解压结果顺序写入 w(而非整份返回)。
 // CM 是逐 bit 串行解码, 无法随机访问, 但输出天然是流式的 —— 写 w 即可让解压
 // 不再要求"输出全量常驻内存"(解包侧落临时文件所需)。
-func cmDecompressTo(w io.Writer, frame []byte) error {
+func cmDecompressTo(w io.Writer, frame []byte, maxOut int64) error {
 	if len(frame) < 9 || frame[0] != 1 {
 		fatal("cm 帧格式错误")
 	}
 	n := binary.LittleEndian.Uint64(frame[1:9])
+	// 帧头这 8 字节是**归档里给的**。CM 逐 bit 解码没有天然的结束标记 ——
+	// 解码器读完输入后会一直补 0, 唯一的终止条件就是这个长度。于是它被改坏成
+	// 天文数字时, 解码器会一直跑到地老天荒: 实测一个损坏的 text 归档能让
+	// `hcax list` 永久挂死(单核跑满, 调用栈停在 cmCodec.update)。
+	// zstd/lzma2 有流结束标记, 不会这样 —— 只有 CM 需要这个兜底。
+	limit := maxOut
+	if limit <= 0 {
+		limit = 1 << 31 // 调用方给不出精确期望值时(老格式)的宽松兜底
+	}
+	if n > uint64(limit) {
+		return fmt.Errorf("cm 帧声明 %d 字节, 超过上限 %d(归档已损坏)", n, limit)
+	}
 	if n == 0 {
 		return nil
 	}
@@ -479,9 +492,11 @@ func cmDecompressTo(w io.Writer, frame []byte) error {
 	return nil
 }
 
-func cmDecompress(frame []byte) []byte {
+// maxOut: 调用方已知的期望输出上限(元数据有 metaRawLen, 固实流有各块 uncomp 之和)。
+// CM 帧头的长度字段不可信, 没有它解码器会跑到地老天荒 —— 详见 cmDecompressTo。
+func cmDecompress(frame []byte, maxOut int64) []byte {
 	var out bytes.Buffer
-	if err := cmDecompressTo(&out, frame); err != nil {
+	if err := cmDecompressTo(&out, frame, maxOut); err != nil {
 		fatal("cm 解压: %v", err)
 	}
 	return out.Bytes()

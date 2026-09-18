@@ -91,15 +91,26 @@ func openArchive(path string) *archive {
 		if _, err := io.ReadFull(f, metaFrame); err != nil {
 			fatal("读元数据失败: %v", err)
 		}
-		metaRaw := be.decompress(metaFrame)
+		// 元数据区的未压缩长度是头部里的 metaRawLen, 是个**精确**的期望值 ——
+		// 传给 CM 当上限, 免得它照着被改坏的帧头长度一直解码下去。
+		metaRaw := be.decompress(metaFrame, int64(metaRawLen))
 		if uint64(len(metaRaw)) != metaRawLen {
 			fatal("元数据长度不符: 期望 %d 实际 %d", metaRawLen, len(metaRaw))
 		}
 		chunks, files, sh, rh := parseMeta(metaRaw, nChunks, nFiles, ver)
 		// 3) 数据区: 只记录位置, 不读不解压 —— 按需(惰性)解压见 ensureSolid
+		// 固实流的未压缩大小 = 所有**非原样**块的 uncomp 之和(原样块在原样区)。
+		// 这也是个精确值, 给 CM 当解码上限用 —— 否则损坏的 text 归档会让它跑到挂死。
+		var solidUncomp uint64
+		for _, c := range chunks {
+			if !c.stored {
+				solidUncomp += uint64(c.uncomp)
+			}
+		}
 		a := &archive{spec: spec, be: be, src: f, dataStart: dataOff,
 			compLen: int64(compLen), rawOff: rawOff, rawLen: int64(rawLen),
 			metaCompLen: int64(metaCompLen), metaRawLen: int64(metaRawLen),
+			solidUncomp: int64(solidUncomp),
 			chunks: chunks, files: files, hashLen: 0,
 			solidHash: sh, rawHash: rh, ver: ver}
 		a.checkCounts()
@@ -337,7 +348,7 @@ func (a *archive) ensureSolid(need uint64) {
 			r, closeFn = xr, nil
 		} else {
 			fr := io.NewSectionReader(a.src, a.dataStart, a.compLen)
-			r, closeFn, err = a.be.decompressReader(fr)
+			r, closeFn, err = a.be.decompressReader(fr, a.solidUncomp)
 			if err != nil {
 				fatal("解压器: %v", err)
 			}
@@ -581,6 +592,14 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 // 这样 "d/sub" 与 "d/sub/" 是同一个意思。
 func normAsk(s string) string {
 	s = filepath.ToSlash(s)
+	// 归档内的名字永远是相对的, 而 shell 补全/automation 拼出来的目标常常带
+	// "./" 甚至 "/" 前缀 —— 不归一化的话, 用户照着 ls 的输出粘过来反而抽不到,
+	// 报"没有匹配"还很让人困惑(明明 list 里就有)。
+	for strings.HasPrefix(s, "./") {
+		s = s[2:]
+	}
+	s = strings.TrimPrefix(s, "/")
+	// 目录名后面的斜杠去掉(原来就有)
 	for len(s) > 1 && strings.HasSuffix(s, "/") {
 		s = s[:len(s)-1]
 	}

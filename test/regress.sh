@@ -173,6 +173,15 @@ rm -rf rx2
 if "$BIN" extract "$A" rx2 novel.txt records.json >/dev/null 2>&1 && \
    cmp -s corpus/novel.txt rx2/corpus/novel.txt && cmp -s corpus/records.json rx2/corpus/records.json; then
   ok "extract 多文件"; else bad "extract 多文件"; fi
+# 目标带 "./" 前缀(shell 补全/automation 常这么拼)必须也能抽出。
+# 老版本会报"没有匹配", 而 list 里明明有 —— 很让人困惑。
+rm -rf rx3
+if "$BIN" extract "$A" rx3 ./corpus/novel.txt >/dev/null 2>&1 && \
+   cmp -s corpus/novel.txt rx3/corpus/novel.txt; then
+  ok "extract 目标带 ./ 前缀也能命中"
+else
+  bad "extract 目标带 ./ 前缀时抽不到"
+fi
 if "$BIN" unpack "$A" r_verify --verify >/dev/null 2>&1; then ok "unpack --verify"; else bad "unpack --verify"; fi
 # list: 按路径排序(打包顺序是 文件/目录/链接 三组, 直接打印是乱的) + 分类统计
 if "$BIN" list "$A" 2>/dev/null | sed -n '1,/^共/p' | grep -E '^  ' | awk '{print $2}' | sort -c 2>/dev/null; then

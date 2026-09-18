@@ -518,9 +518,11 @@ func (b *backend) compressLZMA2Dict(cb []byte, dict string) []byte {
 	return buf.Bytes()
 }
 
-func (b *backend) decompress(frame []byte) []byte {
+// maxOut: 期望的输出上限, 只 CM 需要(zstd/lzma2 有流结束标记, 自己会停)。
+// CM 帧头的长度字段是归档里给的, 改坏了会让解码器跑到地老天荒 —— 见 cmDecompressTo。
+func (b *backend) decompress(frame []byte, maxOut int64) []byte {
 	if b.spec.backend == "cm" {
-		return cmDecompress(frame)
+		return cmDecompress(frame, maxOut)
 	}
 	if b.spec.backend == "zstd" {
 		if b.zDecDict != nil {
@@ -551,7 +553,7 @@ func (b *backend) decompress(frame []byte) []byte {
 // 与 decompress(整份在内存) 的区别在于输出不再要求常驻 —— 这是解包侧内存有界的前提。
 // 返回的 closeFn 负责释放解码器资源(zstd 会起后台 goroutine), 可为 nil。
 
-func (b *backend) decompressReader(r io.Reader) (io.Reader, func(), error) {
+func (b *backend) decompressReader(r io.Reader, maxOut int64) (io.Reader, func(), error) {
 	switch b.spec.backend {
 	case "cm":
 		// CM 必须先拿到完整压缩帧(自描述长度头在帧首), 但输出是流式的:
@@ -562,7 +564,7 @@ func (b *backend) decompressReader(r io.Reader) (io.Reader, func(), error) {
 		}
 		pr, pw := io.Pipe()
 		go func() {
-			pw.CloseWithError(cmDecompressTo(pw, frame))
+			pw.CloseWithError(cmDecompressTo(pw, frame, maxOut))
 		}()
 		return pr, func() { pr.Close() }, nil
 	case "zstd":
@@ -607,6 +609,11 @@ type archive struct {
 	solidR    io.Reader // 解压器(保留以便续解压)
 	solidSize int64     // 已解压字节数
 	solidEOF  bool      // 流已到底
+
+	// 固实流**总的**未压缩大小(各非原样块 uncomp 之和)。CM 解码需要它当上限:
+	// CM 帧头声明的长度不可信, 改坏了能让解码器跑到挂死。老格式算不出时为 0,
+	// cmDecompressTo 会退回一个宽松的绝对上限。
+	solidUncomp int64
 
 	// 解包进度(与打包侧的进度对称): 只写 stderr, 不污染 stdout 的机器可读输出
 	progShow  bool

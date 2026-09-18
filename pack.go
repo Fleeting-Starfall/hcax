@@ -425,7 +425,16 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 			continue
 		}
 		rel := storedName(fp, root)
-		st, _ := f.Stat()
+		// 不能忽略这个错误: 失败时 st 是 nil, 而下面 st.Size()/st.ModTime()/
+		// fileKeyOf(st) 全都会直接 nil 解引用崩掉 —— 整个备份一次失败一份不留。
+		// 拿不到属性就当"读不到"处理, 跟上面一样的跳过策略。
+		st, serr := f.Stat()
+		if serr != nil || st == nil {
+			fmt.Fprintf(os.Stderr, "警告: 跳过无法读取的文件 %s: %v\n", fp, serr)
+			f.Close()
+			skipped = append(skipped, fp)
+			continue
+		}
 
 		// 硬链接(v11): 同一 inode 的第二个及以后的名字, 直接复用首个条目的块索引 ——
 		// CDC 去重本来就会命中同一批块, 所以既不占归档空间, 也省掉一整遍读盘/分块。
