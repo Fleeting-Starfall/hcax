@@ -54,6 +54,10 @@ run_timed() {
 }
 
 rm -rf "$WORK"; mkdir -p "$WORK"
+# 把临时目录隔离到本次工作目录。TMPDIR 是全局的, 别的 hcax 进程(尤其是被中断的
+# 上一次运行留下的孤儿)同时在里面建/删文件, 会让"临时文件无泄漏"这种计数检查
+# 随机翻车 —— 明明没泄漏却报 +1。隔离之后计数只反映本次运行自己的行为。
+TMPDIR="$WORK/tmp"; mkdir -p "$TMPDIR"; export TMPDIR
 cd "$WORK" || exit 1
 
 note "0. 准备语料"
@@ -460,7 +464,16 @@ count_tmp() { find "${TMPDIR:-/tmp}" -maxdepth 1 -name 'hcax-solid-*' -o -maxdep
 before=$(count_tmp)
 "$BIN" pack tmpchk.hcax corpus -m max >/dev/null 2>&1
 after=$(count_tmp)
-if [ "$after" -le "$before" ]; then ok "临时文件无泄漏(前$before 后$after)"; else bad "临时文件泄漏(前$before 后$after)"; fi
+if [ "$after" -le "$before" ]; then ok "临时文件无泄漏(打包, 前$before 后$after)"; else bad "打包泄漏临时文件(前$before 后$after)"; fi
+# verify / list 也要查: verify 会 readChunk -> 建固实流临时文件(可达整个解压后大小),
+# 而它的成功路径此前没调 runCleanups —— 每跑一次 verify 就在 /tmp 留一个几十 MB。
+# 老版本这条会红, 正是要抓的。
+before=$(count_tmp)
+"$BIN" verify tmpchk.hcax >/dev/null 2>&1
+"$BIN" list tmpchk.hcax -l >/dev/null 2>&1
+"$BIN" info tmpchk.hcax >/dev/null 2>&1
+after=$(count_tmp)
+if [ "$after" -le "$before" ]; then ok "临时文件无泄漏(verify/list/info, 前$before 后$after)"; else bad "verify/list/info 泄漏临时文件(前$before 后$after)"; fi
 
 # 失败路径: 第一个文件已写入临时文件, 第二个文件打不开 -> 在临时文件建立**之后**失败
 # (旧实现用 defer os.Remove, 而 fatal() 走 os.Exit, defer 不执行 -> 泄漏)

@@ -93,6 +93,7 @@ func listArchive(archivePath string, long bool) {
 	}
 	fmt.Printf("共 %d 条目 (%d 文件 / %d 目录 / %d 链接), 原大小 %d B (%s), 唯一块 %d\n",
 		len(items), nFile, nDir, nLink, tot, humanSize(tot), len(a.chunks))
+	runCleanups() // 成功路径也要清理(见 verifyArchive 里的说明)
 }
 
 // info: 打印容器内部布局。配合 FORMAT.md 用来核对/调试格式 —— 光看归档大小
@@ -181,4 +182,9 @@ func verifyArchive(archivePath string) {
 	}
 	fmt.Printf("校验通过: %s; %d 个条目 / %d 块, 解压数据 %d B (%s), 耗时 %v%s\n",
 		checked, len(a.files), len(a.chunks), tot, humanSize(tot), el.Round(time.Millisecond), rate)
+	// 必须显式清理: verify 会 readChunk -> ensureSolid, 那会在系统临时目录建一个
+	// 固实流临时文件(可达**整个解压后的大小**)。fatal 路径由 fatal() 里的
+	// runCleanups 兜着, 而成功路径没人管 —— 于是每跑一次 verify 就在 /tmp 里
+	// 留下一个几十 MB 的 hcax-solid-*。(infoArchive 一直有, list/verify 漏了。)
+	runCleanups()
 }
