@@ -19,3 +19,6 @@ _legacy_prototype/
 *.swp
 .idea/
 .vscode/
+
+# Local test tooling (not published)
+test/
