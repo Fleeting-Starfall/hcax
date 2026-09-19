@@ -1,233 +1,249 @@
-# hcax 容器格式规范
+# hcax Container Format Specification
 
-本文描述 `.hcax` 归档的**字节级布局**。实现见 `format.go`（容器读写 + 版本常量）、
-`pack.go`（写）、`unpack.go`（读）、`backend.go`（后端与参数自适应）、
-`chunker.go`（CDC 分块）、`raster.go` + `preprocess.go`（变换）。
-当前写入版本 **v12**，可读取 **v2 ~ v12**。
+This document describes the **byte-level layout** of `.hcax` archives. Implementation:
+`format.go` (container read/write + version constants), `pack.go` (write), `unpack.go` (read),
+`backend.go` (backends + adaptive params), `chunker.go` (CDC chunking),
+`raster.go` + `preprocess.go` (transforms).
+Current write version **v12**, readable versions **v2 ~ v12**.
 
-约定：所有整数均为 **小端（little-endian）**，无对齐填充。路径分隔符按打包时的平台记录
-（Unix 为 `/`），解包时用 `filepath.FromSlash` 转换。
-
----
-
-## 1. 整体布局
-
-```
-+---------------------------+
-| 头部 (v6+: 48B)           |
-+---------------------------+
-| 元数据帧 (metaCompLen)    |  压缩后的块表 + 文件表
-+---------------------------+
-| 数据区 (compLen)          |  固实流, 经后端压缩(可能含多个串联帧)
-+---------------------------+
-| 原样区 (rawLen)           |  判定为"不可压"的块, 原样存放
-+---------------------------+
-| 训练字典区 (可选)         |
-+---------------------------+
-| 尾部 (20B)                |
-+---------------------------+
-```
+Conventions: all integers are **little-endian**, no padding. Path separators are recorded per
+the packing platform (Unix: `/`); unpack converts with `filepath.FromSlash`.
 
 ---
 
-## 2. 头部
+## 1. Overall Layout
 
-### v6 及以后（48 字节）
+```
++---------------------------+
+| Header (v6+: 48B)          |
++---------------------------+
+| Metadata frame (metaCompLen)|  compressed chunk table + file table
++---------------------------+
+| Data section (compLen)     |  solid stream, backend-compressed (may be multiple
+|                           |  concatenated frames)
++---------------------------+
+| Raw section (rawLen)       |  chunks judged "incompressible", stored as-is
++---------------------------+
+| Dictionary section (opt)   |
++---------------------------+
+| Tail (20B)                 |
++---------------------------+
+```
 
-| 偏移 | 大小 | 字段 | 说明 |
+---
+
+## 2. Header
+
+### v6 and later (48 bytes)
+
+| Offset | Size | Field | Notes |
 |---|---|---|---|
 | 0 | 4 | magic | `HCAX` |
-| 4 | 1 | version | 格式版本 |
-| 5 | 1 | code | 模式代码：0=fast 1=best 2=max 3=ultra 4=text |
-| 6 | 1 | window | zstd 窗口 log₂（解压 zstd 帧时要按它建解码器）。fast/text 为 0（用
-  编码器默认/最小窗口），其余档为 27。**lzma2 档不用它**——字典大小由
-  `dictFor(可压数据量)` 在打包时决定，并写进 xz 帧头，解压方从帧头读 |
-| 7 | 1 | — | 保留，恒 0 |
-| 8 | 8 | metaCompLen | 元数据帧压缩后长度 |
-| 16 | 8 | metaRawLen | 元数据解压后长度 |
-| 24 | 8 | compLen | 数据区长度 |
-| 32 | 8 | rawLen | 原样区长度 |
-| 40 | 4 | nChunks | 块表项数 |
-| 44 | 4 | nFiles | 文件表项数 |
+| 4 | 1 | version | format version |
+| 5 | 1 | code | mode code: 0=fast 1=best 2=max 3=ultra 4=text |
+| 6 | 1 | window | zstd window log₂ (decoder must be built with it to read zstd frames). fast/text: 0
+  (encoder default/minimal window); others: 27. **Unused by lzma2 tiers** — dict size is decided
+  at pack time by `dictFor(compressible size)` and written into the xz frame header; decoder
+  reads it from there |
+| 7 | 1 | — | reserved, always 0 |
+| 8 | 8 | metaCompLen | compressed metadata frame length |
+| 16 | 8 | metaRawLen | metadata decompressed length |
+| 24 | 8 | compLen | data section length |
+| 32 | 8 | rawLen | raw section length |
+| 40 | 4 | nChunks | chunk table entry count |
+| 44 | 4 | nFiles | file table entry count |
 
-### v2 ~ v5（更短，见 §6）
-
----
-
-## 3. 元数据（解压后为 metaRawLen 字节）
-
-### 3.1 流级校验哈希（16B）
-
-| 偏移 | 大小 | 字段 |
-|---|---|---|
-| 0 | 8 | solidHash — 解压后**固实流**的 sha256 前 8 字节 |
-| 8 | 8 | rawHash — **原样区**的 sha256 前 8 字节 |
-
-> v5 及更早是逐块存 16B 随机数哈希。那些哈希完全不可压，大量小文件时能占到归档的一半，
-> v6 起改为流级校验（见 `README.md` §4.4b）。
-
-### 3.2 块表（每项 5B）
-
-| 大小 | 字段 | 说明 |
-|---|---|---|
-| 4 | uncomp | 块解压后长度 |
-| 1 | flags | bit0 = stored（原样存储）<br>bits1–4 = xform（预处理类型）<br>bit5 = dictID（使用训练字典） |
-
-**块偏移不存储**：可压块在固实流中、原样块在原样区中都是**顺序紧凑排列**的，
-解包时累加 `uncomp` 即得。这项从 31B/项 降到 5B/项。
-
-### 3.3 文件表（变长）
-
-| 大小 | 字段 | 说明 |
-|---|---|---|
-| 2 | nameLen | 文件名长度 |
-| nameLen | name | 归档内相对路径 |
-| 1 | flags | bit0 = isDir<br>bits1–4 = xform（v7+，文件级光栅变换）<br>bit5 = isLink（v9+）<br>bit6 = isHard（v11+） |
-| 8 | size | 原始大小（符号链接记为目标字符串长度） |
-| 4 / 8 | mtime | v≤9：Unix 秒（uint32）<br>v10+：Unix **纳秒**（int64，0 = 无时间戳） |
-| 2 / 4 | mode | v≤9：权限位低 12 位（uint16）<br>v10+：uint32，含 setuid / setgid / sticky |
-| 4 | nChunks | 该文件引用的块数 |
-| 4×nChunks | chunks | 块索引（必须 < nChunks） |
-| 2 + tl | link | **仅 isLink（v9+）/ isHard（v11+）**：目标长度 + 目标字符串。<br>isHard 时目标是**归档内首个名字的归档内路径**，解包时 `os.Link` 还原共享 inode |
+### v2 ~ v5 (shorter, see §6)
 
 ---
 
-## 4. 数据区与原样区
+## 3. Metadata (metaRawLen bytes after decompression)
 
-- **数据区**：所有非 stored 的块按文件顺序拼成一条**固实流**，经后端整体压缩。
-  `max` 模式在可压数据 ≥ 64 MiB 时并行分组，产生**多个串联的 xz 帧**，
-  解压时按流顺序读取即可（帧自描述，字典嵌在帧头）。
-- **原样区**：stored 块原样拼接，不压缩、不加帧头。
+### 3.1 Stream checksums (16B)
 
-### 后端
-
-| code | 后端 | 说明 |
+| Offset | Size | Field |
 |---|---|---|
-| 0/1 | zstd | 可能带训练字典（字典区） |
-| 2/3 | lzma2 | xz 容器，系统 `xz` 压缩／纯 Go 解压 |
-| 4 | cm | 自研上下文混合（见 `cm.go`） |
+| 0 | 8 | solidHash — first 8 bytes of sha256 of the decompressed **solid stream** |
+| 8 | 8 | rawHash — first 8 bytes of sha256 of the **raw section** |
 
-### 训练字典区
+> v5 and earlier stored a 16B random hash per chunk. Those hashes were incompressible and could
+> reach half the archive with many small files; v6 moved to stream-level checksums
+> (see `README.md` §4.4b).
+
+### 3.2 Chunk table (5B each)
+
+| Size | Field | Notes |
+|---|---|---|
+| 4 | uncomp | decompressed chunk length |
+| 1 | flags | bit0 = stored (raw) <br>bits1–4 = xform (preprocessing type) <br>bit5 = dictID (uses trained dictionary) |
+
+**No offsets stored**: compressible chunks are sequentially packed in the solid stream, raw
+chunks in the raw section; unpack accumulates `uncomp`. This cut the table from 31 B/entry to
+5 B/entry.
+
+### 3.3 File table (variable)
+
+| Size | Field | Notes |
+|---|---|---|
+| 2 | nameLen | name length |
+| nameLen | name | in-archive relative path |
+| 1 | flags | bit0 = isDir <br>bits1–4 = xform (v7+, file-level raster transform) <br>bit5 = isLink (v9+) <br>bit6 = isHard (v11+) |
+| 8 | size | original size (symlinks: target string length) |
+| 4 / 8 | mtime | v≤9: Unix seconds (uint32) <br>v10+: Unix **nanoseconds** (int64; 0 = no timestamp) |
+| 2 / 4 | mode | v≤9: low 12 permission bits (uint16) <br>v10+: uint32 incl. setuid / setgid / sticky |
+| 4 | nChunks | chunks referenced by this file |
+| 4×nChunks | chunks | chunk indices (must be < nChunks) |
+| 2 + tl | link | **only isLink (v9+) / isHard (v11+)**: target length + target string. For isHard,
+  target is the **in-archive path of the first name**; unpack restores shared inode via `os.Link` |
+
+---
+
+## 4. Data & Raw Sections
+
+- **Data section**: all non-stored chunks concatenated in file order into one **solid stream**,
+  compressed as a whole by the backend. `max` mode parallel-groups when compressible data
+  ≥ 64 MiB, producing **multiple concatenated xz frames**; decode in stream order (frames are
+  self-describing, dict embedded in frame header).
+- **Raw section**: stored chunks concatenated as-is — no compression, no frame headers.
+
+### Backends
+
+| code | Backend | Notes |
+|---|---|---|
+| 0/1 | zstd | may use a trained dictionary (dictionary section) |
+| 2/3 | lzma2 | xz container; system `xz` for compression, pure Go for decompression |
+| 4 | cm | in-house context mixing (see `cm.go`) |
+
+### Dictionary section
 
 ```
-uint32 count      // 0 或 1
-重复 count 次:
+uint32 count      // 0 or 1
+repeat count times:
   uint32 len
-  bytes  dict     // zstd 字典正文
+  bytes  dict     // zstd dictionary body
 ```
 
-字典区位于原样区之后、尾部之前；**必须先装载字典再解压元数据帧**，
-否则 zstd 会报 `unknown dictionary`。
+Located after the raw section, before the tail. **The dictionary must be loaded before
+decompressing the metadata frame**, or zstd reports `unknown dictionary`.
 
 ---
 
-## 5. 尾部（20B，所有版本一致）
+## 5. Tail (20B, identical across versions)
 
-| 偏移 | 大小 | 字段 |
+| Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | `XACH` |
-| 4 | 8 | totalUncomp（原始总字节数） |
+| 4 | 8 | totalUncomp (original total bytes) |
 | 12 | 4 | nFiles |
 | 16 | 4 | nChunks |
 
-尾部是**截断检测**的依据：读数据区之前先核对文件长度与魔数，
-解析完元数据再核对条目数与头部一致（见 `checkTailMagic` / `checkCounts`）。
+The tail is the **truncation check**: before reading the data section, verify file length and
+magic; after parsing metadata, cross-check counts against the header
+(see `checkTailMagic` / `checkCounts`).
 
 ---
 
-## 6. 版本演进
+## 6. Version History
 
-| 版本 | 变更 |
+| Version | Change |
 |---|---|
-| v2 | 24B 头；块表 28B/项（hash16 + offset + uncomp + stored） |
-| v3 | 32B 头，新增 rawLen（原样区）；块表 29B/项 |
-| v4 | 块表 30B/项，新增 xform |
-| v5 | 块表 31B/项，新增 dictID；新增训练字典区 |
-| v6 | 48B 头；**元数据改为压缩存储**；块表精简到 5B/项并去掉块偏移；改流级校验 |
-| v7 | 文件表新增 xform（文件级光栅变换）；不再用"看到 BM 就逆变换"的启发式 |
-| v8 | 无格式变更（打包内存修复） |
-| v9 | 文件表 flag bit5 = isLink + 链接目标字段（符号链接） |
-| v10 | 文件表的 mtime 改 int64 纳秒、mode 改 uint32（补回 setuid / setgid / sticky） |
-| v11 | 文件表 flag bit6 = isHard + 复用 link 字段存"首个名字"（硬链接） |
-| v12 | xform 新增 8 / 9 号**逐行**光栅变换（6 / 7 号扁平版保留为只读兼容） |
+| v2 | 24B header; chunk table 28B/entry (hash16 + offset + uncomp + stored) |
+| v3 | 32B header, added rawLen (raw section); chunk table 29B/entry |
+| v4 | chunk table 30B/entry, added xform |
+| v5 | chunk table 31B/entry, added dictID; added dictionary section |
+| v6 | 48B header; **metadata compressed**; chunk table cut to 5B/entry, offsets dropped; stream-level checksums |
+| v7 | file table gains xform (file-level raster transform); heuristic "BM → inverse transform" removed |
+| v8 | no format change (pack memory fix) |
+| v9 | file table flag bit5 = isLink + link target field (symlinks) |
+| v10 | file table mtime → int64 nanoseconds, mode → uint32 (setuid/setgid/sticky restored) |
+| v11 | file table flag bit6 = isHard, link field reused for "first name" (hardlinks) |
+| v12 | xform gains 8/9 **row-wise** raster transforms (6/7 flat versions kept read-only) |
 
-### 版本写入策略
+### Write-version policy
 
-`version = 12`，`verCompat = 8`，`verLinks = 9`，`verExt = 10`，`verHard = 11`，`verRow = 12`。
+`version = 12`, `verCompat = 8`, `verLinks = 9`, `verExt = 10`, `verHard = 11`, `verRow = 12`.
 
-**能不升就不升**——每升一版就意味着旧版二进制读不了这个归档：
+**Upgrade only on demand** — every bump makes old binaries unable to read the archive:
 
-- 普通归档 → v8（旧版照样能解）
-- 含符号链接 → v9
-- 含 setuid / setgid / sticky，或时间戳超出 uint32 秒（2038 之后 / 1970 之前）→ v10
-- 用户显式加 `-T / --precise-times` → v10（时间戳存到纳秒）
-- 含硬链接 → v11
-- 含逐行光栅变换（xform 8 / 9，即打进了未压缩位图）→ v12
+- Plain archive → v8 (old binaries still unpack)
+- Contains symlinks → v9
+- Contains setuid/setgid/sticky, or timestamps outside uint32 seconds (post-2038 / pre-1970) → v10
+- User explicitly passes `-T / --precise-times` → v10 (nanosecond timestamps)
+- Contains hardlinks → v11
+- Contains row-wise raster transforms (xform 8/9, i.e. touched uncompressed bitmaps) → v12
 
-**亚秒精度不单独触发升级**：现实里几乎所有文件都带纳秒级 mtime（APFS / ext4 都是），
-若因此一律写 v10，等于让每一个新归档都与旧版绝缘。所以默认按秒存（与 tar 一致），
-只在归档本来就要升 v10 时"顺便"把纳秒存下来。含链接的归档被旧版读取时报
-`版本不兼容: 9`——**明确失败，而不是解出错误数据**。
+**Sub-second precision alone never triggers an upgrade**: virtually every real file has
+nanosecond mtimes (APFS/ext4 both do); upgrading unconditionally would insulate every new
+archive from old binaries. So seconds are stored by default (same as tar); nanoseconds are kept
+only when the archive is upgrading to v10 anyway. Old binaries reading link-bearing archives get
+`version incompatible: 9` — **explicit failure, never wrong data**.
 
-### 兼容性保证
+### Compatibility guarantees
 
-- 读：v2 ~ v12 全部可读（旧块表走逐块 16B 哈希校验，v6+ 走流级校验）
-- 写：默认为 v8（兼容优先），按需升 v9 / v10 / v11 / v12
-- 解压始终纯 Go，零外部依赖；只有 `max`/`ultra` 的**压缩**会用系统 `xz`，缺失则回退纯 Go
+- Read: v2 ~ v12 all readable (old chunk tables use per-chunk 16B hash verification; v6+ uses
+  stream-level)
+- Write: defaults to v8 (compat-first), upgrades to v9/v10/v11/v12 on demand
+- Decompression is always pure Go, zero external deps; only `max`/`ultra` **compression** uses
+  system `xz`, falling back to pure Go when missing
 
 ---
 
-## 7. 变换类型（xform）
+## 7. Transform Types (xform)
 
-| 值 | 名称 | 说明 |
+| Value | Name | Notes |
 |---|---|---|
-| 0 | none | 不变换 |
-| 1 | delta1 | 8 位差分 |
-| 2 | delta2 | 16 位差分 |
-| 3 | delta3 | 24 位差分 |
-| 4 | delta4 | 32 位差分 |
-| 5 | bcj-x86 | x86 跳转地址变换 |
-| 6 | raster-med | 光栅：MED 中值边缘预测（**仅文件级**，旧，覆盖整行含填充；只读兼容） |
-| 7 | raster-rct-med | 光栅：RCT 色彩去相关 + MED（**仅文件级**，旧，整块按 3 字节滑动；只读兼容） |
-| 8 | raster-row-med | 光栅：逐行 MED，跳过行尾对齐填充（v12） |
-| 9 | raster-row-rct-med | 光栅：逐行 RCT + 逐行 MED，跳过行尾对齐填充（v12） |
+| 0 | none | no transform |
+| 1 | delta1 | 8-bit differencing |
+| 2 | delta2 | 16-bit differencing |
+| 3 | delta3 | 24-bit differencing |
+| 4 | delta4 | 32-bit differencing |
+| 5 | bcj-x86 | x86 jump-address transform |
+| 6 | raster-med | raster: MED median edge prediction (**file-level only**, old; whole rows incl.
+  padding; read-only compat) |
+| 7 | raster-rct-med | raster: RCT color decorrelation + MED (**file-level only**, old; whole buffer
+  sliced per 3 bytes; read-only compat) |
+| 8 | raster-row-med | raster: row-wise MED, skipping row-padding (v12) |
+| 9 | raster-row-rct-med | raster: row-wise RCT + row-wise MED, skipping row-padding (v12) |
 
-1–5 记在**块级**（每块独立可逆）；6–9 记在**文件级**
-——预测依赖整幅图像的几何，跨块生效，不能按块独立还原。
+1–5 are recorded **per-chunk** (each chunk independently invertible); 6–9 are **per-file** —
+prediction depends on whole-image geometry, spans chunk boundaries, cannot be inverted per chunk.
 
-6 / 7 与 8 / 9 的区别只在**是否跨过 BMP 的行尾填充**：BMP 每行要补齐到 4 字节，
-24bpp 且 宽 % 4 ∈ {1, 2} 时行跨距不是 3 的倍数，7 号变换会沿整块缓冲区每 3 字节
-切一组，把填充和下一行头两个字节当成一个"像素"去相关，通道相位逐行漂移，
-MED 的"上 / 左上"邻居落到别的通道上，竖直预测失效（实测比不做去相关还差约 60%）。
-8 / 9 只在每行前 `rowBytes`（= 宽 × bpp）字节内运算，填充保持原样。
+The only difference between 6/7 and 8/9 is **whether BMP row padding is crossed**: BMP rows pad
+to 4 bytes; with 24bpp and `width % 4 ∈ {1, 2}`, row stride is not a multiple of 3. Transform 7
+slices 3-byte groups across the whole buffer, treating padding + next row's head bytes as one
+"pixel": channel phase drifts per row, MED's up/upper-left neighbors land on wrong channels,
+vertical prediction collapses (measured ~60% worse than no decorrelation). 8/9 operate only on
+the first `rowBytes` (= width × bpp) bytes of each row; padding untouched.
 
 ---
 
-## 8. 校验与健壮性
+## 8. Validation & Robustness
 
-打开归档时按顺序做以下检查，任一失败即明确报错（不会 panic，也不会静默解出错误数据）：
+On open, checks run in order; any failure is an explicit error (no panic, no silent wrong data):
 
 1. magic == `HCAX`
-2. 版本在 2..12（低于 `verCompat` 或高于 `version` 一律 `版本不兼容`）
-3. `checkTailMagic` — 文件长度足够、尾部魔数正确、数据区不越界（**截断检测**）
-4. `checkHeaderBounds` — 长度字段不超过文件大小、布局不超出文件、
-   条目数与元数据长度交叉验证（**防 OOM / 荒谬分配**）
-5. 元数据解压后长度 == `metaRawLen`
-6. `parseMeta` 每处读取前 `need()` 边界检查；块索引必须 < nChunks
-7. `checkCounts` — 尾部 nFiles/nChunks 与头部一致
+2. version in 2..12 (below `verCompat` or above `version` → `version incompatible`)
+3. `checkTailMagic` — file long enough, tail magic correct, data section in bounds
+   (**truncation detection**)
+4. `checkHeaderBounds` — length fields within file size, layout within file, entry counts
+   cross-validated against metadata length (**anti-OOM / absurd allocation**)
+5. metadata decompressed length == `metaRawLen`
+6. `parseMeta` boundary-checks every read via `need()`; chunk indices must be < nChunks
+7. `checkCounts` — tail nFiles/nChunks match header
 
-损坏检测能力：改 1 字节即被 `verify` 捕获；截断 30 字节即被拒绝。
+Corruption detection: flipping 1 byte is caught by `verify`; truncating 30 bytes is rejected.
 
-### 解包时的路径安全（归档里的名字不可信）
+### Unpack path safety (archive names are untrusted)
 
-| 风险 | 处置 |
+| Risk | Handling |
 |---|---|
-| 绝对路径、`..` 分段、空名字 | `safeName` 拒绝 |
-| 拼接后逃出解包目录 | `joinOut` 拒绝（前缀比对） |
-| 条目在 `target` 处建成符号链接后再写同名文件 | 写前 `Lstat`，是链接就摘掉 |
-| **符号链接出现在路径中间**（`link` → `/etc`，再有条目 `link/xxx`） | `mkdirUnderOut` 逐段 `Lstat`，摘掉挡路的链接 |
+| Absolute paths, `..` segments, empty names | `safeName` rejects |
+| Escape after join | `joinOut` rejects (prefix check) |
+| Entry builds symlink at `target`, then writes same-name file | `Lstat` before write; drop if link |
+| **Symlink in the middle of a path** (`link` → `/etc`, then entry `link/xxx`) | `mkdirUnderOut` `Lstat`s each segment, drops blocking links |
 
-最后一条最容易漏：`os.MkdirAll` 会**跟随**符号链接，只检查最终 `target` 挡不住
-"链接在中间"这一种（会顺着链接把目录建到解包目录外，随后写文件就写穿了）。
-归档里"符号链接之下还有条目"本身不合法——打包侧 `filepath.Walk` 不跟随链接，
-写不出这种结构——所以直接摘掉即可。見 `security_test.go`。
+The last one is the easiest to miss: `os.MkdirAll` **follows** symlinks, so checking only the
+final `target` doesn't stop the "link in the middle" case (directories get created outside the
+unpack dir through the link, then file writes escape). Entries "below a symlink" are illegal by
+construction — pack-side `filepath.Walk` doesn't follow links — so dropping them is safe.
+See `security_test.go`.
