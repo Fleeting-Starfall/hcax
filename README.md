@@ -764,4 +764,4 @@ A: Backup of early artifacts (Python prototype stage). Safe to delete as a whole
 
 ## 10. License
 
-[MIT](LICENSE) — Copyright (c) 2026 hcax contributors
+[MIT](LICENSE) — Copyright (c) 2026 Fleeting-Starfall
