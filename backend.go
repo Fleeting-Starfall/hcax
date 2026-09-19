@@ -42,9 +42,9 @@ type modeSpec struct {
 	code    byte
 	backend string // "zstd" or "lzma2"
 	level   int
-	window  int  // zstd window log / lzma2 dict 提示
-	solid   bool // true=整文件固实(关 CDC 去重, 像 7z); 用于 ultra
-	mmt     bool // true=并行固实分组压缩; 用于 max
+	window  int  // zstd window log / lzma2 dict hint
+	solid   bool // true=whole-file solid (CDC dedup off, like 7z); used by ultra
+	mmt     bool // true=parallel solid-group compression; used by max
 }
 
 var modes = map[string]modeSpec{
@@ -144,7 +144,7 @@ func (b *backend) shouldStore(cb []byte) bool {
 	}
 	out := b.gateEnc.EncodeAll(cb, nil)
 	if len(out) < len(cb)*storeThresholdPct/100 {
-		return false // 门控能压 -> 可压, 进固实流
+		return false // gate says compressible -> solid stream
 	}
 	// Gate says "incompressible": confirm it is really random. Image residuals often
 	// fail chunk-local compression yet compress well globally (solid stream / large
@@ -267,7 +267,7 @@ func warnXZFallback(reason string) {
 	})
 }
 
-// 用系统 xz 按指定 lc/pb 压缩; 不可用或出错时返回 nil(以便走回退路径)
+// compress with system xz at given lc/pb; nil on unavailability or error (fallback path)
 
 func (b *backend) xzCompress(r io.Reader, lc, pb, dict string) []byte {
 	xzbin, err := exec.LookPath("xz")
@@ -310,10 +310,10 @@ func (b *backend) xzCompress(r io.Reader, lc, pb, dict string) []byte {
 
 func (b *backend) compressLZMA2Best(cb []byte) []byte {
 	if b.spec.backend != "lzma2" {
-		return b.compress(cb) // zstd 等直接走原路径
+		return b.compress(cb) // zstd etc. go straight through
 	}
 	if len(cb) < 256<<10 {
-		return b.compress(cb) // 太小, 不值得选参
+		return b.compress(cb) // too small to bother tuning
 	}
 	pbs := []string{"2", "4"}
 	outs := make([][]byte, len(pbs))
@@ -334,7 +334,7 @@ func (b *backend) compressLZMA2Best(cb []byte) []byte {
 		}
 	}
 	if best == nil {
-		return b.compress(cb) // xz 不可用 -> 回退
+		return b.compress(cb) // xz unavailable -> fallback
 	}
 	return best
 }
@@ -486,8 +486,8 @@ func (b *backend) compressMT(chunks []*chunkMeta, solid io.ReaderAt, solidSize i
 		if e > len(comp) {
 			e = len(comp)
 		}
-		// v8e: 固实流已落临时文件, 同组块按偏移从文件读出(一次 copy, 仅组大小常驻),
-		// 不再持有"全量固实流 + 各组副本"双份 —— 此前大语料并行期内存翻倍的根因。
+		// v8e: the solid stream lands in a temp file; same-group chunks are read by offset
+		// (one copy, only group-size resident) -- no more full stream + per-group duplicates
 		start := comp[i].offset
 		last := comp[e-1]
 		end := last.offset + uint64(last.uncomp)
@@ -511,7 +511,7 @@ func (b *backend) compressMT(chunks []*chunkMeta, solid io.ReaderAt, solidSize i
 	}
 	wg.Wait()
 	var out bytes.Buffer
-	ugs := uint64(0) // 未压缩累计(偏移必须在解压后流中定位, 不能用压缩字节)
+	ugs := uint64(0) // uncompressed running total (offsets live in the decompressed stream)
 	for gi, g := range groups {
 		out.Write(results[gi])
 		for c, lo := range g.local {
@@ -602,8 +602,8 @@ func (b *backend) decompress(frame []byte, maxOut int64) []byte {
 func (b *backend) decompressReader(r io.Reader, maxOut int64) (io.Reader, func(), error) {
 	switch b.spec.backend {
 	case "cm":
-		// CM 必须先拿到完整压缩帧(自描述长度头在帧首), 但输出是流式的:
-		// 用 pipe 把 cmDecompressTo 的输出接到 reader 上, 内存只留一个 64KiB 缓冲。
+		// CM needs the whole compressed frame first (self-describing length head), output is streaming:
+		// pipe cmDecompressTo's output into a reader; memory stays at one 64KiB buffer.
 		frame, err := io.ReadAll(r)
 		if err != nil {
 			return nil, nil, err
@@ -623,7 +623,7 @@ func (b *backend) decompressReader(r io.Reader, maxOut int64) (io.Reader, func()
 			return nil, nil, err
 		}
 		return d, func() { d.Close() }, nil
-	default: // lzma2: xz 容器, 本身即流式
+	default: // lzma2: xz container, natively streaming
 		xr, err := xz.NewReader(r)
 		if err != nil {
 			return nil, nil, err
@@ -642,10 +642,10 @@ type archive struct {
 	// archive file handle: raw/data regions read on demand via ReadAt, never fully
 	// loaded into memory
 	src         *os.File
-	compLen     int64 // 压缩帧字节数
-	metaCompLen int64 // 元数据帧压缩后长度
-	metaRawLen  int64 // 元数据解压后长度
-	rawOff      int64 // 原样区在归档文件中的偏移
+	compLen     int64 // compressed frame bytes
+	metaCompLen int64 // metadata frame, compressed length
+	metaRawLen  int64 // metadata, decompressed length
+	rawOff      int64 // raw region offset within the archive
 	rawLen      int64
 
 	// Decompressed solid stream lands in a temp file (symmetric with pack-side v8e),
@@ -654,9 +654,9 @@ type archive struct {
 	// listing one archive ate memory proportional to all its data, and extracting one
 	// small file decompressed the entire stream.
 	solidFile *os.File
-	solidR    io.Reader // 解压器(保留以便续解压)
-	solidSize int64     // 已解压字节数
-	solidEOF  bool      // 流已到底
+	solidR    io.Reader // decompressor (kept for continued decoding)
+	solidSize int64     // decompressed bytes so far
+	solidEOF  bool      // stream exhausted
 
 	// Total **uncompressed** size of the solid stream (sum of uncomp across
 	// non-stored chunks). CM decoding needs it as a bound: the CM frame header's
@@ -669,7 +669,7 @@ type archive struct {
 	progDone  uint64
 	progLast  uint64
 	progTotal uint64
-	overwrote int // 本次解包改写掉的、输出目录里已存在的条目数
+	overwrote int // entries in the output dir that this unpack overwrote
 
 	// Directory permission/timestamps cannot be applied as entries are extracted:
 	// writing files into a directory bumps its mtime to "now", and chmod-ing it
@@ -679,8 +679,8 @@ type archive struct {
 
 	chunks    []chunkMeta
 	files     []fileEntry
-	ver       byte // 归档格式版本(v7 起文件级变换显式记录; 更早版本靠启发式判断)
-	hashLen   int  // 逐块哈希长度: 旧版=16, v6=0(改用流级校验)
+	ver       byte // archive format version (v7+ records per-file transforms; older heuristics)
+	hashLen   int  // per-chunk hash length: legacy=16, v6=0 (stream-level verification)
 	solidHash [8]byte
 	rawHash   [8]byte
 }

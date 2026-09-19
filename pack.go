@@ -812,7 +812,7 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 	// one is half-written: one failure destroys both. See util.go.
 	aw := openArchiveForWrite(outPath)
 	out := aw.f
-	addCleanup(aw.abort) // 失败路径删掉半成品; 成功时 commit 已把 tmp 置空, 空操作
+	addCleanup(aw.abort) // failure path deletes the half-written file; on success tmp is nil, a no-op
 	// Metadata (chunk + file tables) is serialized and compressed together (v6): plain
 	// metadata often dominates an archive, compression pays off hugely.
 	// Stream-level checksum (replaces per-chunk hashes: per-chunk hashes are random
@@ -860,7 +860,7 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 	binary.Write(&trl, binary.LittleEndian, uint32(len(fileEntries)))
 	binary.Write(&trl, binary.LittleEndian, uint32(len(chunkMetas)))
 
-	// 布局: metaFrame | dataFrame | rawRegion | dictRegion
+	// layout: metaFrame | dataFrame | rawRegion | dictRegion
 	mustWrite(out, hdr.Bytes(), "header")
 	mustWrite(out, metaFrame, "metadata frame")
 	mustWrite(out, frame, "data frame")
@@ -883,7 +883,7 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 	if serr != nil {
 		fatal("stat archive failed: %v", serr)
 	}
-	aw.commit() // 到此才算"打包成功": 旧归档在这一刻才被完整的新归档替换
+	aw.commit() // "packed" only now: the old archive is replaced atomically at this point
 
 	raw := totalUncomp
 	// All-empty archives have raw==0; dividing would yield +Inf% — "-" is more honest
@@ -891,7 +891,7 @@ func pack(inputs []string, outPath, mode string, excl []string, precise bool) {
 	if raw > 0 {
 		ratio = fmt.Sprintf("%.2f%%", 100.0*float64(sz.Size())/float64(raw))
 	}
-	runCleanups() // 成功路径也要删临时文件(清理钩子本身幂等, 重复执行无副作用)
+	runCleanups() // success path cleans temp files too (hooks are idempotent)
 	fmt.Printf("packed: %s  raw %d B -> %d B  ratio %s  mode=%s  chunks=%d (comp %d / raw %d)\n",
 		outPath, raw, sz.Size(), ratio, mode, len(chunkMetas), nComp, nStored)
 	if nExcluded > 0 {

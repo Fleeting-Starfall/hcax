@@ -299,7 +299,7 @@ func (c *cmCodec) predict() (uint32, uint32) {
 		c.idx[i] = idx
 		st[i] = stretchT[c.tbls[i].p16(idx)>>4]
 	}
-	// 匹配模型
+	// matching model
 	st[cmNM] = 0
 	if c.matchPtr >= 0 && c.matchLen > 0 {
 		mp := int(c.matchPtr)

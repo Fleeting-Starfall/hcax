@@ -82,7 +82,7 @@ func openArchive(path string) *archive {
 						if dec, e := zstd.NewReader(bytes.NewReader(nil), zstd.WithDecoderDicts(d)); e == nil {
 							be.zDecDict = dec
 						}
-						be.dictBytes = d // 流式解压时需用它重建解码器
+						be.dictBytes = d // needed to rebuild the decoder during streaming decompress
 					}
 				}
 			}
@@ -269,7 +269,7 @@ func checkHeaderBounds(f *os.File, metaCompLen, metaRawLen, compLen, rawLen uint
 	if metaRawLen > 1<<30 {
 		fatal("metadata length invalid (%d B): corrupt archive", metaRawLen)
 	}
-	// 块表项至少 5B, 文件表项至少 21B —— 据此给条目数设上界
+	// chunk entries are >=5B, file entries >=21B -- cap the counts from that
 	if uint64(nChunks)*5 > metaRawLen || uint64(nFiles)*16 > metaRawLen {
 		fatal("header counts contradict metadata length (nChunks=%d nFiles=%d, metadata %d B): corrupt archive",
 			nChunks, nFiles, metaRawLen)
@@ -284,7 +284,7 @@ func checkHeaderBounds(f *os.File, metaCompLen, metaRawLen, compLen, rawLen uint
 func (a *archive) checkLogical() {
 	for _, fe := range a.files {
 		if fe.isDir || fe.isLink {
-			continue // 目录不产生块; 链接的 size 记的是目标字符串长度
+			continue // dirs produce no chunks; a link's size is its target string length
 		}
 		var sum uint64
 		for _, ix := range fe.chunks {
@@ -321,7 +321,7 @@ func (a *archive) checkCounts() {
 // had this for a while; unpack side was missing it).
 func (a *archive) addProgress(n uint64) {
 	if !a.progShow || a.progTotal == 0 || a.progDone >= a.progTotal {
-		return // 已报完 100% 就别再打了(后续 0 字节的目录条目还会进来)
+		return // 100% already reported; do not print again (0-byte dir entries keep coming)
 	}
 	a.progDone += n
 	if a.progDone-a.progLast >= 16<<20 || a.progDone >= a.progTotal {
@@ -340,7 +340,7 @@ func (a *archive) ensureSolid(need uint64) {
 	if a.solidFile == nil {
 		tf, err := os.CreateTemp("", "hcax-solid-")
 		if err != nil {
-			fatal("临时文件: %v", err)
+			fatal("temp file: %v", err)
 		}
 		a.solidFile = tf
 		addCleanup(func() {
@@ -446,7 +446,7 @@ func (a *archive) verifyStream() {
 		return
 	}
 	if a.compLen > 0 {
-		a.drainSolid() // 校验需要全量数据
+		a.drainSolid() // verification needs the whole stream
 		a.solidFile.Seek(0, io.SeekStart)
 		h := hashReader(a.solidFile)
 		if !bytes.Equal(h[:8], a.solidHash[:]) {
@@ -465,7 +465,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	if !safeName(fe.name) {
 		fatal("illegal path: %s", fe.name)
 	}
-	defer a.addProgress(fe.size) // 所有 return 分支都要计入进度
+	defer a.addProgress(fe.size) // every return path must count progress
 	target := joinOut(outDir, fe.name)
 	// Overwrite count: unpacking into a non-empty dir silently replaces same-named
 	// entries. tar does too, but the user should know "how much existing state this
@@ -495,7 +495,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 		if err := mkdirUnderOut(outDir, filepath.Dir(target)); err != nil {
 			fatal("mkdir: %v", err)
 		}
-		os.Remove(target) // 覆盖同名已存在的文件/链接
+		os.Remove(target) // overwrite an existing file/link of the same name
 		if err := os.Symlink(fe.link, target); err != nil {
 			fatal("symlink %s: %v", fe.name, err)
 		}
@@ -573,7 +573,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 				buf = append(buf, a.readChunk(ix, verify)...)
 			}
 			if _, ok := bmpInfoLegacy(buf); ok {
-				pred2DLegacy(buf, false) // 旧版用的是二维梯度预测
+				pred2DLegacy(buf, false) // legacy used 2-D gradient prediction
 			}
 			if uint64(len(buf)) != fe.size {
 				fatal("file %s size mismatch: expected %d got %d", fe.name, fe.size, len(buf))
@@ -621,7 +621,7 @@ func normAsk(s string) string {
 		s = s[2:]
 	}
 	s = strings.TrimPrefix(s, "/")
-	// 目录名后面的斜杠去掉(原来就有)
+	// strip the trailing slash from dir names (it was there)
 	for len(s) > 1 && strings.HasSuffix(s, "/") {
 		s = s[:len(s)-1]
 	}
@@ -746,7 +746,7 @@ func overwriteNote(n int) string {
 func unpack(archivePath, outDir string, verify bool, only []string) {
 	a := openArchive(archivePath)
 	if verify {
-		a.verifyStream() // v6 流级校验(旧版为空操作, 由 readChunk 逐块校验)
+		a.verifyStream() // v6 stream-level check (legacy no-op; readChunk verified per chunk)
 	}
 	os.MkdirAll(outDir, 0o755)
 	a.setProgress(a.files)
@@ -772,7 +772,7 @@ func unpack(archivePath, outDir string, verify bool, only []string) {
 			if matchEntry(fe.name, p) {
 				want = append(want, fe)
 				hit[p] = true
-				break // 一个条目只解一次(多个条件同时命中时不重复)
+				break // extract an entry once (no double work when several patterns match)
 			}
 		}
 	}
