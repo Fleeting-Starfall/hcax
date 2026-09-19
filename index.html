@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>hcax — High-Ratio Lossless Archive Tool</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; padding: 0; background: #f6f8fa; color: #24292f; }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 48px 24px; }
+  h1 { font-size: 28px; margin-bottom: 4px; }
+  .tagline { color: #57606a; font-size: 15px; margin-bottom: 32px; }
+  .card { background: #fff; border: 1px solid #d0d7de; border-radius: 8px; padding: 24px; margin-bottom: 20px; }
+  .card h2 { font-size: 18px; margin-top: 0; }
+  .ver { display: inline-block; background: #ddf4ff; color: #0969da; border-radius: 12px; padding: 2px 10px; font-size: 13px; font-weight: 600; }
+  a.btn { display: inline-block; background: #1f883d; color: #fff; text-decoration: none; padding: 10px 18px; border-radius: 6px; font-size: 15px; font-weight: 600; }
+  a.btn:hover { background: #1a7f37; }
+  pre { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: 12px; overflow-x: auto; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
+  .muted { color: #57606a; font-size: 14px; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 10px; text-align: left; }
+  th { background: #f6f8fa; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .badge { display: inline-block; border-radius: 10px; padding: 1px 8px; font-size: 12px; font-weight: 600; }
+  .badge.green { background: #dafbe1; color: #1a7f37; }
+  .badge.gray { background: #eaeef2; color: #57606a; }
+  .langbar { text-align: right; margin-bottom: 16px; }
+  .langbar select { font-size: 13px; padding: 4px 8px; border-radius: 6px; border: 1px solid #d0d7de; background: #fff; color: #24292f; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="langbar">
+    <label for="langSel" class="muted" data-i18n="langLabel">Language</label>
+    <select id="langSel" aria-label="Language">
+      <option value="zh-CN">中文简体</option>
+      <option value="zh-TW">中文繁體</option>
+      <option value="en" selected>English</option>
+      <option value="ru">Русский</option>
+      <option value="fr">Français</option>
+      <option value="ja">日本語</option>
+      <option value="de">Deutsch</option>
+    </select>
+  </div>
+
+  <h1>hcax</h1>
+  <div class="tagline" data-i18n="tagline">High-Ratio Lossless Archive Tool — CDC dedup, solid streams, content-adaptive preprocessing, context mixing. Pure Go.</div>
+
+  <div class="card">
+    <h2 data-i18n-html="latestH">Latest release <span class="ver"></span></h2>
+    <p class="muted" data-i18n="firstStable">First stable release.</p>
+    <p><a class="btn" id="dlBtn" href="https://github.com/Fleeting-Starfall/hcax/releases/latest" data-i18n="downloadBtn"></a></p>
+    <p class="muted" data-i18n="sourceNote">Source code is available at the release page. Binary builds are attached to each release.</p>
+  </div>
+
+  <div class="card">
+    <h2 data-i18n="whatH">What is hcax?</h2>
+    <p data-i18n-html="whatP">hcax is a <strong>high-ratio lossless archive tool</strong> written in pure Go. It combines
+    <strong>CDC chunking with content-defined dedup</strong>, <strong>solid streams</strong>,
+    <strong>content-adaptive preprocessing</strong> (BMP/TGA/PNM reversible transforms, text detection)
+    and <strong>context-mixing prediction</strong> to squeeze out smaller archives than classic
+    general-purpose compressors — with no native dependencies (only <code>max</code>/<code>ultra</code>
+    optionally shell out to <code>xz</code>).</p>
+    <p class="muted" data-i18n-html="fiveModes">Five modes cover the speed–ratio spectrum: <code>fast</code> → <code>best</code>
+    → <code>max</code> → <code>ultra</code> → <code>text</code>.</p>
+  </div>
+
+  <div class="card">
+    <h2 data-i18n="modeCmpH">Mode comparison <span class="badge gray" data-i18n="modeCmpBadge">end-to-end ratio, this machine</span></h2>
+    <p class="muted" data-i18n="modeCmpNote">Ratio = archive ÷ original × 100%, lower is better. End-to-end measured on the
+    author's macOS machine (mixed workload incl. text, code, binaries, bitmaps).</p>
+    <table>
+      <tr><th data-i18n="thMode">Mode</th><th class="num" data-i18n="thRatio">Ratio</th><th data-i18n="thNotes">Notes</th><th data-i18n="thBestFor">Best for</th></tr>
+      <tr><td><code>text</code></td><td class="num">26.77%</td><td data-i18n="mNote1">Predictive modeling, smallest output, slowest</td><td data-i18n="mUse1">Text / code / logs / JSON</td></tr>
+      <tr><td><code>max</code></td><td class="num">26.89%</td><td data-i18n="mNote2">lzma2 extreme + adaptive preprocessing, auto-parallel</td><td data-i18n="mUse2">Mixed data, general best (recommended default for archives)</td></tr>
+      <tr><td><code>ultra</code></td><td class="num">26.89%</td><td data-i18n="mNote3">Dedup + single-stream full-data param selection</td><td data-i18n="mUse3">Extreme ratio, whole-file solid</td></tr>
+      <tr><td><code>best</code></td><td class="num">32.61%</td><td data-i18n="mNote4">zstd-19 + trained dictionary, fast</td><td data-i18n="mUse4">Many similar files</td></tr>
+      <tr><td><code>fast</code></td><td class="num">39.69%</td><td data-i18n="mNote5">zstd-3</td><td data-i18n="mUse5">Fastest possible</td></tr>
+    </table>
+    <p class="muted" data-i18n-html="xzNote"><code>max</code> / <code>ultra</code> require the system <code>xz</code> command
+    (<code>brew install xz</code>); without it hcax falls back to pure-Go lzma2 and the ratio degrades
+    from 26.89% to 33.40% (~24% larger archive). The other three modes are pure Go, no deps.</p>
+  </div>
+
+  <div class="card">
+    <h2 data-i18n="vsH">vs common tools <span class="badge gray" data-i18n="vsBadge">12.3 MB mixed corpus</span></h2>
+    <p class="muted" data-i18n="vsNote">Same mixed corpus (text / JSON / Go source / binary / random / uncompressed BMP),
+    from the README benchmark section.</p>
+    <table>
+      <tr><th data-i18n="thTool">Tool</th><th class="num" data-i18n="thRatio2">Ratio</th><th data-i18n="thResult">Result</th></tr>
+      <tr><td><strong>hcax</strong> <code>text</code></td><td class="num">26.74%</td><td><span class="badge green" data-i18n="r1">Best in class</span></td></tr>
+      <tr><td><strong>hcax</strong> <code>max</code></td><td class="num">26.86%</td><td><span class="badge green" data-i18n="r2">beats xz by 4.0%, 7z by 5.4%</span></td></tr>
+      <tr><td><code>xz -9e</code></td><td class="num">28.00%</td><td data-i18n="rRef">Reference</td></tr>
+      <tr><td><code>7z -mx=9</code></td><td class="num">28.39%</td><td data-i18n="rRef2">Reference</td></tr>
+      <tr><td><code>zstd -19</code></td><td class="num">28.70%</td><td data-i18n="rRef3">Reference</td></tr>
+      <tr><td><code>zip -9</code></td><td class="num">34.27%</td><td data-i18n="rRef4">Reference</td></tr>
+    </table>
+    <p class="muted" data-i18n-html="benchNote">On text / code workloads, <code>text</code> beats <code>xz -9e</code> by
+    <strong>13–16%</strong>, approaching PPMd (3–5% behind). Uncompressed bitmaps (BMP/TGA/PNM) get
+    automatic RCT color decorrelation + MED 2D prediction — a hcax strength.</p>
+  </div>
+
+  <div class="card">
+    <h2 data-i18n="installH">Install from source</h2>
+    <pre><code>git clone https://github.com/Fleeting-Starfall/hcax.git
+cd hcax
+go build -o hcax .
+./hcax --help</code></pre>
+  </div>
+
+  <div class="card">
+    <h2 data-i18n="quickH">Quick start</h2>
+    <pre><code data-i18n-code="quickCode"># Pack (default: best mode)
+hcax pack out.hcax &lt;file-or-dir&gt;...
+
+# Choose a mode
+hcax pack backup.hcax ~/Documents -m max
+
+# Unpack and verify
+hcax unpack out.hcax /path/to/output
+hcax verify out.hcax</code></pre>
+    <p class="muted" data-i18n-html="seeReadme">See the <a href="https://github.com/Fleeting-Starfall/hcax">repository README</a> for full documentation.</p>
+  </div>
+</div>
+
+<script>
+const I18N = {
+  en: {
+    docTitle: "hcax — High-Ratio Lossless Archive Tool",
+    langLabel: "Language",
+    tagline: "High-Ratio Lossless Archive Tool — CDC dedup, solid streams, content-adaptive preprocessing, context mixing. Pure Go.",
+    latestH: 'Latest release <span class="ver">{ver}</span>',
+    firstStable: "First stable release.",
+    downloadBtn: "Download {ver}",
+    sourceNote: "Source code is available at the release page. Binary builds are attached to each release.",
+    whatH: "What is hcax?",
+    whatP: "hcax is a <strong>high-ratio lossless archive tool</strong> written in pure Go. It combines <strong>CDC chunking with content-defined dedup</strong>, <strong>solid streams</strong>, <strong>content-adaptive preprocessing</strong> (BMP/TGA/PNM reversible transforms, text detection) and <strong>context-mixing prediction</strong> to squeeze out smaller archives than classic general-purpose compressors — with no native dependencies (only <code>max</code>/<code>ultra</code> optionally shell out to <code>xz</code>).",
+    fiveModes: "Five modes cover the speed–ratio spectrum: <code>fast</code> → <code>best</code> → <code>max</code> → <code>ultra</code> → <code>text</code>.",
+    modeCmpH: "Mode comparison",
+    modeCmpBadge: "end-to-end ratio, this machine",
+    modeCmpNote: "Ratio = archive ÷ original × 100%, lower is better. End-to-end measured on the author's macOS machine (mixed workload incl. text, code, binaries, bitmaps).",
+    thMode: "Mode", thRatio: "Ratio", thNotes: "Notes", thBestFor: "Best for",
+    mNote1: "Predictive modeling, smallest output, slowest", mUse1: "Text / code / logs / JSON",
+    mNote2: "lzma2 extreme + adaptive preprocessing, auto-parallel", mUse2: "Mixed data, general best (recommended default for archives)",
+    mNote3: "Dedup + single-stream full-data param selection", mUse3: "Extreme ratio, whole-file solid",
+    mNote4: "zstd-19 + trained dictionary, fast", mUse4: "Many similar files",
+    mNote5: "zstd-3", mUse5: "Fastest possible",
+    xzNote: "<code>max</code> / <code>ultra</code> require the system <code>xz</code> command (<code>brew install xz</code>); without it hcax falls back to pure-Go lzma2 and the ratio degrades from 26.89% to 33.40% (~24% larger archive). The other three modes are pure Go, no deps.",
+    vsH: "vs common tools",
+    vsBadge: "12.3 MB mixed corpus",
+    vsNote: "Same mixed corpus (text / JSON / Go source / binary / random / uncompressed BMP), from the README benchmark section.",
+    thTool: "Tool", thRatio2: "Ratio", thResult: "Result",
+    r1: "Best in class",
+    r2: "beats xz by 4.0%, 7z by 5.4%",
+    rRef: "Reference", rRef2: "Reference", rRef3: "Reference", rRef4: "Reference",
+    benchNote: "On text / code workloads, <code>text</code> beats <code>xz -9e</code> by <strong>13–16%</strong>, approaching PPMd (3–5% behind). Uncompressed bitmaps (BMP/TGA/PNM) get automatic RCT color decorrelation + MED 2D prediction — a hcax strength.",
+    installH: "Install from source",
+    quickH: "Quick start",
+    quickCode: "# Pack (default: best mode)\nhcax pack out.hcax &lt;file-or-dir&gt;...\n\n# Choose a mode\nhcax pack backup.hcax ~/Documents -m max\n\n# Unpack and verify\nhcax unpack out.hcax /path/to/output\nhcax verify out.hcax",
+    seeReadme: 'See the <a href="https://github.com/Fleeting-Starfall/hcax">repository README</a> for full documentation.'
+  },
+  "zh-CN": {
+    docTitle: "hcax — 高压缩率无损归档工具",
+    langLabel: "语言",
+    tagline: "高压缩率无损归档工具 — CDC 去重、固实流、内容自适应预处理、上下文混合。纯 Go 实现。",
+    latestH: '最新版本 <span class="ver">{ver}</span>',
+    firstStable: "首个稳定版本。",
+    downloadBtn: "下载 {ver}",
+    sourceNote: "源代码见发布页面，每个版本附带二进制构建。",
+    whatH: "hcax 是什么？",
+    whatP: "hcax 是一款用纯 Go 编写的高压缩率无损归档工具。它结合 <strong>CDC 分块与内容定义去重</strong>、<strong>固实流</strong>、<strong>内容自适应预处理</strong>（BMP/TGA/PNM 可逆变换、文本检测）和 <strong>上下文混合预测</strong>，压出比经典通用压缩器更小的归档——无原生依赖（仅 <code>max</code>/<code>ultra</code> 可选调用系统 <code>xz</code>）。",
+    fiveModes: "五种模式覆盖速度与压缩率的全谱：<code>fast</code> → <code>best</code> → <code>max</code> → <code>ultra</code> → <code>text</code>。",
+    modeCmpH: "模式对比",
+    modeCmpBadge: "端到端压缩率，本机实测",
+    modeCmpNote: "压缩率 = 归档 ÷ 原始 × 100%，越低越好。在作者的 macOS 机器上端到端实测（混合负载：文本、代码、二进制、位图）。",
+    thMode: "模式", thRatio: "压缩率", thNotes: "说明", thBestFor: "适用场景",
+    mNote1: "预测建模，输出最小，速度最慢", mUse1: "文本 / 代码 / 日志 / JSON",
+    mNote2: "lzma2 extreme + 自适应预处理，自动并行", mUse2: "混合数据，综合最佳（归档推荐默认）",
+    mNote3: "去重 + 单流全量参数选择", mUse3: "极致压缩率，整文件固实",
+    mNote4: "zstd-19 + 训练字典，速度快", mUse4: "大量相似文件",
+    mNote5: "zstd-3", mUse5: "最快速度",
+    xzNote: "<code>max</code> / <code>ultra</code> 需要系统 <code>xz</code> 命令（<code>brew install xz</code>）；没有时 hcax 回退到纯 Go lzma2，压缩率从 26.89% 降至 33.40%（归档大约增大 24%）。其余三种模式为纯 Go，无依赖。",
+    vsH: "与传统工具对比",
+    vsBadge: "12.3 MB 混合语料",
+    vsNote: "同一混合语料（文本 / JSON / Go 源码 / 二进制 / 随机 / 未压缩 BMP），来自 README 基准章节。",
+    thTool: "工具", thRatio2: "压缩率", thResult: "结果",
+    r1: "同类最佳",
+    r2: "比 xz 优 4.0%，比 7z 优 5.4%",
+    rRef: "参照", rRef2: "参照", rRef3: "参照", rRef4: "参照",
+    benchNote: "在文本 / 代码负载下，<code>text</code> 比 <code>xz -9e</code> 好 <strong>13–16%</strong>，接近 PPMd（落后 3–5%）。未压缩位图（BMP/TGA/PNM）自动应用 RCT 色彩去相关 + MED 二维预测——这是 hcax 的强项。",
+    installH: "从源码安装",
+    quickH: "快速上手",
+    quickCode: "# 打包（默认 best 模式）\nhcax pack out.hcax &lt;file-or-dir&gt;...\n\n# 选择模式\nhcax pack backup.hcax ~/Documents -m max\n\n# 解包并校验\nhcax unpack out.hcax /path/to/output\nhcax verify out.hcax",
+    seeReadme: '完整文档见<a href="https://github.com/Fleeting-Starfall/hcax">仓库 README</a>。'
+  },
+  "zh-TW": {
+    docTitle: "hcax — 高壓縮率無損歸檔工具",
+    langLabel: "語言",
+    tagline: "高壓縮率無損歸檔工具 — CDC 去重、固實流、內容自適應預處理、上下文混合。純 Go 實作。",
+    latestH: '最新版本 <span class="ver">{ver}</span>',
+    firstStable: "首個穩定版本。",
+    downloadBtn: "下載 {ver}",
+    sourceNote: "原始碼見發布頁面，每個版本附帶二進位構建。",
+    whatH: "hcax 是什麼？",
+    whatP: "hcax 是以純 Go 編寫的高壓縮率無損歸檔工具。它結合 <strong>CDC 分塊與內容定義去重</strong>、<strong>固實流</strong>、<strong>內容自適應預處理</strong>（BMP/TGA/PNM 可逆變換、文字偵測）和 <strong>上下文混合預測</strong>，壓出比經典通用壓縮器更小的歸檔——無原生依賴（僅 <code>max</code>/<code>ultra</code> 可選呼叫系統 <code>xz</code>）。",
+    fiveModes: "五種模式覆蓋速度與壓縮率全譜：<code>fast</code> → <code>best</code> → <code>max</code> → <code>ultra</code> → <code>text</code>。",
+    modeCmpH: "模式比較",
+    modeCmpBadge: "端到端壓縮率，本機實測",
+    modeCmpNote: "壓縮率 = 歸檔 ÷ 原始 × 100%，越低越好。在作者的 macOS 機器上端到端實測（混合負載：文字、程式碼、二進位、點陣圖）。",
+    thMode: "模式", thRatio: "壓縮率", thNotes: "說明", thBestFor: "適用場景",
+    mNote1: "預測建模，輸出最小，速度最慢", mUse1: "文字 / 程式碼 / 日誌 / JSON",
+    mNote2: "lzma2 extreme + 自適應預處理，自動並行", mUse2: "混合資料，綜合最佳（歸檔建議預設）",
+    mNote3: "去重 + 單流全量參數選擇", mUse3: "極致壓縮率，整檔固實",
+    mNote4: "zstd-19 + 訓練字典，速度快", mUse4: "大量相似檔案",
+    mNote5: "zstd-3", mUse5: "最快速度",
+    xzNote: "<code>max</code> / <code>ultra</code> 需要系統 <code>xz</code> 指令（<code>brew install xz</code>）；沒有時 hcax 回退至純 Go lzma2，壓縮率從 26.89% 降至 33.40%（歸檔約增大 24%）。其餘三種模式為純 Go，無依賴。",
+    vsH: "與傳統工具比較",
+    vsBadge: "12.3 MB 混合語料",
+    vsNote: "同一混合語料（文字 / JSON / Go 原始碼 / 二進位 / 隨機 / 未壓縮 BMP），來自 README 基準章節。",
+    thTool: "工具", thRatio2: "壓縮率", thResult: "結果",
+    r1: "同類最佳",
+    r2: "比 xz 優 4.0%，比 7z 優 5.4%",
+    rRef: "參照", rRef2: "參照", rRef3: "參照", rRef4: "參照",
+    benchNote: "在文字 / 程式碼負載下，<code>text</code> 比 <code>xz -9e</code> 好 <strong>13–16%</strong>，接近 PPMd（落後 3–5%）。未壓縮點陣圖（BMP/TGA/PNM）自動套用 RCT 色彩去相關 + MED 二維預測——這是 hcax 的強項。",
+    installH: "從原始碼安裝",
+    quickH: "快速入門",
+    quickCode: "# 打包（預設 best 模式）\nhcax pack out.hcax &lt;file-or-dir&gt;...\n\n# 選擇模式\nhcax pack backup.hcax ~/Documents -m max\n\n# 解包並驗證\nhcax unpack out.hcax /path/to/output\nhcax verify out.hcax",
+    seeReadme: '完整文件見<a href="https://github.com/Fleeting-Starfall/hcax">倉庫 README</a>。'
+  },
+  ru: {
+    docTitle: "hcax — высокоэффективный архиватор без потерь",
+    langLabel: "Язык",
+    tagline: "Высокоэффективный архиватор без потерь — CDC-дедупликация, сплошные потоки, адаптивная предобработка контента, контекстное смешивание. Чистый Go.",
+    latestH: 'Последний релиз <span class="ver">{ver}</span>',
+    firstStable: "Первый стабильный релиз.",
+    downloadBtn: "Скачать {ver}",
+    sourceNote: "Исходный код доступен на странице релиза. Бинарные сборки прилагаются к каждому релизу.",
+    whatH: "Что такое hcax?",
+    whatP: "hcax — это <strong>высокоэффективный архиватор без потерь</strong>, написанный на чистом Go. Он сочетает <strong>CDC-разбиение с дедупликацией по содержимому</strong>, <strong>сплошные потоки</strong>, <strong>адаптивную предобработку контента</strong> (обратимые преобразования BMP/TGA/PNM, определение текста) и <strong>контекстное смешивание</strong>, чтобы сжимать сильнее классических универсальных архиваторов — без нативных зависимостей (только <code>max</code>/<code>ultra</code> опционально используют системный <code>xz</code>).",
+    fiveModes: "Пять режимов покрывают весь спектр «скорость–сжатие»: <code>fast</code> → <code>best</code> → <code>max</code> → <code>ultra</code> → <code>text</code>.",
+    modeCmpH: "Сравнение режимов",
+    modeCmpBadge: "сквозное сжатие, эта машина",
+    modeCmpNote: "Сжатие = архив ÷ оригинал × 100%, чем меньше, тем лучше. Сквозные замеры на macOS автора (смешанная нагрузка: текст, код, бинарники, растры).",
+    thMode: "Режим", thRatio: "Сжатие", thNotes: "Примечания", thBestFor: "Наилучшее для",
+    mNote1: "Предиктивное моделирование, минимальный выход, самый медленный", mUse1: "Текст / код / логи / JSON",
+    mNote2: "lzma2 extreme + адаптивная предобработка, автопараллелизм", mUse2: "Смешанные данные, лучший общий (рекомендуется по умолчанию)",
+    mNote3: "Дедупликация + выбор параметров по полному потоку", mUse3: "Максимальное сжатие, сплошной файл",
+    mNote4: "zstd-19 + обученный словарь, быстро", mUse4: "Много похожих файлов",
+    mNote5: "zstd-3", mUse5: "Максимальная скорость",
+    xzNote: "<code>max</code> / <code>ultra</code> требуют системной команды <code>xz</code> (<code>brew install xz</code>); без неё hcax откатывается к чистому Go-lzma2, и сжатие ухудшается с 26.89% до 33.40% (архив примерно на 24% больше). Остальные три режима — чистый Go, без зависимостей.",
+    vsH: "Сравнение с известными инструментами",
+    vsBadge: "смешанный корпус 12.3 МБ",
+    vsNote: "Тот же смешанный корпус (текст / JSON / исходники Go / бинарники / случайные данные / несжатые BMP) — из раздела бенчмарков README.",
+    thTool: "Инструмент", thRatio2: "Сжатие", thResult: "Результат",
+    r1: "Лучший в классе",
+    r2: "обгоняет xz на 4.0%, 7z на 5.4%",
+    rRef: "Эталон", rRef2: "Эталон", rRef3: "Эталон", rRef4: "Эталон",
+    benchNote: "На текстовых / кодовых нагрузках <code>text</code> обгоняет <code>xz -9e</code> на <strong>13–16%</strong>, приближаясь к PPMd (отставание 3–5%). Несжатые растры (BMP/TGA/PNM) получают автоматическую RCT-декорреляцию цветов + 2D-прогноз MED — сильная сторона hcax.",
+    installH: "Установка из исходников",
+    quickH: "Быстрый старт",
+    quickCode: "# Упаковка (по умолчанию режим best)\nhcax pack out.hcax &lt;file-or-dir&gt;...\n\n# Выбор режима\nhcax pack backup.hcax ~/Documents -m max\n\n# Распаковка и проверка\nhcax unpack out.hcax /path/to/output\nhcax verify out.hcax",
+    seeReadme: 'Полная документация — в <a href="https://github.com/Fleeting-Starfall/hcax">README репозитория</a>.'
+  },
+  fr: {
+    docTitle: "hcax — Outil d'archivage sans perte à taux de compression élevé",
+    langLabel: "Langue",
+    tagline: "Outil d'archivage sans perte à taux de compression élevé — déduplication CDC, flux solid, prétraitement adaptatif du contenu, mélange de contextes. 100 % Go.",
+    latestH: 'Dernière version <span class="ver">{ver}</span>',
+    firstStable: "Première version stable.",
+    downloadBtn: "Télécharger {ver}",
+    sourceNote: "Le code source est disponible sur la page de la version. Des binaires sont joints à chaque version.",
+    whatH: "Qu'est-ce que hcax ?",
+    whatP: "hcax est un <strong>outil d'archivage sans perte à taux de compression élevé</strong> écrit en Go pur. Il combine <strong>le découpage CDC avec déduplication par contenu</strong>, <strong>des flux solid</strong>, <strong>un prétraitement adaptatif du contenu</strong> (transformations réversibles BMP/TGA/PNM, détection de texte) et <strong>une prédiction par mélange de contextes</strong> pour produire des archives plus petites que les compresseurs classiques — sans dépendance native (seuls <code>max</code>/<code>ultra</code> peuvent faire appel à <code>xz</code>).",
+    fiveModes: "Cinq modes couvrent le spectre vitesse–taux : <code>fast</code> → <code>best</code> → <code>max</code> → <code>ultra</code> → <code>text</code>.",
+    modeCmpH: "Comparaison des modes",
+    modeCmpBadge: "taux de bout en bout, cette machine",
+    modeCmpNote: "Taux = archive ÷ original × 100 %, plus bas = meilleur. Mesures de bout en bout sur le Mac de l'auteur (charge mixte : texte, code, binaires, bitmaps).",
+    thMode: "Mode", thRatio: "Taux", thNotes: "Notes", thBestFor: "Idéal pour",
+    mNote1: "Modélisation prédictive, sortie minimale, le plus lent", mUse1: "Texte / code / journaux / JSON",
+    mNote2: "lzma2 extreme + prétraitement adaptatif, parallélisme auto", mUse2: "Données mixtes, meilleur compromis (défaut recommandé)",
+    mNote3: "Déduplication + sélection des paramètres sur le flux complet", mUse3: "Taux extrême, fichier entièrement solid",
+    mNote4: "zstd-19 + dictionnaire entraîné, rapide", mUse4: "Beaucoup de fichiers similaires",
+    mNote5: "zstd-3", mUse5: "Vitesse maximale",
+    xzNote: "<code>max</code> / <code>ultra</code> nécessitent la commande système <code>xz</code> (<code>brew install xz</code>) ; sinon hcax retombe sur le lzma2 pur Go et le taux passe de 26,89 % à 33,40 % (archive ~24 % plus grosse). Les trois autres modes sont en Go pur, sans dépendance.",
+    vsH: "Face aux outils courants",
+    vsBadge: "corpus mixte de 12,3 Mo",
+    vsNote: "Même corpus mixte (texte / JSON / sources Go / binaire / aléatoire / BMP non compressé), tiré de la section benchmarks du README.",
+    thTool: "Outil", thRatio2: "Taux", thResult: "Résultat",
+    r1: "Meilleur de sa catégorie",
+    r2: "bat xz de 4,0 %, 7z de 5,4 %",
+    rRef: "Référence", rRef2: "Référence", rRef3: "Référence", rRef4: "Référence",
+    benchNote: "Sur les charges texte / code, <code>text</code> bat <code>xz -9e</code> de <strong>13–16 %</strong>, s'approchant de PPMd (3–5 % derrière). Les bitmaps non compressés (BMP/TGA/PNM) bénéficient automatiquement de la décorrélation RCT + prédiction 2D MED — un point fort de hcax.",
+    installH: "Installation depuis les sources",
+    quickH: "Démarrage rapide",
+    quickCode: "# Empaqueter (mode par défaut : best)\nhcax pack out.hcax &lt;file-or-dir&gt;...\n\n# Choisir un mode\nhcax pack backup.hcax ~/Documents -m max\n\n# Dépaqueter et vérifier\nhcax unpack out.hcax /path/to/output\nhcax verify out.hcax",
+    seeReadme: 'Voir le <a href="https://github.com/Fleeting-Starfall/hcax">README du dépôt</a> pour la documentation complète.'
+  },
+  ja: {
+    docTitle: "hcax — 高圧縮率・可逆アーカイブツール",
+    langLabel: "言語",
+    tagline: "高圧縮率・可逆アーカイブツール — CDC 重複排除、ソリッドストリーム、コンテンツ適応前処理、コンテキストミキシング。純 Go。",
+    latestH: '最新リリース <span class="ver">{ver}</span>',
+    firstStable: "初の安定版リリース。",
+    downloadBtn: "{ver} をダウンロード",
+    sourceNote: "ソースコードはリリースページで公開されています。各リリースにバイナリが同梱されています。",
+    whatH: "hcax とは？",
+    whatP: "hcax は純 Go で書かれた<strong>高圧縮率の可逆アーカイブツール</strong>です。<strong>CDC チャンキングによるコンテンツ定義重複排除</strong>、<strong>ソリッドストリーム</strong>、<strong>コンテンツ適応前処理</strong>（BMP/TGA/PNM 可逆変換、テキスト検出）、<strong>コンテキストミキシング予測</strong>を組み合わせ、従来の汎用圧縮ツールより小さなアーカイブを生成します。ネイティブ依存はありません（<code>max</code>/<code>ultra</code> のみ、必要に応じてシステムの <code>xz</code> を呼び出します）。",
+    fiveModes: "速度と圧縮率の全スペクトラムを 5 つのモードでカバー：<code>fast</code> → <code>best</code> → <code>max</code> → <code>ultra</code> → <code>text</code>。",
+    modeCmpH: "モード比較",
+    modeCmpBadge: "エンドツーエンド圧縮率（本機）",
+    modeCmpNote: "圧縮率 = アーカイブ ÷ 元ファイル × 100%。低いほど良い。作者の macOS マシンでのエンドツーエンド計測（テキスト、コード、バイナリ、ビットマップの混合ワークロード）。",
+    thMode: "モード", thRatio: "圧縮率", thNotes: "備考", thBestFor: "最適な用途",
+    mNote1: "予測モデリング、最小出力、最遅", mUse1: "テキスト / コード / ログ / JSON",
+    mNote2: "lzma2 extreme + 適応前処理、自動並列", mUse2: "混合データ全般に最適（アーカイブの推奨デフォルト）",
+    mNote3: "重複排除 + 単一ストリーム全量パラメータ選択", mUse3: "極限の圧縮率、ファイル全体をソリッド化",
+    mNote4: "zstd-19 + 学習辞書、高速", mUse4: "類似ファイルが多い場合",
+    mNote5: "zstd-3", mUse5: "最速",
+    xzNote: "<code>max</code> / <code>ultra</code> にはシステムの <code>xz</code> コマンドが必要です（<code>brew install xz</code>）。無い場合 hcax は純 Go の lzma2 にフォールバックし、圧縮率は 26.89% から 33.40% に悪化します（アーカイブが約 24% 増加）。他の 3 モードは純 Go で依存なしです。",
+    vsH: "一般的なツールとの比較",
+    vsBadge: "12.3 MB 混合コーパス",
+    vsNote: "README のベンチマーク節と同じ混合コーパス（テキスト / JSON / Go ソース / バイナリ / ランダム / 非圧縮 BMP）。",
+    thTool: "ツール", thRatio2: "圧縮率", thResult: "結果",
+    r1: "クラス最高",
+    r2: "xz を 4.0%、7z を 5.4% 上回る",
+    rRef: "基準", rRef2: "基準", rRef3: "基準", rRef4: "基準",
+    benchNote: "テキスト / コードのワークロードでは、<code>text</code> は <code>xz -9e</code> を <strong>13–16%</strong> 上回り、PPMd に迫ります（3–5% 差）。非圧縮ビットマップ（BMP/TGA/PNM）には RCT 色相関除去 + MED 2D 予測が自動適用されます — hcax の強みです。",
+    installH: "ソースからインストール",
+    quickH: "クイックスタート",
+    quickCode: "# パック（デフォルトは best モード）\nhcax pack out.hcax &lt;file-or-dir&gt;...\n\n# モードを選択\nhcax pack backup.hcax ~/Documents -m max\n\n# 展開して検証\nhcax unpack out.hcax /path/to/output\nhcax verify out.hcax",
+    seeReadme: '完全なドキュメントは<a href="https://github.com/Fleeting-Starfall/hcax">リポジトリの README</a>を参照してください。'
+  },
+  de: {
+    docTitle: "hcax — Verlustfreies Archivierungswerkzeug mit hoher Komprimierung",
+    langLabel: "Sprache",
+    tagline: "Verlustfreies Archivierungswerkzeug mit hoher Komprimierung — CDC-Deduplizierung, Solid-Streams, inhaltsadaptive Vorverarbeitung, Kontext-Mixing. Reines Go.",
+    latestH: 'Neueste Version <span class="ver">{ver}</span>',
+    firstStable: "Erste stabile Version.",
+    downloadBtn: "{ver} herunterladen",
+    sourceNote: "Der Quellcode ist auf der Release-Seite verfügbar. Zu jeder Version gehören Binär-Builds.",
+    whatH: "Was ist hcax?",
+    whatP: "hcax ist ein <strong>verlustfreies Archivierungswerkzeug mit hoher Komprimierung</strong>, geschrieben in reinem Go. Es kombiniert <strong>CDC-Chunking mit inhaltsbasierter Deduplizierung</strong>, <strong>Solid-Streams</strong>, <strong>inhaltsadaptive Vorverarbeitung</strong> (reversible BMP/TGA/PNM-Transformationen, Texterkennung) und <strong>Kontext-Mixing-Vorhersage</strong>, um kleinere Archive zu erzeugen als klassische Universal-Kompressoren — ohne native Abhängigkeiten (nur <code>max</code>/<code>ultra</code> rufen optional das System-<code>xz</code> auf).",
+    fiveModes: "Fünf Modi decken das Spektrum von Geschwindigkeit bis Verhältnis ab: <code>fast</code> → <code>best</code> → <code>max</code> → <code>ultra</code> → <code>text</code>.",
+    modeCmpH: "Modus-Vergleich",
+    modeCmpBadge: "End-to-End-Verhältnis, dieses System",
+    modeCmpNote: "Verhältnis = Archiv ÷ Original × 100 %, je kleiner desto besser. End-to-End auf dem macOS-Rechner des Autors gemessen (gemischte Last: Text, Code, Binaries, Bitmaps).",
+    thMode: "Modus", thRatio: "Verhältnis", thNotes: "Hinweise", thBestFor: "Geeignet für",
+    mNote1: "Prädiktive Modellierung, kleinste Ausgabe, am langsamsten", mUse1: "Text / Code / Logs / JSON",
+    mNote2: "lzma2 extreme + adaptive Vorverarbeitung, Auto-Parallelisierung", mUse2: "Gemischte Daten, allgemein beste Wahl (empfohlener Standard)",
+    mNote3: "Deduplizierung + Parameterwahl über den gesamten Stream", mUse3: "Extremes Verhältnis, ganzes File solid",
+    mNote4: "zstd-19 + trainiertes Wörterbuch, schnell", mUse4: "Viele ähnliche Dateien",
+    mNote5: "zstd-3", mUse5: "Maximale Geschwindigkeit",
+    xzNote: "<code>max</code> / <code>ultra</code> benötigen den Systembefehl <code>xz</code> (<code>brew install xz</code>) ; ohne ihn fällt hcax auf reines Go-lzma2 zurück und das Verhältnis verschlechtert sich von 26,89 % auf 33,40 % (~24 % größeres Archiv). Die anderen drei Modi sind reines Go ohne Abhängigkeiten.",
+    vsH: "Vergleich mit gängigen Tools",
+    vsBadge: "12,3 MB gemischtes Korpus",
+    vsNote: "Dasselbe gemischte Korpus (Text / JSON / Go-Quellcode / Binär / Zufall / unkomprimiertes BMP) aus dem Benchmark-Abschnitt der README.",
+    thTool: "Werkzeug", thRatio2: "Verhältnis", thResult: "Ergebnis",
+    r1: "Klassenbeste",
+    r2: "schlägt xz um 4,0 %, 7z um 5,4 %",
+    rRef: "Referenz", rRef2: "Referenz", rRef3: "Referenz", rRef4: "Referenz",
+    benchNote: "Bei Text-/Code-Last schlägt <code>text</code> <code>xz -9e</code> um <strong>13–16 %</strong> und kommt an PPMd heran (3–5 % dahinter). Unkomprimierte Bitmaps (BMP/TGA/PNM) erhalten automatisch RCT-Farbdekorrelation + 2D-MED-Prädiktion — eine Stärke von hcax.",
+    installH: "Aus dem Quellcode installieren",
+    quickH: "Schnellstart",
+    quickCode: "# Packen (Standard: best-Modus)\nhcax pack out.hcax &lt;file-or-dir&gt;...\n\n# Modus wählen\nhcax pack backup.hcax ~/Documents -m max\n\n# Entpacken und prüfen\nhcax unpack out.hcax /path/to/output\nhcax verify out.hcax",
+    seeReadme: 'Vollständige Dokumentation im <a href="https://github.com/Fleeting-Starfall/hcax">Repository-README</a>.'
+  }
+};
+
+const langSel = document.getElementById('langSel');
+
+let latestTag = 'v1.0.0';
+
+function applyLang(lang) {
+  const dict = I18N[lang] || I18N.en;
+  document.documentElement.lang = lang;
+  document.title = dict.docTitle;
+  document.querySelectorAll('[data-i18n]').forEach(function (el) {
+    const key = el.getAttribute('data-i18n');
+    if (dict[key] !== undefined) el.textContent = dict[key].replace(/\{ver\}/g, latestTag);
+  });
+  document.querySelectorAll('[data-i18n-html]').forEach(function (el) {
+    const key = el.getAttribute('data-i18n-html');
+    if (dict[key] !== undefined) el.innerHTML = dict[key].replace(/\{ver\}/g, latestTag);
+  });
+  document.querySelectorAll('[data-i18n-code]').forEach(function (el) {
+    const key = el.getAttribute('data-i18n-code');
+    if (dict[key] !== undefined) el.textContent = dict[key].replace(/\{ver\}/g, latestTag);
+  });
+  langSel.value = lang;
+  try { localStorage.setItem('hcax-lang', lang); } catch (e) {}
+}
+
+langSel.addEventListener('change', function () { applyLang(langSel.value); });
+
+let saved = 'en';
+try { saved = localStorage.getItem('hcax-lang') || 'en'; } catch (e) {}
+applyLang(saved);
+
+// 动态获取 GitHub 最新 release，自动更新版本徽章与下载链接
+fetch('https://api.github.com/repos/Fleeting-Starfall/hcax/releases/latest')
+  .then(function (res) { if (!res.ok) throw new Error(String(res.status)); return res.json(); })
+  .then(function (data) {
+    if (data && data.tag_name) {
+      latestTag = data.tag_name;
+      var link = document.getElementById('dlBtn');
+      if (link && data.html_url) link.href = data.html_url;
+      applyLang(saved);
+    }
+  })
+  .catch(function () { /* 获取失败时保留默认版本 */ });
+</script>
+</body>
+</html>
