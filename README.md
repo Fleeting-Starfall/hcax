@@ -58,6 +58,23 @@ hcax pack src.hcax ./proj -m max --exclude .git --exclude node_modules --exclude
 go build -o hcax .
 ```
 
+**Install to PATH** (any one):
+
+```bash
+# 1. go install (binary lands in $(go env GOPATH)/bin, usually already on PATH)
+go install .
+
+# 2. Or copy the built binary to a standard location
+sudo cp hcax /usr/local/bin/
+
+# 3. Or add the directory containing hcax to PATH (replace <path-to-hcax>)
+echo 'export PATH="<path-to-hcax>:$PATH"' >> ~/.zshrc   # macOS / zsh
+echo 'export PATH="<path-to-hcax>:$PATH"' >> ~/.bashrc  # Linux / bash
+source ~/.zshrc
+```
+
+Verify: `hcax` should print usage from anywhere.
+
 ---
 
 ## 2. Choosing a Mode
