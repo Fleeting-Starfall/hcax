@@ -196,6 +196,11 @@ func (b *backend) tuneLZMA2(r io.ReaderAt, size int64) {
 }
 
 // 从 io.ReaderAt 等距抽 8 段拼成不超过 max 的样本(同 stridedSample, 但数据源是文件而非内存切片)
+//
+// 这里的 ReadAt 错误是**故意**不致命的: 它只是给 lzma2 选参(pb=2/4)用的样本,
+// 少读几个字节最坏的结果是选到略差的那个参数(压率差零点几个百分点), 不会损坏
+// 数据, 也不该因为抽样失败就让整次备份报销 —— 这跟 compressMT 里那条是两回事,
+// 那里读的是**要写进归档的数据本体**, 短读就是静默损坏, 必须 fatal(见 mustReadAt)。
 func stridedSampleFrom(r io.ReaderAt, size int64, max int) []byte {
 	if size <= int64(max) {
 		buf := make([]byte, size)
@@ -451,7 +456,7 @@ func (b *backend) compressMT(chunks []*chunkMeta, solid io.ReaderAt, solidSize i
 		last := comp[e-1]
 		end := last.offset + uint64(last.uncomp)
 		buf := make([]byte, end-start)
-		solid.ReadAt(buf, int64(start))
+		mustReadAt(solid, buf, int64(start), "固实流(并行分组)")
 		local := map[*chunkMeta]uint64{}
 		base := start
 		for _, c := range comp[i:e] {
@@ -485,7 +490,7 @@ func concatChunksFile(cs []*chunkMeta, solid io.ReaderAt) []byte {
 	var buf bytes.Buffer
 	for _, c := range cs {
 		seg := make([]byte, c.uncomp)
-		solid.ReadAt(seg, int64(c.offset))
+		mustReadAt(solid, seg, int64(c.offset), "固实流(单流拼接)")
 		buf.Write(seg)
 	}
 	return buf.Bytes()

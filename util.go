@@ -53,6 +53,22 @@ func mustCopy(dst io.Writer, src io.Reader, what string) {
 	}
 }
 
+// 读同样必须检查返回值, 理由和 mustWrite 完全对称: ReaderAt 短读时 buffer 里
+// 剩下的是**零**, 不报错也不崩 —— 它只是悄悄把数据换成 0, 打包一路"成功",
+// 要等解包对不上才发现。compressMT / concatChunksFile 此前就是这么写的。
+func mustReadAt(r io.ReaderAt, buf []byte, off int64, what string) {
+	if len(buf) == 0 {
+		return
+	}
+	n, err := r.ReadAt(buf, off)
+	if err != nil && err != io.EOF {
+		fatal("读 %s 失败(偏移 %d): %v", what, off, err)
+	}
+	if n != len(buf) {
+		fatal("读 %s 短读(偏移 %d, 要 %d 字节实得 %d)", what, off, len(buf), n)
+	}
+}
+
 // ---------------- 归档落盘: 必须先写临时文件再 rename ----------------
 //
 // 老代码直接 os.Create(outPath)。os.Create 是 O_TRUNC, 一打开就把已有文件

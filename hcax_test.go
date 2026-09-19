@@ -673,6 +673,33 @@ func TestNormAsk(t *testing.T) {
 	}
 }
 
+// ---------- 读必须检查返回值: 短读会让 buffer 里留下零(静默损坏) ----------
+
+func TestMustReadAt(t *testing.T) {
+	unmute := muteStdio(t)
+	defer unmute()
+	data := []byte("0123456789")
+	r := bytes.NewReader(data)
+
+	// 正常读: 不 fatal
+	buf := make([]byte, 4)
+	if runCatchingFatal(func() { mustReadAt(r, buf, 2, "测试") }) {
+		t.Fatal("正常读取不该 fatal")
+	}
+	if string(buf) != "2345" {
+		t.Errorf("读到 %q, 期望 \"2345\"", buf)
+	}
+	// 短读: 越界读 -> buffer 里会留下零, 必须 fatal
+	over := make([]byte, 20)
+	if !runCatchingFatal(func() { mustReadAt(r, over, 5, "测试") }) {
+		t.Error("短读必须 fatal —— 否则 buffer 里剩下的零会被当数据写进归档")
+	}
+	// 空读: 不该因为 0 长度就报错
+	if runCatchingFatal(func() { mustReadAt(r, nil, 0, "测试") }) {
+		t.Error("0 字节的读取不该 fatal")
+	}
+}
+
 // ---------- 截断归档必须"干净失败", 不许 panic ----------
 
 // 静音: 下面要跑几千次解析, 让它们往测试输出里打印毫无意义
