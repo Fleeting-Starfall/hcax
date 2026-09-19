@@ -756,10 +756,6 @@ are recorded as packed.
 **Q: How do I confirm an archive isn't corrupted?**
 A: `hcax verify file.hcax`, or `--verify` during unpack.
 
-**Q: What is `_legacy_prototype/`?**
-A: Backup of early artifacts (Python prototype stage). Safe to delete as a whole; doesn't affect
-`hcax`.
-
 ---
 
 ## 10. License

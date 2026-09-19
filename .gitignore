@@ -12,7 +12,6 @@ testdata/
 bench-out/
 
 # Early prototypes and intermediate artifacts (kept local, not committed)
-_legacy_prototype/
 
 # Editors / system
 .DS_Store
