@@ -1,7 +1,7 @@
 # hcax — High-Ratio Lossless Archive Tool
 
 > Pure-Go CLI lossless archiver combining **CDC dedup + solid streams + content-adaptive preprocessing + adaptive parameters + context mixing**.
-> Beats **xz / 7z** on text/code/structured data; dedicated optimization for uncompressed bitmaps.
+> Higher ratio than **xz / 7z** on text/code/structured data (see §4 for measurements); dedicated optimization for uncompressed bitmaps.
 > **Lossless = byte-identical**: unpacked files match originals byte-for-byte (verified with `cmp`).
 
 ---
@@ -81,7 +81,7 @@ Verify: `hcax` should print usage from anywhere.
 
 | Your data | Mode | Why |
 |---|---|---|
-| Whole folder / directory tree | `text` or `max` | Metadata compressed too; beats 7z on ratio |
+| Whole folder / directory tree | `text` or `max` | Metadata compressed too; better ratio than 7z |
 | Text / code / logs / JSON | `text` | Predictive modeling; 8–16% better than xz |
 | Mixed data, best ratio | `max` | lzma2 extreme params + adaptive preprocessing |
 | Large archives (>64MiB), want speed | `max` | Auto-parallel solid groups, several times faster |
@@ -236,12 +236,12 @@ with long-range redundancy destroyed, it still wins by 13.6% — this is predict
 
 1. **RCT color decorrelation** — RGB channels are highly correlated (R≈G≈B); transform to
    `(G, R−G, B−G)`. The two difference channels are near-zero, eliminating a large chunk of
-   redundancy. Biggest single win.
+   redundancy — the largest single gain.
 2. **MED median edge prediction** (LOCO-I / JPEG-LS predictor) — predicts from left/up/upper-left
    along the edge direction; doesn't cross edges, more stable than "left+up−upper-left" gradient,
    more accurate than Paeth/average.
 
-> **Candidate-based transforms**: during packing, gating actually compares
+> **Candidate-based transforms**: during packing, gating compares
 > none / MED / RCT+MED and adopts only the smallest — never a regression.
 > Transforms span chunk boundaries (prediction depends on whole-image geometry), so they are
 > recorded **per-file** (`fe.xform`), not per-chunk.
@@ -353,7 +353,7 @@ streaming encoder with `1<<27` = **128 MiB** window; its history buffer grew to 
 >
 > **Others are as bad or worse.** `ultra` uses the same lzma2 big-dict engine as 7z: `xz -9e
 > dict=256MiB` on the same file measures **2974 MB** RSS (609 MB decompressing); 7z's backend
-> really uses ~3GB (`/usr/bin/time -l` only sees the 7z frontend's 3MB — the real work happens in
+> actually uses ~3GB (`/usr/bin/time -l` only sees the 7z frontend's 3MB — the actual work happens in
 > a child process). hcax's pre-fix 1750MB was self-inflicted (no dedup → double resident data),
 > not inherent to lzma2. Reproduce with `./bbench.sh <bigfile>`.
 
@@ -517,8 +517,8 @@ In data-flow order:
    Chunks split by content boundary (avg 64KB); identical content yields identical chunks →
    **cross-file dedup**.
 2. **Dedup**
-   Identical chunks stored once. Huge win for multi-version / multi-copy data.
-3. **Content-adaptive preprocessing** (per chunk, picks the actually-smaller result)
+   Identical chunks stored once; large gains on multi-version / multi-copy data.
+3. **Content-adaptive preprocessing** (per chunk, picks the smaller result)
    - `DELTA`: 1-D differencing (8/16/24/32-bit)
    - `BCJ-x86`: x86 executable jump-address transform
    - `RCT + MED`: color decorrelation + median edge prediction for uncompressed bitmaps
@@ -541,7 +541,8 @@ In data-flow order:
    along the stream.
 8. **Context mixing (CM) backend** (`text`)
    No matching — **bit-by-bit prediction**: order-0~6 context models + match model + adaptive
-   mixer + two-level SSE, fed to a binary arithmetic coder. Far beyond LZ family on text/code.
+   mixer + two-level SSE, fed to a binary arithmetic coder. Better than LZ-family tools on
+   text/code.
 
 **Container**: `HCAX` magic + header + data section (solid frames + raw section) + chunk table +
 file table + tail checksum.
@@ -683,10 +684,10 @@ random data / 24bpp+32bpp uncompressed BMP). Fixed seed; byte-reproducible.
   samples of `max` range anywhere from 2.9s to 5.9s — the old README's `ultra 3.84s` came from
   that and was not trustworthy.)
 - `text` is bit-by-bit context modeling; slowness is inherent (~**1.3 MB/s** on this corpus). It
-  wins on ratio, not speed.
+  Its advantage is ratio, not speed.
 - Absolute values change across machines/corpora; **magnitudes matter more than absolutes**.
 
-### Limitations (honest list)
+### Known limitations
 
 1. **Already-compressed data won't shrink**: JPEG/PNG/MP4/random data are near entropy limit;
    lossless cannot compress further.
@@ -709,7 +710,7 @@ random data / 24bpp+32bpp uncompressed BMP). Fixed seed; byte-reproducible.
    at about **the data size itself** (pack ≈ input size, unpack ≈ decompressed size). Before
    backing up 100 GB, confirm `TMPDIR` has 100 GB; set the `TMPDIR` env var to relocate.
 
-### v12 known gaps (honest list)
+### v12 known gaps
 
 1. **Symlink mtimes can't be restored**: Go stdlib has no `lutimes`; only regular files/dirs.
 2. **No owner / ACL / xattr preservation**: only permission bits + mtime (setuid/setgid/sticky
