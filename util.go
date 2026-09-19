@@ -1,6 +1,6 @@
 package main
 
-// 全局小工具: 清理钩子、报错退出、归档内路径安全。
+// Global utilities: cleanup hooks, fatal exit, in-archive path safety.
 
 import (
 	"fmt"
@@ -23,66 +23,70 @@ func runCleanups() {
 	cleanupFns = nil
 }
 
-// 退出动作单独抽出来: 测试里会把它换成 panic, 好把"归档损坏"这类分支当成
-// 普通失败来断言(否则 os.Exit 会直接干掉整个测试进程, 后面的用例全跑不了)。
+// The exit action is isolated so tests can swap it for panic and assert on
+// "corrupt archive" branches as ordinary failures (os.Exit would kill the whole
+// test process and every later case).
 var fatalExit = os.Exit
 
 func fatal(format string, args ...interface{}) {
-	fmt.Fprintf(os.Stderr, "错误: "+format+"\n", args...)
+	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
 	runCleanups()
 	fatalExit(1)
 }
 
-// 写盘必须检查返回值。Write/Copy 在磁盘满、超配额、IO 出错时只是返回 error,
-// 不会 panic —— 老代码一路 out.Write(...) 不看返回值, 于是磁盘满时会静默产出
-// 一个**截断的归档/文件**: 头部、元数据、校验码都是按"写成功"生成的, 看上去
-// 完好, 校验也过得去, 等到某天真要恢复才发现内容不对。这是最坏的一类失败 ——
-// 它不报错, 它骗人。
+// Write results must be checked. Write/Copy only return an error on disk full,
+// quota or IO failure — they never panic. Old code called out.Write(...) without
+// looking at the return value, so a full disk silently produced a **truncated
+// archive/file**: header, metadata and checksums were generated as if the write
+// succeeded, verification passed, and the damage surfaced only at restore time.
+// That is the worst kind of failure — it does not error, it lies.
 func mustWrite(f *os.File, b []byte, what string) {
 	if len(b) == 0 {
 		return
 	}
 	if _, err := f.Write(b); err != nil {
-		fatal("写 %s(%s) 失败: %v", what, f.Name(), err)
+		fatal("write %s(%s) failed: %v", what, f.Name(), err)
 	}
 }
 
 func mustCopy(dst io.Writer, src io.Reader, what string) {
 	if _, err := io.Copy(dst, src); err != nil {
-		fatal("写 %s 失败: %v", what, err)
+		fatal("write %s failed: %v", what, err)
 	}
 }
 
-// 读同样必须检查返回值, 理由和 mustWrite 完全对称: ReaderAt 短读时 buffer 里
-// 剩下的是**零**, 不报错也不崩 —— 它只是悄悄把数据换成 0, 打包一路"成功",
-// 要等解包对不上才发现。compressMT / concatChunksFile 此前就是这么写的。
+// Reads need the same treatment as mustWrite: a short ReaderAt read leaves zeros
+// in the buffer without erroring or panicking, silently corrupting data until
+// unpack fails. compressMT / concatChunksFile used to be written this way.
 func mustReadAt(r io.ReaderAt, buf []byte, off int64, what string) {
 	if len(buf) == 0 {
 		return
 	}
 	n, err := r.ReadAt(buf, off)
 	if err != nil && err != io.EOF {
-		fatal("读 %s 失败(偏移 %d): %v", what, off, err)
+		fatal("read %s failed (offset %d): %v", what, off, err)
 	}
 	if n != len(buf) {
-		fatal("读 %s 短读(偏移 %d, 要 %d 字节实得 %d)", what, off, len(buf), n)
+		fatal("read %s short read (offset %d, want %d got %d)", what, off, len(buf), n)
 	}
 }
 
-// ---------------- 归档落盘: 必须先写临时文件再 rename ----------------
+// ---------------- archive write: temp file first, then rename ----------------
 //
-// 老代码直接 os.Create(outPath)。os.Create 是 O_TRUNC, 一打开就把已有文件
-// 截成 0 字节。打包动辄跑几分钟, 而失败最容易发生在最后写盘那一步(磁盘满、
-// 超配额、IO 出错)—— 那一刻旧的备份已经被清空, 新的又只写了一半:
-// **一次失败同时毁掉两份**。mustWrite 只能保证"不静默", 救不回被截断的旧归档。
+// Old code used os.Create(outPath). os.Create is O_TRUNC — opening truncates an
+// existing file to 0 bytes. Packs run for minutes and failures are most likely at
+// the final write step (disk full, quota, IO error): at that moment the old backup
+// is already gone and the new one is half-written — **one failure destroys both**.
+// mustWrite only prevents silence; it cannot rescue the truncated old archive.
 //
-// 所以改成: 在同一目录下写临时文件, 全部写成功后再 rename 覆盖目标。
-// rename 在同一文件系统内是原子的 —— 要么拿到完整的新归档, 要么旧的原封不动。
+// So: write a temp file in the same directory, then rename over the target after
+// all writes succeed. rename within one filesystem is atomic — either the complete
+// new archive is there, or the old one is untouched.
 
 type archiveWriter struct {
 	f       *os.File
 	outPath string
-	tmp     string // 非空 = 当前写的是同目录临时文件, 收尾需 rename
+	tmp     string // non-empty = writing a same-dir temp file; commit must rename
 }
 
 func openArchiveForWrite(outPath string) *archiveWriter {
@@ -90,11 +94,11 @@ func openArchiveForWrite(outPath string) *archiveWriter {
 	if dir == "" {
 		dir = "."
 	}
-	// 临时文件必须在**同一目录**: rename 跨文件系统会失败(EXDEV)
+	// The temp file must live in the same directory: rename across filesystems fails (EXDEV).
 	if f, err := os.CreateTemp(dir, ".hcax-new-"); err == nil {
-		// CreateTemp 固定 0600, 直接改名会让归档变得只有自己能读。
-		// 新建按 0644(与 os.Create 在默认 umask 下一致); 覆盖已有归档时
-		// 沿用它原本的权限, 免得"重新打包一次"顺手把权限改了。
+		// CreateTemp always uses 0600; renaming directly would make the archive owner-only.
+		// New archives use 0644 (matching os.Create under the default umask); overwriting an
+		// existing archive keeps its original mode so repacking does not silently change it.
 		mode := os.FileMode(0o644)
 		if fi, e := os.Stat(outPath); e == nil {
 			mode = fi.Mode().Perm()
@@ -102,7 +106,8 @@ func openArchiveForWrite(outPath string) *archiveWriter {
 		f.Chmod(mode)
 		return &archiveWriter{f: f, outPath: outPath, tmp: f.Name()}
 	}
-	// 同目录不可写(但目标文件本身可能可写) -> 退回老做法, 总比打不了包强
+	// Same dir not writable (but the target itself may be) -> fall back to the old
+	// way; better than refusing to pack.
 	f, err := os.Create(outPath)
 	if err != nil {
 		fatal("create %s: %v", outPath, err)
@@ -110,8 +115,8 @@ func openArchiveForWrite(outPath string) *archiveWriter {
 	return &archiveWriter{f: f, outPath: outPath}
 }
 
-// abort: 关掉并删掉半成品。commit 之后 tmp 已置空, 再调一次是空操作 ——
-// 清理钩子会无条件跑, 这里必须幂等。
+// abort closes and deletes the half-written file. After commit, tmp is empty, so
+// calling it again is a no-op — cleanup hooks run unconditionally, must be idempotent.
 func (w *archiveWriter) abort() {
 	if w.tmp == "" {
 		return
@@ -121,15 +126,15 @@ func (w *archiveWriter) abort() {
 	w.tmp = ""
 }
 
-// commit: 写盘全部成功后调用, 把临时文件改名成目标归档。
+// commit renames the temp file to the target archive after all writes succeeded.
 func (w *archiveWriter) commit() {
 	if w.tmp == "" {
 		return
 	}
 	if err := os.Rename(w.tmp, w.outPath); err != nil {
-		fatal("归档落盘失败(%s -> %s): %v", w.tmp, w.outPath, err)
+		fatal("archive rename failed (%s -> %s): %v", w.tmp, w.outPath, err)
 	}
-	w.tmp = "" // 已经搬过去了, 后面的清理钩子不要再删
+	w.tmp = "" // already moved; later cleanup hooks must not delete it
 }
 
 func safeName(name string) bool {
@@ -149,12 +154,12 @@ func safeName(name string) bool {
 	return true
 }
 
-// 拼出解包目标路径, 并二次确认结果仍在 outDir 之内(纵深防御)
+// joinOut builds the unpack target path and double-checks it stays inside outDir.
 func joinOut(outDir, name string) string {
 	target := filepath.Join(outDir, filepath.FromSlash(name))
 	root := filepath.Clean(outDir) + string(os.PathSeparator)
 	if !strings.HasPrefix(target, root) {
-		fatal("非法路径(逃逸出解包目录): %s", name)
+		fatal("illegal path (escapes unpack dir): %s", name)
 	}
 	return target
 }

@@ -6,22 +6,22 @@ import (
 )
 
 func usage() {
-	fmt.Println("hcax - 极高压缩率无损归档 (Go 原生, 去重+流式+随机解压+预处理+原样存储)")
-	fmt.Println("用法:")
-	fmt.Println("  hcax pack   输出.hcax 文件/目录... -m fast|best|max|ultra|text [--exclude 模式]...")
-	fmt.Println("    fast   : zstd-3, 最快")
-	fmt.Println("    best   : zstd-19 + 训练字典(相似文件) + 轻量预处理, 快且压率好")
-	fmt.Println("    max    : lzma2(系统xz极限参数) + 自适应预处理 + 并行分组(-mmt), 压率/速度均衡")
-	fmt.Println("    ultra  : lzma2 整文件固实(关CDC去重) + 自适应预处理, 单线程求最低压率")
-	fmt.Println("    text   : 上下文混合(CM)建模, 不靠'重复'而靠'预测', 对非重复文本/代码再省 8~16%(纯算法, 较慢)")
-	fmt.Println("  --exclude 模式: 可重复, glob 匹配。按完整路径/路径分段/基名 任一命中即排除;")
-	fmt.Println("                  命中目录时整棵子树跳过。例: --exclude .git --exclude '*.tmp'")
-	fmt.Println("  -T/--precise-times: 时间戳存到纳秒(会把归档升到 v10, 旧版二进制读不了)")
-	fmt.Println("  hcax unpack 输入.hcax 输出目录 [--verify]")
-	fmt.Println("  hcax extract 输入.hcax 输出目录 [文件...] [--verify]")
-	fmt.Println("  hcax list   输入.hcax [-l]      # -l/--long: 权限 + 修改时间 + 分类统计")
-	fmt.Println("  hcax verify 输入.hcax")
-	fmt.Println("  hcax info   输入.hcax   # 容器布局详情(版本/各区大小/块数)")
+	fmt.Println("hcax - high-ratio lossless archiver (pure Go: dedup + solid streams + random-access extract + preprocessing + raw storage)")
+	fmt.Println("usage:")
+	fmt.Println("  hcax pack <out.hcax> <file-or-dir...> -m fast|best|max|ultra|text [--exclude glob]...")
+	fmt.Println("    fast   : zstd-3, fastest")
+	fmt.Println("    best   : zstd-19 + trained dictionary (similar files) + light preprocessing; fast with good ratio")
+	fmt.Println("    max    : lzma2 (system xz, extreme params) + adaptive preprocessing + parallel groups; best all-round")
+	fmt.Println("    ultra  : lzma2 whole-file solid (CDC dedup off) + adaptive preprocessing; single-stream extreme ratio")
+	fmt.Println("    text   : context mixing (CM) modeling; prediction, not matching; 8~16% better on non-repetitive text/code (pure algorithm, slow)")
+	fmt.Println("  --exclude glob: repeatable glob match; excluded if full path / any path segment / basename matches;")
+	fmt.Println("                  matching directories are skipped entirely. e.g. --exclude .git --exclude '*.tmp'")
+	fmt.Println("  -T/--precise-times: store timestamps in nanoseconds (bumps archive to v10; old binaries cannot read)")
+	fmt.Println("  hcax unpack <in.hcax> <out-dir> [--verify]")
+	fmt.Println("  hcax extract <in.hcax> <out-dir> [file...] [--verify]")
+	fmt.Println("  hcax list <in.hcax> [-l]      # -l/--long: permissions + mtime + type stats")
+	fmt.Println("  hcax verify <in.hcax>")
+	fmt.Println("  hcax info <in.hcax>   # container layout (version/section sizes/chunk counts)")
 }
 
 func main() {
@@ -42,15 +42,15 @@ func main() {
 			case "-T", "--precise-times":
 				precise = true
 			case "-m":
-				// 少了这个判断, `hcax pack out dir -m` 会直接 index out of range 崩掉
+				// Without this check, `hcax pack out dir -m` panics with index out of range.
 				if i+1 >= len(os.Args) {
-					fatal("-m 需要一个模式参数(fast|best|max|ultra|text)")
+					fatal("-m needs a mode argument (fast|best|max|ultra|text)")
 				}
 				mode = os.Args[i+1]
 				i++
 			case "--exclude":
 				if i+1 >= len(os.Args) {
-					fatal("--exclude 需要一个模式参数")
+					fatal("--exclude needs a pattern argument")
 				}
 				excl = append(excl, os.Args[i+1])
 				i++
@@ -63,7 +63,7 @@ func main() {
 			}
 		}
 		if out == "" || len(inputs) == 0 {
-			fatal("pack 需要 输出 和 输入")
+			fatal("pack needs an output and an input")
 		}
 		pack(inputs, out, mode, excl, precise)
 	case "unpack":
@@ -79,7 +79,7 @@ func main() {
 			}
 		}
 		if a == "" || o == "" {
-			fatal("unpack 需要 输入 输出")
+			fatal("unpack needs an input and an output")
 		}
 		unpack(a, o, verify, nil)
 	case "extract":
@@ -98,7 +98,7 @@ func main() {
 			}
 		}
 		if a == "" || o == "" {
-			fatal("extract 需要 输入 输出")
+			fatal("extract needs an input and an output")
 		}
 		unpack(a, o, verify, files)
 	case "list":
@@ -112,17 +112,17 @@ func main() {
 			}
 		}
 		if a == "" {
-			fatal("list 需要 输入")
+			fatal("list needs an input")
 		}
 		listArchive(a, long)
 	case "verify":
 		if len(os.Args) < 3 {
-			fatal("verify 需要 输入")
+			fatal("verify needs an input")
 		}
 		verifyArchive(os.Args[2])
 	case "info":
 		if len(os.Args) < 3 {
-			fatal("info 需要 输入")
+			fatal("info needs an input")
 		}
 		infoArchive(os.Args[2])
 	default:
