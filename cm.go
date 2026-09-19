@@ -1,9 +1,10 @@
 package main
 
-// cm.go - 上下文混合(Context Mixing)压缩器 v2
-// 思路: 不"找重复", 而是"预测下一个 bit"。多个不同阶的上下文模型各自给出 P(bit=1),
-// 经两级 APM/SSE 校正后交二值算术编码器。对"非重复文本"同样有效(利用符号间统计依赖)。
-// 纯算法, 无 AI/大模型, 纯 CPU。编解码完全对称(确定性)。
+// cm.go - Context Mixing compressor v2
+// Instead of finding repeats, predict the next bit. Several order-n context models each
+// produce P(bit=1); a two-stage APM/SSE correction feeds a binary arithmetic coder.
+// Effective on non-repetitive text too (statistical dependencies between symbols).
+// Pure algorithm, no AI/large models, pure CPU. Encode and decode are fully symmetric.
 
 import (
 	"bytes"
@@ -13,16 +14,16 @@ import (
 	"math"
 )
 
-// ---------------- 二值算术编码器 ----------------
+// ---------------- binary arithmetic coder ----------------
 type arEnc struct {
 	x1, x2 uint32
 	out    []byte
 }
 
-// 初始化区间(必须调用; 零值 x2=0 会导致区间塌陷)
+// init the interval (must be called; zero x2=0 collapses the range)
 func (e *arEnc) init() { e.x1, e.x2, e.out = 0, 0xffffffff, e.out[:0] }
 
-// p: P(bit=1) 的 12-bit 表示(1..4094)
+// p: 12-bit representation of P(bit=1) (1..4094)
 func (e *arEnc) encode(bit int, p uint32) {
 	if p < 1 {
 		p = 1
@@ -121,8 +122,9 @@ func squash(x int32) int32 {
 	return squashT[x+2048]
 }
 
-// ---------------- 自适应概率计数器 ----------------
-// 每项 uint32: 高 16 位 = P(1)(0..65535), 低 16 位 = 观测计数(用于自适应学习率)
+// ---------------- adaptive probability counters ----------------
+// Each uint32: high 16 bits = P(1) (0..65535), low 16 bits = observation count
+// (adaptive learning rate).
 type counterTbl struct {
 	t    []uint32
 	mask uint32
@@ -160,9 +162,9 @@ func (c *counterTbl) update(idx uint32, bit int) {
 	if n > 1023 {
 		n = 1023
 	}
-	// 这里保留 int64 中间量: 在 arm64 上改 int32 反而更慢(32 位运算要额外
-	// 符号扩展), 实测 4 轮配对比较每轮都慢 3~5%。乘积上界 65534*32768
-	// 虽仍在 int32 内, 但没有任何收益, 别"优化"这里。
+	// Keep int64 intermediates: on arm64 int32 is slower (extra sign-extension for
+	// 32-bit ops), measured 3-5% slower in 4 paired comparisons. The product 65534*32768
+	// fits in int32, but there is no gain — do not "optimize" this.
 	p += int32((int64(tgt-p) * int64(cmRcp[n])) >> 16)
 	if p < 1 {
 		p = 1
@@ -175,7 +177,7 @@ func (c *counterTbl) update(idx uint32, bit int) {
 	c.t[idx] = uint32(p)<<16 | uint32(n)
 }
 
-// ---------------- APM / SSE 二级校正 ----------------
+// ---------------- APM / SSE secondary correction ----------------
 type apm struct {
 	t   []uint16
 	idx int
@@ -210,10 +212,10 @@ func (a *apm) update(bit int, rate int) {
 	}
 }
 
-// ---------------- 上下文混合编解码器 ----------------
+// ---------------- context mixing codec ----------------
 const (
-	cmNM = 7 // 上下文模型数: order-0,1,2,3,4,5,6
-	cmNI = 9 // 混流输入: 7 模型 + 匹配模型 + 偏置
+	cmNM = 7 // number of context models: order-0..6
+	cmNI = 9 // mixer inputs: 7 models + match model + bias
 )
 
 var cmOrderList = [cmNM]int{0, 1, 2, 3, 4, 5, 6}
@@ -225,20 +227,20 @@ type cmCodec struct {
 	match *counterTbl
 	w     []int32
 	hist  []byte
-	// 匹配模型
+	// match model
 	mht      []int32
 	matchPtr int32
 	matchLen int
-	// 逐 bit 状态
+	// per-bit state
 	c0   uint32
 	bpos int
-	// 每个 bit 的中间结果缓存: predict 算好给 update 复用。
-	// 原实现 update 会把 7 个上下文哈希重算一遍(每 bit 14 次 -> 7 次),
-	// 且 st 数组按值返回/传参, 每 bit 多拷两趟 36B。
-	// 纯实现优化: 数值路径不变, 压缩输出逐字节一致。
+	// Per-bit cached intermediates: predict computes them for update to reuse.
+	// The original update re-hashed all 7 contexts (14->7 hashes per bit) and passed
+	// st by value, copying 36B twice per bit. Pure implementation optimization: numeric
+	// path unchanged, compressed output byte-identical.
 	idx [cmNM]uint32
 	st  [cmNI]int32
-	// SSE
+	// SSE stages
 	apm1 *apm
 	apm2 *apm
 
@@ -254,7 +256,8 @@ func newCMCodec() *cmCodec {
 		c.tbls[i] = newCounterTbl(cmTblBits[i])
 	}
 	c.match = newCounterTbl(20)
-	// 混合器按 bit 位置(bpos 0..7)分组: 每组独立权重(更贴合当前 bit 的上下文)
+	// Mixer weights are grouped by bit position (bpos 0..7): independent weights per
+	// context fit the current bit better.
 	c.w = make([]int32, cmNI*8)
 	for i := range c.w {
 		c.w[i] = (1 << 16) / cmNI
@@ -270,7 +273,7 @@ func newCMCodec() *cmCodec {
 	return c
 }
 
-// 每个模型的表大小掩码预计算好, 免得每 bit 每模型都重算一次移位
+// Precompute per-model table masks to avoid re-shifting on every bit.
 var cmMask = func() [cmNM]uint32 {
 	var m [cmNM]uint32
 	for i, b := range cmTblBits {
@@ -287,8 +290,8 @@ func ctxIdx(cx uint32, i int, c0 uint32) uint32 {
 	return (h + c0*0x7feb352d) & cmMask[i]
 }
 
-// 返回: 最终 12-bit P(1), 混合器自身 12-bit P(1)(用于训练权重)。
-// 上下文索引与各模型 stretch 值缓存在 c.idx / c.st, 供 update 复用。
+// Returns: final 12-bit P(1) and the mixer's own 12-bit P(1) (for weight training).
+// Context indices and per-model stretch values are cached in c.idx / c.st for update.
 func (c *cmCodec) predict() (uint32, uint32) {
 	st := c.st[:]
 	for i := 0; i < cmNM; i++ {
@@ -314,7 +317,7 @@ func (c *cmCodec) predict() (uint32, uint32) {
 			}
 		}
 	}
-	st[cmNM+1] = 256 // 偏置
+	st[cmNM+1] = 256 // bias
 
 	wb := c.bpos * cmNI
 	var dot int32
@@ -326,8 +329,8 @@ func (c *cmCodec) predict() (uint32, uint32) {
 	} else if dot < -2047 {
 		dot = -2047
 	}
-	pMix := squash(dot) // 混合器自身输出(12-bit), 用于训练权重
-	// 两级 APM/SSE 校正
+	pMix := squash(dot) // mixer's own output (12-bit), used for weight training
+	// two-stage APM/SSE correction
 	a1 := c.apm1.pp(dot, int(c.c0&0xff))
 	a2 := c.apm2.pp(dot, int((c.cx[1]&0xff)<<8|(c.c0&0xff)))
 	p12 := (a1 + a2*3) >> 2
@@ -348,7 +351,8 @@ func (c *cmCodec) update(bit int, pMix uint32) {
 	if bit == 0 {
 		target = 0
 	}
-	// 用"混合器自身输出"的误差训练权重(lpaq 做法); 原用 APM 输出误差是错的
+	// Train weights with the mixer output error (lpaq approach); using the APM output
+	// error was wrong.
 	err := target - int32(pMix)
 	wb := c.bpos * cmNI
 	for i := 0; i < cmNI; i++ {
@@ -356,7 +360,8 @@ func (c *cmCodec) update(bit int, pMix uint32) {
 	}
 	c.apm1.update(bit, 7)
 	c.apm2.update(bit, 7)
-	// 匹配模型: 若本 bit 与预测不符, 则本字节内停用(避免误导后续 bit)
+	// Match model: if the bit differs from the prediction, disable it for this byte to
+	// avoid misleading later bits.
 	if c.matchLen > 0 && c.matchPtr >= 0 && int(c.matchPtr) < len(c.hist) {
 		pb := c.hist[c.matchPtr]
 		if int((pb>>uint(7-c.bpos))&1) != bit {
@@ -438,25 +443,27 @@ func cmCompress(data []byte) []byte {
 	return out
 }
 
-// cmDecompressTo 把解压结果顺序写入 w(而非整份返回)。
-// CM 是逐 bit 串行解码, 无法随机访问, 但输出天然是流式的 —— 写 w 即可让解压
-// 不再要求"输出全量常驻内存"(解包侧落临时文件所需)。
+// cmDecompressTo writes decompressed output sequentially to w instead of returning it
+// whole. CM decodes serially bit-by-bit with no random access, but output is naturally
+// streaming — writing to w avoids keeping the full output in memory (needed on the
+// unpack side when writing to a temp file).
 func cmDecompressTo(w io.Writer, frame []byte, maxOut int64) error {
 	if len(frame) < 9 || frame[0] != 1 {
-		fatal("cm 帧格式错误")
+		fatal("cm frame format error")
 	}
 	n := binary.LittleEndian.Uint64(frame[1:9])
-	// 帧头这 8 字节是**归档里给的**。CM 逐 bit 解码没有天然的结束标记 ——
-	// 解码器读完输入后会一直补 0, 唯一的终止条件就是这个长度。于是它被改坏成
-	// 天文数字时, 解码器会一直跑到地老天荒: 实测一个损坏的 text 归档能让
-	// `hcax list` 永久挂死(单核跑满, 调用栈停在 cmCodec.update)。
-	// zstd/lzma2 有流结束标记, 不会这样 —— 只有 CM 需要这个兜底。
+	// These 8 header bytes come from the archive. CM bit-by-bit decoding has no natural
+	// end marker — after the input is exhausted the decoder keeps reading zeros, so this
+	// length is the only termination condition. If corrupted to a huge value, decoding
+	// runs forever: a damaged text archive used to hang `hcax list` permanently (one CPU
+	// pegged, stack stuck in cmCodec.update). zstd/lzma2 have end-of-stream markers and
+	// are immune — only CM needs this guard.
 	limit := maxOut
 	if limit <= 0 {
-		limit = 1 << 31 // 调用方给不出精确期望值时(老格式)的宽松兜底
+		limit = 1 << 31 // loose fallback when the caller cannot give an exact bound (old formats)
 	}
 	if n > uint64(limit) {
-		return fmt.Errorf("cm 帧声明 %d 字节, 超过上限 %d(归档已损坏)", n, limit)
+		return fmt.Errorf("cm frame declares %d bytes, over the %d bound (corrupt archive)", n, limit)
 	}
 	if n == 0 {
 		return nil
@@ -492,12 +499,13 @@ func cmDecompressTo(w io.Writer, frame []byte, maxOut int64) error {
 	return nil
 }
 
-// maxOut: 调用方已知的期望输出上限(元数据有 metaRawLen, 固实流有各块 uncomp 之和)。
-// CM 帧头的长度字段不可信, 没有它解码器会跑到地老天荒 —— 详见 cmDecompressTo。
+// maxOut: the caller's known expected output bound (metaRawLen in metadata, or the sum
+// of uncomp sizes in a solid stream). The CM frame length field is untrusted; without a
+// bound the decoder runs forever — see cmDecompressTo.
 func cmDecompress(frame []byte, maxOut int64) []byte {
 	var out bytes.Buffer
 	if err := cmDecompressTo(&out, frame, maxOut); err != nil {
-		fatal("cm 解压: %v", err)
+		fatal("cm decompress: %v", err)
 	}
 	return out.Bytes()
 }

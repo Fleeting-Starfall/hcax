@@ -15,21 +15,27 @@ import (
 
 const storeThresholdPct = 100
 
-// mmtMinBytes: 并行固实分组(mmt)的数据量门槛。
-// 并行分组把固实流切成多段独立压缩, 会丢失段间冗余 -> 压率略损。
-// 中小语料上"压率越低越好"优先, 故仅在可压数据足够大(>=64MiB, 速度才是瓶颈)时才用并行。
+// mmtMinBytes: data threshold for parallel solid grouping (mmt).
+// Parallel groups cut the solid stream into independently compressed segments,
+// losing cross-segment redundancy -> slightly worse ratio. On small/medium corpora
+// ratio wins, so parallelism only kicks in when compressible data is large enough
+// (>=64MiB, where speed is the bottleneck).
 
 const mmtMinBytes = 64 << 20
 
-// zstd 模式按块编码(块上限 chunkMax=256KiB), 单个块被独立 EncodeAll, 匹配距离不可能跨块,
-// 故编码器窗口封顶到 1MiB(已远超 256KiB 块上限); 更大的窗口纯浪费内存。
-// best 档原 window=27(1<<27=128MiB), 两个 zstd 编码器常驻 ~256MiB —— 是 best 内存(~264MB)远高于
-// max(~88MB, zstd 模式才建编码器)的根因。封顶后 best 内存回到 ~10MB 级, 压率不变(块内匹配用不到大窗口)。
+// zstd encodes per chunk (chunk cap chunkMax=256KiB); each chunk is EncodeAll'd
+// independently, so matches cannot cross chunks. The encoder window is therefore
+// capped at 1MiB (far beyond the 256KiB chunk cap); bigger windows just waste memory.
+// best used to set window=27 (1<<27=128MiB), keeping two zstd encoders resident at
+// ~256MiB — the reason best peaked at ~264MB vs max's ~88MB (zstd mode is the only
+// one building encoders). After the cap best sits at ~10MB with identical ratio
+// (chunk-local matches never need the big window).
 const zstdMaxWindowLog = 20
 
-// dictTrialMaxBytes: 训练字典是否划算的"试压"上限。
-// 字典本身要写进归档, 小语料上可能比它省下的还多 —— 只有可压数据不超过这个量时,
-// 才值得多花一次压缩去比较"带字典帧+字典" vs "无字典帧"。(见 archive.go 中的试压逻辑)
+// dictTrialMaxBytes: cap for the "is the trained dict worth it" trial.
+// The dict itself is stored in the archive and can cost more than it saves on small
+// corpora — only below this size is a second compression pass worth comparing
+// "dict frame + dict" vs "no dict frame". (See the trial logic in archive.go)
 const dictTrialMaxBytes = 32 << 20
 
 type modeSpec struct {
@@ -45,40 +51,42 @@ var modes = map[string]modeSpec{
 	"fast":  {0, "zstd", 3, 0, false, false},
 	"best":  {1, "zstd", 19, 27, false, false},
 	"max":   {2, "lzma2", 9, 27, false, true},
-	"ultra": {3, "lzma2", 9, 27, false, false}, // v8b: 关固实(去重), 内存从 ~1.8GB 降到 ~max 级(~86MB); 仍单流全流选参保压率(区别于 max 的并行)
-	"text":  {4, "cm", 0, 0, false, false},     // 上下文混合: 对文本/代码/源数据极高压缩率(纯算法, 慢)
+	"ultra": {3, "lzma2", 9, 27, false, false}, // v8b: solid off (dedup on), memory drops from ~1.8GB to ~max level (~86MB); still single-stream full trial for ratio (unlike max's parallel)
+	"text":  {4, "cm", 0, 0, false, false},     // context mixing: extreme ratio on text/code/source (pure algorithm, slow)
 }
 
 type backend struct {
 	spec      modeSpec
-	zEnc      *zstd.Encoder // 无字典编码(zstd)
+	zEnc      *zstd.Encoder // no-dict encoder (zstd)
 	zDec      *zstd.Decoder
-	zEncDict  *zstd.Encoder // 带训练字典编码(zstd best 相似文件)
-	zDecDict  *zstd.Decoder // 带训练字典解码
-	gateEnc   *zstd.Encoder // 廉价 l1 编码器, 用于不可压判定/逐块预处理选型
-	dictParam string        // lzma2 dict 大小(按可压数据量收敛)
-	lcParam   string        // lzma2 lc(literal context bits), 自适应选取
-	pbParam   string        // lzma2 pb(position bits), 自适应选取
-	trainDict []byte        // zstd(best)训练字典正文(流式压缩时复用以建输出编码器)
+	zEncDict  *zstd.Encoder // trained-dict encoder (zstd best for similar files)
+	zDecDict  *zstd.Decoder // trained-dict decoder
+	gateEnc   *zstd.Encoder // cheap l1 encoder for incompressibility checks / per-chunk preprocessing selection
+	dictParam string        // lzma2 dict size (converges on compressible data size)
+	lcParam   string        // lzma2 lc (literal context bits), adaptive
+	pbParam   string        // lzma2 pb (position bits), adaptive
+	trainDict []byte        // zstd(best) trained dict body (reused to build the output encoder when streaming)
 	hasDict   bool
-	dictBytes []byte // 归档里的训练字典正文(流式**解压**时需重建带字典的解码器)
+	dictBytes []byte // trained dict body from the archive (rebuilds the dict decoder when streaming **decompression**)
 }
 
 func newBackend(spec modeSpec) *backend {
-	b := &backend{spec: spec, lcParam: "4", pbParam: "2"} // lzma2 默认; tuneLZMA2 会按数据自适应覆盖
+	b := &backend{spec: spec, lcParam: "4", pbParam: "2"} // lzma2 defaults; tuneLZMA2 overrides per data
 	if spec.backend == "zstd" {
 		var err error
-		// v8c: zEnc(无字典编码器)改为惰性创建 —— best 档总会训练字典并用 zEncDict, 原 zEnc 从未被使用,
-		// 却白白常驻一个 level-19 编码器(~35~69MB, 其内存由 level 决定、与窗口无关)。惰性创建后,
-		// 只有"未训练字典"的 zstd 档(fast / 训练失败回退)才建它。
+		// v8c: zEnc (no-dict encoder) is created lazily — best always trains a dict and
+		// uses zEncDict; the old zEnc was never used yet kept a level-19 encoder resident
+		// (~35~69MB; its memory is level-driven, not window-driven). Lazily, only
+		// dict-less zstd modes (fast / training fallback) build it.
 		b.zDec, err = zstd.NewReader(nil)
 		if err != nil {
 			fatal("zstd decoder: %v", err)
 		}
 	}
-	// v8: 门控编码器只用于"估计块是否可压"(选原样/选预处理), 不需要大窗口/历史。
-	// 用固定 1MiB 窗口, 避免 zstd 流式编码器历史缓冲随数据膨胀(大文件可飙到 GB 级, 见 ensureHist)。
-	// 注意: 仅 zstd 模式才需要 zEnc/zDec; lzma2 模式不创建, 省下 128MiB 字典窗口。
+	// v8: the gate encoder only estimates "is this block compressible" (raw/preprocess
+	// choice); no big window or history needed. Fixed 1MiB window avoids zstd streaming
+	// encoder history growth (can hit GBs on large files, see ensureHist).
+	// Note: only zstd mode needs zEnc/zDec; lzma2 skips them, saving the 128MiB dict window.
 	gateOpts := []zstd.EOption{zstd.WithEncoderLevel(zstd.SpeedDefault), zstd.WithWindowSize(1 << 20)}
 	g, err := zstd.NewWriter(io.Discard, gateOpts...)
 	if err != nil {
@@ -88,9 +96,10 @@ func newBackend(spec modeSpec) *backend {
 	return b
 }
 
-// 逐块自适应预处理选型: 试候选变换, 用门控(zstd-l3)投影选最小者。
-// 只采用"确实变小时"的变换 -> 绝不退步; 且能抓取无文件头的结构化数据(裸光栅/内嵌x86代码)。
-// light=true(用于 best 快档): 只试主要候选, 降门控开销保速度; max/ultra 档用全 6 候选求更优。
+// Per-chunk adaptive preprocessing: try candidate transforms, pick the smallest under
+// the gate (zstd-l3) projection. Only adopt a transform that actually shrinks the chunk
+// -> never worse; also catches structured data without file headers (raw raster / x86
+// code). light=true (best): fewer candidates, lower gate cost; max/ultra try all 6.
 
 func (b *backend) chooseTransform(cb []byte) (byte, []byte) {
 	if len(cb) < 4 {
@@ -100,10 +109,10 @@ func (b *backend) chooseTransform(cb []byte) (byte, []byte) {
 	if b.spec.backend == "lzma2" {
 		cands = []byte{xfNone, xfDelta1, xfDelta2, xfDelta3, xfDelta4, xfBCJX86}
 	} else {
-		cands = []byte{xfNone, xfDelta3, xfBCJX86} // best: 轻量候选, 保速度
+		cands = []byte{xfNone, xfDelta3, xfBCJX86} // best: light candidates for speed
 	}
 	best, bestSz := xfNone, len(cb)
-	// v8: 复用单个 scratch 试所有候选, 不再为每块分配 6 个全尺寸缓冲
+	// v8: reuse one scratch for all candidates instead of allocating 6 full-size buffers per chunk
 	scratch := make([]byte, len(cb))
 	for _, t := range cands {
 		copy(scratch, cb)
@@ -115,16 +124,18 @@ func (b *backend) chooseTransform(cb []byte) (byte, []byte) {
 	return best, applyXform(best, cb, false)
 }
 
-// 廉价判定: 该块是否不可压(应原样存储而非进压缩器)。zstd 模式恒压, 不原样存储。
+// Cheap check: is this block incompressible (store raw instead of feeding the
+// compressor)? zstd mode always compresses, never stores raw.
 
 func (b *backend) shouldStore(cb []byte) bool {
 	if len(cb) == 0 {
 		return true
 	}
-	// CM(text) 靠统计预测, 对高熵数据(随机/已压缩)既压不动又极慢(逐 bit 建模
-	// ~1.3MB/s, 实测值见 README §8; 早期注释写的 0.5MB/s 是估算, 已更正)。
-	// 让这类块走原样存储, 免得 CM 在压不出结果的数据上白耗时间。
-	// (此前只有 lzma2 档做原样判定, text 档一律硬送进 CM。)
+	// CM(text) predicts statistically; high-entropy data (random/already compressed)
+	// neither shrinks nor is fast (~1.3MB/s bitwise modeling, measured, see README §8;
+	// an early 0.5MB/s estimate was corrected). Such blocks go raw so CM does not burn
+	// time on data it cannot compress. (Previously only lzma2 did raw checks; text
+	// always forced chunks into CM.)
 	if b.spec.backend == "cm" {
 		return byteEntropy(cb) > 7.95
 	}
@@ -135,22 +146,25 @@ func (b *backend) shouldStore(cb []byte) bool {
 	if len(out) < len(cb)*storeThresholdPct/100 {
 		return false // 门控能压 -> 可压, 进固实流
 	}
-	// 门控"压不动": 还要确认它是否真的随机。图像残差这类数据常常"块内不可压、但整体(固实/lzma2大字典)可压",
-	// 若仅凭门控就原样存储会误判丢压率。用字节熵二次确认: 只有高熵(真随机)才原样存储。
+	// Gate says "incompressible": confirm it is really random. Image residuals often
+	// fail chunk-local compression yet compress well globally (solid stream / large
+	// lzma2 dict); storing them raw on the gate's verdict alone would waste ratio.
+	// Double-check with byte entropy: only high-entropy (true random) goes raw.
 	return byteEntropy(cb) > 7.95
 }
 
-// lzma2 dict 按可压数据量收敛。lzma2 的匹配距离受限于 dict, hcax 块均 64KiB,
-// 4MiB 已覆盖 ~64 个块的历史 —— 对"多样语料"(文本/JSON/源码混合)再往上加字典
-// 实测毫无收益(12.6MB 语料: 4/8/16/32MiB 压缩结果**完全一样**), 只涨内存。
+// lzma2 dict converges on compressible data size. lzma2 matches are limited by the
+// dict; hcax chunks average 64KiB, so 4MiB covers ~64 chunks of history — on mixed
+// corpora (text/JSON/source) larger dicts measured zero gain (12.6MB corpus:
+// 4/8/16/32MiB compress **identically**), only more memory.
 //
-// 但可执行文件是另一回事: 20MB 的 Mach-O 上, dict 8MiB→16MiB 还能再省 4.0%
-// (6,659,708 -> 6,395,092 B), 32MiB 则一分不省。这类数据的重复是"长距离"的
-// (相同函数体/字符串表隔得很远), 只有字典够大才连得上。
+// Executables are different: on a 20MB Mach-O, 8MiB->16MiB dict saves another 4.0%
+// (6,659,708 -> 6,395,092 B); 32MiB saves nothing. Their repetition is long-range
+// (same function bodies / string tables far apart); only a large enough dict connects it.
 //
-// 所以 >=16MiB 的可压数据一律给 16MiB: 耗时不变(实测 3.30s vs 3.36s),
-// 代价是 xz 子进程峰值内存从 ~121MB 涨到 ~208MB(只影响 >=16MiB 的输入;
-// 更小的输入仍走 4MiB / 2MiB, 峰值 ~72MB)。
+// So >=16MiB of compressible data always gets 16MiB: runtime unchanged (measured
+// 3.30s vs 3.36s), at the cost of xz subprocess peak memory ~121MB -> ~208MB (only
+// for >=16MiB inputs; smaller inputs stay at 4MiB/2MiB, ~72MB peak).
 
 func dictFor(n int) string {
 	switch {
@@ -163,9 +177,11 @@ func dictFor(n int) string {
 	}
 }
 
-// lzma2 lc/pb 自适应: 用固实流样本试若干候选参数, 选"投影最小"的组合。
-// 只采用确实更小者 -> 绝不退步; 依赖系统 xz(缺失则保持默认, 回退 ulikunitz)。
-// 实测: 对代码/结构化数据 pb=4 常优于默认 pb=2 (约 1~2%); 但最优值随数据而异, 故自适应。
+// lzma2 lc/pb adaptation: sample the solid stream, try candidate parameters, pick the
+// smallest projection. Only adopt a genuinely smaller combo -> never worse; depends on
+// system xz (falls back to defaults and ulikunitz if missing).
+// Measured: pb=4 often beats the default pb=2 on code/structured data (~1-2%), but the
+// optimum varies by data, hence adaptive.
 
 func (b *backend) tuneLZMA2(r io.ReaderAt, size int64) {
 	if b.spec.backend != "lzma2" || size == 0 {
@@ -174,7 +190,8 @@ func (b *backend) tuneLZMA2(r io.ReaderAt, size int64) {
 	if _, err := exec.LookPath("xz"); err != nil {
 		return
 	}
-	// 采样: 等距抽 8 段拼成 ~1MiB —— 既代表全流, 又够快(避免只取头部造成误判)
+	// Sample: 8 evenly spaced segments totaling ~1MiB — representative of the whole
+	// stream yet fast (avoids misjudging from the head alone)
 	if size < 256<<10 {
 		return
 	}
@@ -195,12 +212,15 @@ func (b *backend) tuneLZMA2(r io.ReaderAt, size int64) {
 	}
 }
 
-// 从 io.ReaderAt 等距抽 8 段拼成不超过 max 的样本(同 stridedSample, 但数据源是文件而非内存切片)
+// Evenly sample 8 segments from an io.ReaderAt into a buffer of at most max bytes
+// (same as stridedSample, but reading from a file rather than an in-memory slice).
 //
-// 这里的 ReadAt 错误是**故意**不致命的: 它只是给 lzma2 选参(pb=2/4)用的样本,
-// 少读几个字节最坏的结果是选到略差的那个参数(压率差零点几个百分点), 不会损坏
-// 数据, 也不该因为抽样失败就让整次备份报销 —— 这跟 compressMT 里那条是两回事,
-// 那里读的是**要写进归档的数据本体**, 短读就是静默损坏, 必须 fatal(见 mustReadAt)。
+// ReadAt errors here are **deliberately** non-fatal: this is only a sample for lzma2
+// parameter selection (pb=2/4). A few missing bytes cost a slightly suboptimal
+// parameter (fractions of a percent of ratio), never data corruption, and a sampling
+// failure must not sink a whole backup — unlike compressMT, which reads the **data
+// being written into the archive**: a short read there is silent corruption and is
+// fatal (see mustReadAt).
 func stridedSampleFrom(r io.ReaderAt, size int64, max int) []byte {
 	if size <= int64(max) {
 		buf := make([]byte, size)
@@ -225,23 +245,25 @@ func stridedSampleFrom(r io.ReaderAt, size int64, max int) []byte {
 	return out
 }
 
-// xzFallbackWarn 记录"本进程是否已经警告过 xz 回退"; 只报一次, 免得 max 档
-// 每条固实流都刷一行。测试用 xzWarnCount 断言警告确实发出过。
+// xzFallbackWarn tracks whether this process already warned about the xz fallback;
+// warn once so max does not print a line per solid stream. Tests assert the warning
+// fired via xzWarnCount.
 var (
 	xzWarnOnce  sync.Once
 	xzWarnCount int
 )
 
-// warnXZFallback: 系统 xz 不可用时必须让用户知道。
-// 这不是"锦上添花"—— 实测同一语料: 有系统 xz 压率 26.89%, 回退到内置纯 Go lzma2
-// 后 33.40%, 归档凭空大 24%。此前是**完全静默**的, 用户以为自己在用最强档。
+// warnXZFallback: the user must know when system xz is unavailable.
+// This is not cosmetic — measured on the same corpus: with system xz ratio 26.89%,
+// falling back to the built-in pure Go lzma2 gives 33.40%, an archive 24% larger.
+// It used to be **fully silent**, the user believing they were on the strongest mode.
 func warnXZFallback(reason string) {
 	xzWarnOnce.Do(func() {
 		xzWarnCount++
 		fmt.Fprintf(os.Stderr,
-			"警告: %s; max/ultra 已回退到内置的纯 Go lzma2 实现\n"+
-				"       压率会明显变差(实测同一语料 26.89%% -> 33.40%%, 归档大 24%%)。\n"+
-				"       装上系统 xz 可恢复: brew install xz / apt-get install xz-utils\n", reason)
+			"warning: %s; max/ultra fell back to the built-in pure Go lzma2\n"+
+				"       ratio will be noticeably worse (measured 26.89%% -> 33.40%%, 24%% larger archive).\n"+
+				"       install system xz to restore: brew install xz / apt-get install xz-utils\n", reason)
 	})
 }
 
@@ -250,26 +272,30 @@ func warnXZFallback(reason string) {
 func (b *backend) xzCompress(r io.Reader, lc, pb, dict string) []byte {
 	xzbin, err := exec.LookPath("xz")
 	if err != nil {
-		warnXZFallback("未能在 PATH 中找到 xz")
+		warnXZFallback("xz not found in PATH")
 		return nil
 	}
-	// v8d: 弃用极端模式 -e(nice=273, 深度 256MiB) —— 实测对 30MB 多样数据压率零收益(与 -9 完全一致),
-	// 却显著拖慢匹配器。改 preset=9 + nice=64(标准 -9 档), 配合 dictFor 收敛的字典, 速度/内存大幅下降。
-	// dict 上限 16MiB(见 dictFor): 超出后压率增益 < 0.03%, 但内存/耗时陡增。
-	// v8e: 入参改为 io.Reader —— 固实流落临时文件后, xz 直接从文件流读取, 不再把全量固实流读进内存。
+	// v8d: dropped the extreme -e mode (nice=273, depth 256MiB) — measured zero ratio
+	// gain on 30MB mixed data (identical to -9) while slowing the matcher notably.
+	// Now preset=9 + nice=64 (standard -9) with dictFor's converged dict: much lower
+	// time and memory. dict caps at 16MiB (see dictFor): beyond that ratio gain is
+	// <0.03% while memory/time jump.
+	// v8e: takes io.Reader — the solid stream lives in a temp file, xz reads it as a
+	// stream instead of loading the whole stream into memory.
 	cmd := exec.Command(xzbin, "-c", "-", "--lzma2=preset=9,dict="+dict+",nice=64,lc="+lc+",lp=0,pb="+pb)
 	cmd.Stdin = r
-	// stdout 与 stderr 必须是两个 buffer。此前两者共用一个, 于是 xz 往 stderr
-	// 写的任何东西(哪怕只是一条无害警告)都会被拼进压缩流 —— 打包照样"成功",
-	// 归档凭空大几十字节, 直到解包时才报 invalid header magic bytes。
-	// 数据损坏是静默发生的, 所以这里分开接: stdout 是数据, stderr 只用于诊断。
+	// stdout and stderr must be separate buffers. They used to share one, so anything
+	// xz wrote to stderr (even a harmless warning) got appended to the compressed
+	// stream — pack "succeeded", the archive silently grew by dozens of bytes, and the
+	// failure surfaced only at unpack as invalid header magic bytes. Corruption was
+	// silent, hence the split: stdout is data, stderr is diagnostic only.
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errb
 	if err := cmd.Run(); err != nil || out.Len() == 0 {
-		reason := "系统 xz 执行失败"
+		reason := "system xz failed"
 		if msg := bytes.TrimSpace(errb.Bytes()); len(msg) > 0 {
-			reason += "(xz 说: " + string(msg) + ")"
+			reason += " (xz says: " + string(msg) + ")"
 		}
 		warnXZFallback(reason)
 		return nil
@@ -277,8 +303,10 @@ func (b *backend) xzCompress(r io.Reader, lc, pb, dict string) []byte {
 	return out.Bytes()
 }
 
-// 中小数据(单流)选参: 对全流试 pb=2/4, 选最小者并**直接复用其压缩结果**(不重复压),
-// 同时记录胜出参数供后续(如 mmt 分组)使用。基于全流真实结果, 比采样更可靠; 代价 2 次全流压缩。
+// Small/medium data (single stream) parameter selection: trial pb=2/4 on the full
+// stream, keep the smaller and **reuse its compressed output** (no recompression),
+// recording the winning parameter for later use (e.g. mmt groups). Based on the real
+// full-stream result, more reliable than sampling; costs 2 full-stream compressions.
 
 func (b *backend) compressLZMA2Best(cb []byte) []byte {
 	if b.spec.backend != "lzma2" {
@@ -311,7 +339,8 @@ func (b *backend) compressLZMA2Best(cb []byte) []byte {
 	return best
 }
 
-// 等距采样(从内存切片): 旧版 tuneLZMA2 用; v8e 改用 stridedSampleFrom(文件源)
+// Evenly spaced sampling (in-memory slice): used by the old tuneLZMA2; v8e moved to
+// stridedSampleFrom (file source)
 
 func stridedSample(b []byte, max int) []byte {
 	if len(b) <= max {
@@ -358,8 +387,9 @@ func (b *backend) compress(cb []byte) []byte {
 		}
 		return b.zEnc.EncodeAll(cb, nil)
 	}
-	// lzma2 档: 系统 xz (lzma2, xz 容器) 取得接近 7z 的极高压缩率; 缺失则回退 ulikunitz xz。
-	// 精调 lzma2 参数(dict/nice/lc/lp/pb) + dict 按量收敛, 比 -9e 预设再小约 0.34%, 同速。
+	// lzma2 mode: system xz (lzma2, xz container) reaches near-7z extreme ratios;
+	// ulikunitz xz is the fallback. Tuned lzma2 params (dict/nice/lc/lp/pb) + converged
+	// dict beat the -9e preset by ~0.34% at the same speed.
 	if b.spec.backend == "lzma2" {
 		if out := b.xzCompress(bytes.NewReader(cb), b.lcParam, b.pbParam, b.dictParam); out != nil {
 			return out
@@ -377,13 +407,14 @@ func (b *backend) compress(cb []byte) []byte {
 		}
 		return buf.Bytes()
 	}
-	fatal("未知后端 %s", b.spec.backend)
+	fatal("unknown backend %s", b.spec.backend)
 	return nil
 }
 
-// 流式压缩固实流(zstd 档: fast/best): 从 io.Reader 逐段读入喂给 zstd 编码器,
-// 内存只留"单块 + 编码器状态", 不再把整条固实流(可达数百 MiB)读进内存。
-// 输出单条 zstd 帧(frame 经解码还原整条固实流), 解包逻辑不变。
+// Stream-compress the solid stream (zstd modes: fast/best): feed the zstd encoder
+// from an io.Reader segment by segment; memory holds only "one chunk + encoder state"
+// instead of the whole solid stream (can be hundreds of MiB). Output is a single zstd
+// frame (decoding restores the whole stream); unpack logic is unchanged.
 func (b *backend) compressZstdStream(r io.Reader) []byte {
 	var buf bytes.Buffer
 	var enc *zstd.Encoder
@@ -403,21 +434,26 @@ func (b *backend) compressZstdStream(r io.Reader) []byte {
 		enc, err = zstd.NewWriter(&buf, opts...)
 	}
 	if err != nil {
-		fatal("zstd 流式编码器: %v", err)
+		fatal("zstd streaming encoder: %v", err)
 	}
 	if _, err := io.Copy(enc, r); err != nil {
-		fatal("zstd 流式压缩: %v", err)
+		fatal("zstd streaming compress: %v", err)
 	}
 	if err := enc.Close(); err != nil {
-		fatal("zstd 关闭: %v", err)
+		fatal("zstd close: %v", err)
 	}
 	return buf.Bytes()
 }
 
-// 并行固实分组压缩(max 档): 把可压块按序分 G 组, 每组并行调 xz 压成独立帧, 顺序拼接回单流。
-// 段间冗余丢失 -> 压率略损, 但打包速度数倍提升。解压仍为整流(多 xz 帧串联), 格式不变。
-// 注意: 数据来自 solid(打包阶段写好的固实缓冲), 不再读 cm.data —— v8 的 cm.data=nil 释放后 cm.data 已为空,
-// 若此处读 c.data 会得到空组 -> 空帧 -> 解包越界panic。这是 mmt 路径在此前(v8)被引入的回归, 仅大语料(>=64MiB)触发。
+// Parallel solid grouping (max mode): split compressible chunks into G groups in
+// order, compress each group with xz in parallel into its own frame, concatenate back
+// into one stream. Losing cross-segment redundancy costs a little ratio for a
+// multi-fold speedup. Decompression is still one stream (serial xz frames); format
+// unchanged.
+// Note: data comes from the solid temp file, not cm.data — after v8 set cm.data=nil
+// it is empty, and reading c.data here would yield empty groups -> empty frames ->
+// out-of-range panic at unpack. That regression hit the mmt path in v8 and only
+// triggers on large corpora (>=64MiB).
 
 func (b *backend) compressMT(chunks []*chunkMeta, solid io.ReaderAt, solidSize int64) []byte {
 	var comp []*chunkMeta
@@ -456,7 +492,7 @@ func (b *backend) compressMT(chunks []*chunkMeta, solid io.ReaderAt, solidSize i
 		last := comp[e-1]
 		end := last.offset + uint64(last.uncomp)
 		buf := make([]byte, end-start)
-		mustReadAt(solid, buf, int64(start), "固实流(并行分组)")
+		mustReadAt(solid, buf, int64(start), "solid stream (parallel groups)")
 		local := map[*chunkMeta]uint64{}
 		base := start
 		for _, c := range comp[i:e] {
@@ -490,14 +526,16 @@ func concatChunksFile(cs []*chunkMeta, solid io.ReaderAt) []byte {
 	var buf bytes.Buffer
 	for _, c := range cs {
 		seg := make([]byte, c.uncomp)
-		mustReadAt(solid, seg, int64(c.offset), "固实流(单流拼接)")
+		mustReadAt(solid, seg, int64(c.offset), "solid stream (single-stream concat)")
 		buf.Write(seg)
 	}
 	return buf.Bytes()
 }
 
-// 按指定 lzma2 字典压缩(并行分组用): 组越小字典越小 -> xz 子进程内存随组大小线性下降。
-// 系统 xz 缺失时回退 ulikunitz。xz 帧自描述(字典嵌帧头), 解压无需记参, 格式不变。
+// Compress with a given lzma2 dict (parallel groups): smaller group -> smaller dict ->
+// xz subprocess memory scales down with group size. Falls back to ulikunitz when
+// system xz is missing. xz frames are self-describing (dict in the frame header), so
+// decompression needs no remembered parameters; format unchanged.
 
 func (b *backend) compressLZMA2Dict(cb []byte, dict string) []byte {
 	if b.spec.backend != "lzma2" {
@@ -523,8 +561,9 @@ func (b *backend) compressLZMA2Dict(cb []byte, dict string) []byte {
 	return buf.Bytes()
 }
 
-// maxOut: 期望的输出上限, 只 CM 需要(zstd/lzma2 有流结束标记, 自己会停)。
-// CM 帧头的长度字段是归档里给的, 改坏了会让解码器跑到地老天荒 —— 见 cmDecompressTo。
+// maxOut: expected output bound; only CM needs it (zstd/lzma2 stop at their own
+// end-of-stream markers). The CM frame's length field comes from the archive; a
+// corrupted value makes the decoder run forever — see cmDecompressTo.
 func (b *backend) decompress(frame []byte, maxOut int64) []byte {
 	if b.spec.backend == "cm" {
 		return cmDecompress(frame, maxOut)
@@ -554,9 +593,11 @@ func (b *backend) decompress(frame []byte, maxOut int64) []byte {
 	return out
 }
 
-// 流式解压: 返回一个按后端封装好的 reader, 供"边解压边落盘"使用。
-// 与 decompress(整份在内存) 的区别在于输出不再要求常驻 —— 这是解包侧内存有界的前提。
-// 返回的 closeFn 负责释放解码器资源(zstd 会起后台 goroutine), 可为 nil。
+// Streaming decompression: returns a backend-wrapped reader for "decompress while
+// writing to disk". Unlike decompress (whole output in memory), the output never
+// needs to be resident — the premise of bounded memory on the unpack side. The
+// returned closeFn releases decoder resources (zstd spawns a background goroutine);
+// may be nil.
 
 func (b *backend) decompressReader(r io.Reader, maxOut int64) (io.Reader, func(), error) {
 	switch b.spec.backend {
@@ -598,7 +639,8 @@ type archive struct {
 	be        *backend
 	dataStart int64
 
-	// 归档文件句柄: 原样区/数据区按需 ReadAt, 不再整段读进内存
+	// archive file handle: raw/data regions read on demand via ReadAt, never fully
+	// loaded into memory
 	src         *os.File
 	compLen     int64 // 压缩帧字节数
 	metaCompLen int64 // 元数据帧压缩后长度
@@ -606,30 +648,33 @@ type archive struct {
 	rawOff      int64 // 原样区在归档文件中的偏移
 	rawLen      int64
 
-	// 固实流解压结果落临时文件(与打包侧 v8e 对称), 且**惰性解压**:
-	// 只有真正要读某个块时才解压到该块末尾为止。
-	// 此前 openArchive 无条件把整条固实流 + 原样区解进内存 —— list 一个归档
-	// 要吃掉全量数据的内存, extract 单个小文件也要解压整条流。
+	// Decompressed solid stream lands in a temp file (symmetric with pack-side v8e),
+	// and **lazily**: only decompress up to the chunk being read. openArchive used to
+	// unconditionally decompress the whole solid stream + raw region into memory —
+	// listing one archive ate memory proportional to all its data, and extracting one
+	// small file decompressed the entire stream.
 	solidFile *os.File
 	solidR    io.Reader // 解压器(保留以便续解压)
 	solidSize int64     // 已解压字节数
 	solidEOF  bool      // 流已到底
 
-	// 固实流**总的**未压缩大小(各非原样块 uncomp 之和)。CM 解码需要它当上限:
-	// CM 帧头声明的长度不可信, 改坏了能让解码器跑到挂死。老格式算不出时为 0,
-	// cmDecompressTo 会退回一个宽松的绝对上限。
+	// Total **uncompressed** size of the solid stream (sum of uncomp across
+	// non-stored chunks). CM decoding needs it as a bound: the CM frame header's
+	// declared length is untrusted and can hang the decoder if corrupted. 0 when the
+	// old format cannot compute it; cmDecompressTo falls back to a loose absolute cap.
 	solidUncomp int64
 
-	// 解包进度(与打包侧的进度对称): 只写 stderr, 不污染 stdout 的机器可读输出
+	// unpack progress (symmetric with pack side): stderr only, keeps stdout machine-readable
 	progShow  bool
 	progDone  uint64
 	progLast  uint64
 	progTotal uint64
 	overwrote int // 本次解包改写掉的、输出目录里已存在的条目数
 
-	// 目录条目的权限/时间戳不能"边解边设": 往目录里写文件会把它的 mtime 改成
-	// "现在", 提前 chmod 成只读(0555)更会让后面的子文件写不进去。都推到最后
-	// 统一落地(见 applyDirMeta)。
+	// Directory permission/timestamps cannot be applied as entries are extracted:
+	// writing files into a directory bumps its mtime to "now", and chmod-ing it
+	// read-only (0555) early blocks later child files. All deferred to the end
+	// (see applyDirMeta).
 	dirTodos []dirTodo
 
 	chunks    []chunkMeta
@@ -640,7 +685,7 @@ type archive struct {
 	rawHash   [8]byte
 }
 
-// 待补的目录元数据(权限 + mtime)
+// deferred directory metadata (mode + mtime)
 type dirTodo struct {
 	path string
 	mode uint32

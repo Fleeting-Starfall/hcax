@@ -1,6 +1,7 @@
 package main
 
-// 解包侧: 打开归档、惰性展开固实流、还原文件/目录/符号链接/硬链接。
+// Unpack side: open the archive, lazily expand the solid stream, restore
+// files/directories/symlinks/hard links.
 
 import (
 	"bytes"
@@ -22,19 +23,20 @@ func openArchive(path string) *archive {
 	if err != nil {
 		fatal("open %s: %v", path, err)
 	}
-	// 句柄需在整个解包过程存活(原样区/数据区按需 ReadAt), 故不能用 defer 关闭:
-	// defer 在 fatal(os.Exit) 下不执行, 交给统一清理钩子。
+	// The handle must live through the whole unpack (raw/data regions are ReadAt on
+	// demand), so it cannot be defer-closed: defer does not run under fatal(os.Exit),
+	// hand it to the unified cleanup hooks.
 	addCleanup(func() { f.Close() })
 	hdr := make([]byte, 48)
 	if _, err := io.ReadFull(f, hdr[:8]); err != nil {
-		fatal("读头失败: %v", err)
+		fatal("read header: %v", err)
 	}
 	if string(hdr[0:4]) != magic {
-		fatal("不是 HCAX 文件")
+		fatal("not a HCAX file")
 	}
 	ver := hdr[4]
 	if ver < 2 || ver > version {
-		fatal("版本不兼容: %d", ver)
+		fatal("unsupported version: %d", ver)
 	}
 	spec := modeSpec{code: hdr[5], window: int(hdr[6])}
 	for _, m := range modes {
@@ -44,10 +46,10 @@ func openArchive(path string) *archive {
 	}
 	be := newBackend(spec)
 
-	// ================= v6/v7: 压缩元数据 + 精简块表 =================
+	// ================= v6/v7: compressed metadata + compact chunk table =================
 	if ver >= 6 {
 		if _, err := io.ReadFull(f, hdr[8:48]); err != nil {
-			fatal("读头(v6+)失败: %v", err)
+			fatal("read header (v6+) failed: %v", err)
 		}
 		metaCompLen := binary.LittleEndian.Uint64(hdr[8:16])
 		metaRawLen := binary.LittleEndian.Uint64(hdr[16:24])
@@ -63,7 +65,7 @@ func openArchive(path string) *archive {
 		checkTailMagic(f, rawOff+int64(rawLen))
 		checkHeaderBounds(f, metaCompLen, metaRawLen, compLen, rawLen, nChunks, nFiles)
 
-		// 1) 先装载训练字典(元数据帧可能就是用该字典压的)
+		// 1) Load the training dict first (the metadata frame may have been compressed with it)
 		if _, err := f.Seek(dictOff, io.SeekStart); err == nil {
 			var dc uint32
 			if binary.Read(f, binary.LittleEndian, &dc) == nil {
@@ -85,22 +87,25 @@ func openArchive(path string) *archive {
 				}
 			}
 		}
-		// 2) 解压并解析元数据
+		// 2) Decompress and parse metadata
 		f.Seek(metaOff, io.SeekStart)
 		metaFrame := make([]byte, metaCompLen)
 		if _, err := io.ReadFull(f, metaFrame); err != nil {
-			fatal("读元数据失败: %v", err)
+			fatal("read metadata: %v", err)
 		}
-		// 元数据区的未压缩长度是头部里的 metaRawLen, 是个**精确**的期望值 ——
-		// 传给 CM 当上限, 免得它照着被改坏的帧头长度一直解码下去。
+		// The metadata region's uncompressed length is metaRawLen from the header, an
+		// **exact** expectation — handed to CM as a bound so a corrupted frame header
+		// cannot drive it forever.
 		metaRaw := be.decompress(metaFrame, int64(metaRawLen))
 		if uint64(len(metaRaw)) != metaRawLen {
-			fatal("元数据长度不符: 期望 %d 实际 %d", metaRawLen, len(metaRaw))
+			fatal("metadata length mismatch: expected %d got %d", metaRawLen, len(metaRaw))
 		}
 		chunks, files, sh, rh := parseMeta(metaRaw, nChunks, nFiles, ver)
-		// 3) 数据区: 只记录位置, 不读不解压 —— 按需(惰性)解压见 ensureSolid
-		// 固实流的未压缩大小 = 所有**非原样**块的 uncomp 之和(原样块在原样区)。
-		// 这也是个精确值, 给 CM 当解码上限用 —— 否则损坏的 text 归档会让它跑到挂死。
+		// 3) Data region: record positions only, no reading/decompression — lazy
+		//    expansion lives in ensureSolid
+		// The solid stream's uncompressed size = sum of uncomp across all **non-stored**
+		// chunks (stored chunks live in the raw region). Also an exact value, used as the
+		// CM decode bound — otherwise a damaged text archive would make it run forever.
 		var solidUncomp uint64
 		for _, c := range chunks {
 			if !c.stored {
@@ -117,9 +122,9 @@ func openArchive(path string) *archive {
 		return a
 	}
 
-	// ================= 旧版本 v2..v5 =================
+	// ================= legacy versions v2..v5 =================
 	if _, err := io.ReadFull(f, hdr[8:24]); err != nil {
-		fatal("读头失败: %v", err)
+		fatal("read header: %v", err)
 	}
 	compLen := binary.LittleEndian.Uint64(hdr[8:16])
 	var rawLen uint64
@@ -128,7 +133,7 @@ func openArchive(path string) *archive {
 	if ver >= 3 {
 		rawLen = binary.LittleEndian.Uint64(hdr[16:24])
 		if _, err := io.ReadFull(f, hdr[24:32]); err != nil {
-			fatal("读头(v3+)失败: %v", err)
+			fatal("read header (v3+) failed: %v", err)
 		}
 		nChunks = binary.LittleEndian.Uint32(hdr[24:28])
 		nFiles = binary.LittleEndian.Uint32(hdr[28:32])
@@ -139,10 +144,12 @@ func openArchive(path string) *archive {
 		dataStart = 24
 	}
 
-	// 同样在读数据区之前先确认文件没被截断(v2~v5 的尾部布局与 v6+ 一致)
+	// Confirm the file is not truncated before reading the data region (v2~v5 share
+	// the v6+ trailer layout)
 	checkTailMagic(f, dataStart+int64(compLen)+int64(rawLen))
 
-	// 先解析块表/文件表, 定位 v5 dict 区; 训练字典必须在解压帧之前装载(否则 zstd 报 unknown dictionary)
+	// Parse the chunk/file tables first to locate the v5 dict region; the training
+	// dict must be loaded before any frame decompression (else zstd reports unknown dictionary)
 	ctOff := dataStart + int64(compLen) + int64(rawLen)
 	f.Seek(ctOff, io.SeekStart)
 	chunks := make([]chunkMeta, nChunks)
@@ -171,7 +178,7 @@ func openArchive(path string) *archive {
 			chunks[i].dictID = cb[30]
 		}
 	}
-	// file table (同时累计长度用于定位 dict 区)
+	// file table (also accumulating length to locate the dict region)
 	var ftLen int64
 	files := make([]fileEntry, nFiles)
 	for i := range files {
@@ -194,7 +201,7 @@ func openArchive(path string) *archive {
 		}
 		files[i] = fileEntry{name: string(nb), size: size, mtime: mtime, mode: mode, chunks: idxs}
 	}
-	// dict region (仅 v5): 必须在解压帧之前装载
+	// dict region (v5 only): must be loaded before any frame decompression
 	if ver == 5 {
 		dictOff := ctOff + int64(ctEntry)*int64(nChunks) + ftLen
 		f.Seek(dictOff, io.SeekStart)
@@ -214,7 +221,8 @@ func openArchive(path string) *archive {
 		}
 	}
 
-	// 数据区同样只记位置(惰性解压): 旧版布局为 [数据区][原样区][块表][文件表][字典区]
+	// Data region likewise records positions only (lazy): legacy layout is
+	// [data][raw][chunk table][file table][dict region]
 	a := &archive{spec: spec, be: be, src: f, dataStart: dataStart,
 		compLen: int64(compLen), rawOff: dataStart + int64(compLen), rawLen: int64(rawLen),
 		chunks: chunks, files: files, hashLen: 16, ver: ver}
@@ -230,18 +238,18 @@ func checkTailMagic(f *os.File, dataEnd int64) {
 	}
 	sz := fi.Size()
 	if sz < 48+trailerLen {
-		fatal("归档过短(%d B): 不是完整的 HCAX 文件", sz)
+		fatal("archive too short (%d B): not a complete HCAX file", sz)
 	}
 	off := sz - trailerLen
 	if dataEnd > off {
-		fatal("归档被截断: 数据区需延伸到 %d B, 但文件只有 %d B", dataEnd, sz)
+		fatal("archive truncated: data extends to %d B but the file is only %d B", dataEnd, sz)
 	}
 	tb := make([]byte, 4)
 	if _, err := f.ReadAt(tb, off); err != nil {
-		fatal("读尾部失败: %v", err)
+		fatal("read trailer: %v", err)
 	}
 	if string(tb) != trailerMag {
-		fatal("尾部魔数不符: 归档被截断或损坏(尾部 %d 字节处不是 %s)", off, trailerMag)
+		fatal("trailer magic mismatch: archive truncated or corrupt (offset %d is not %s)", off, trailerMag)
 	}
 }
 
@@ -252,26 +260,27 @@ func checkHeaderBounds(f *os.File, metaCompLen, metaRawLen, compLen, rawLen uint
 	}
 	sz := uint64(fi.Size())
 	if metaCompLen > sz || compLen > sz || rawLen > sz {
-		fatal("头部长度字段异常(归档损坏): metaComp=%d comp=%d raw=%d, 文件仅 %d B",
+		fatal("header length fields invalid (corrupt archive): metaComp=%d comp=%d raw=%d, file is only %d B",
 			metaCompLen, compLen, rawLen, sz)
 	}
 	if 48+metaCompLen+compLen+rawLen+20 > sz {
-		fatal("头部布局超出文件大小(归档损坏或截断)")
+		fatal("header layout exceeds file size (corrupt or truncated archive)")
 	}
 	if metaRawLen > 1<<30 {
-		fatal("元数据长度异常(%d B): 归档损坏", metaRawLen)
+		fatal("metadata length invalid (%d B): corrupt archive", metaRawLen)
 	}
 	// 块表项至少 5B, 文件表项至少 21B —— 据此给条目数设上界
 	if uint64(nChunks)*5 > metaRawLen || uint64(nFiles)*16 > metaRawLen {
-		fatal("头部条目数与元数据长度矛盾(nChunks=%d nFiles=%d, 元数据 %d B): 归档损坏",
+		fatal("header counts contradict metadata length (nChunks=%d nFiles=%d, metadata %d B): corrupt archive",
 			nChunks, nFiles, metaRawLen)
 	}
 }
 
-// 逻辑一致性: 每个文件声明的 size 必须等于它引用的块长度之和。
-// 光校验"数据区字节流没变"是不够的 —— "哪个文件由哪些块拼成"存在元数据里,
-// 它若被改坏(比如 size 字段翻掉一位), 流哈希照样对得上, verify 却报"通过",
-// 于是拿着一个自相矛盾的归档当完好。这条检查只是做加法, 代价极小。
+// Logical consistency: every file's declared size must equal the sum of its referenced
+// chunk lengths. Verifying "the data stream bytes are unchanged" is not enough — the
+// mapping "which chunks form which file" lives in metadata; if corrupted (e.g. a
+// flipped bit in size), the stream hash still matches and verify reports "OK", leaving
+// a self-contradictory archive treated as intact. This check is just addition; cheap.
 func (a *archive) checkLogical() {
 	for _, fe := range a.files {
 		if fe.isDir || fe.isLink {
@@ -282,13 +291,13 @@ func (a *archive) checkLogical() {
 			sum += uint64(a.chunks[ix].uncomp)
 		}
 		if sum != fe.size {
-			fatal("元数据与数据自相矛盾: 文件 %s 声明 %d B, 但它引用的块合计 %d B",
+			fatal("metadata contradicts data: file %s declares %d B but its chunks total %d B",
 				fe.name, fe.size, sum)
 		}
 	}
 }
 
-// 条目数一致性校验: 尾部记录的 nFiles/nChunks 必须与头部一致(解析元数据后调用)
+// Entry-count consistency: the trailer's nFiles/nChunks must match the header (call after parsing metadata)
 func (a *archive) checkCounts() {
 	const trailerLen = 20
 	fi, err := a.src.Stat()
@@ -297,18 +306,19 @@ func (a *archive) checkCounts() {
 	}
 	tb := make([]byte, trailerLen)
 	if _, err := a.src.ReadAt(tb, fi.Size()-trailerLen); err != nil {
-		fatal("读尾部失败: %v", err)
+		fatal("read trailer: %v", err)
 	}
 	nf := binary.LittleEndian.Uint32(tb[12:16])
 	nc := binary.LittleEndian.Uint32(tb[16:20])
 	if nf != uint32(len(a.files)) || nc != uint32(len(a.chunks)) {
-		fatal("尾部与头部不一致(文件数 %d≠%d 或 块数 %d≠%d): 归档已损坏",
+		fatal("trailer disagrees with header (files %d!=%d or chunks %d!=%d): corrupt archive",
 			nf, len(a.files), nc, len(a.chunks))
 	}
 }
 
-// addProgress 累加已解出字节并按阈值回报进度。
-// 解包几百 MB 的归档要跑几十秒, 全程无反馈跟卡死没区别(打包侧早就有了, 解包侧一直缺)。
+// addProgress accumulates decompressed bytes and reports at thresholds. Unpacking
+// hundreds of MB takes tens of seconds; total silence reads as a hang (pack side has
+// had this for a while; unpack side was missing it).
 func (a *archive) addProgress(n uint64) {
 	if !a.progShow || a.progTotal == 0 || a.progDone >= a.progTotal {
 		return // 已报完 100% 就别再打了(后续 0 字节的目录条目还会进来)
@@ -316,7 +326,7 @@ func (a *archive) addProgress(n uint64) {
 	a.progDone += n
 	if a.progDone-a.progLast >= 16<<20 || a.progDone >= a.progTotal {
 		a.progLast = a.progDone
-		fmt.Fprintf(os.Stderr, "\r  解包中 %.0f%%   ", 100.0*float64(a.progDone)/float64(a.progTotal))
+		fmt.Fprintf(os.Stderr, "\r  extracting %.0f%%   ", 100.0*float64(a.progDone)/float64(a.progTotal))
 		if a.progDone >= a.progTotal {
 			fmt.Fprintln(os.Stderr)
 		}
@@ -350,7 +360,7 @@ func (a *archive) ensureSolid(need uint64) {
 			fr := io.NewSectionReader(a.src, a.dataStart, a.compLen)
 			r, closeFn, err = a.be.decompressReader(fr, a.solidUncomp)
 			if err != nil {
-				fatal("解压器: %v", err)
+				fatal("decompressor: %v", err)
 			}
 		}
 		a.solidR = r
@@ -365,20 +375,21 @@ func (a *archive) ensureSolid(need uint64) {
 		if err == io.EOF {
 			a.solidEOF = true
 		} else {
-			fatal("解压固实流: %v", err)
+			fatal("decompress solid stream: %v", err)
 		}
 	}
 }
 
-// 把固实流完整解压到底(校验等需要全量数据的场景)
+// Decompress the solid stream fully (verification and other full-data scenarios)
 func (a *archive) drainSolid() {
 	for !a.solidEOF {
 		a.ensureSolid(uint64(a.solidSize) + 1<<20)
 	}
 }
 
-// 预先解压到"这批文件所需的最大偏移", 使后续 readChunk 不再触发解压。
-// 抽取归档前部的少量文件时, 可省掉解压整条流的开销。
+// Pre-decompress up to the max offset needed by this batch of files, so later
+// readChunk calls never trigger decompression. Extracting a few early files skips the
+// cost of decompressing the whole stream.
 func (a *archive) prepareFor(files []fileEntry) {
 	var maxEnd uint64
 	for _, fe := range files {
@@ -404,31 +415,32 @@ func (a *archive) readChunk(idx uint32, verify bool) []byte {
 	cm := a.chunks[idx]
 	out := make([]byte, cm.uncomp)
 	if cm.stored {
-		// 原样区不解压, 直接从归档文件按偏移读 —— 零额外内存
+		// Raw region: no decompression, read straight from the archive by offset —
+		// zero extra memory
 		if _, err := a.src.ReadAt(out, a.rawOff+int64(cm.offset)); err != nil {
-			fatal("读原样区: %v", err)
+			fatal("read raw region: %v", err)
 		}
 	} else {
 		a.ensureSolid(cm.offset + uint64(cm.uncomp))
 		if _, err := a.solidFile.ReadAt(out, int64(cm.offset)); err != nil {
-			fatal("读固实流: %v", err)
+			fatal("read solid stream: %v", err)
 		}
 	}
 	out = applyXform(cm.xform, out, true)
-	if verify && a.hashLen > 0 { // 旧版: 逐块校验; v6 走流级校验(verifyStream)
+	if verify && a.hashLen > 0 { // legacy: per-chunk verify; v6 uses stream-level (verifyStream)
 		h := hash16(out)
 		n := a.hashLen
 		if n > 16 {
 			n = 16
 		}
 		if !bytes.Equal(h[:n], cm.hash[:n]) {
-			fatal("块 %d 校验失败(哈希不匹配)", idx)
+			fatal("chunk %d verify failed (hash mismatch)", idx)
 		}
 	}
 	return out
 }
 
-// 流级校验(v6): 校验解压后的固实流与原样区
+// Stream-level verification (v6): checks the decompressed solid stream and raw region
 func (a *archive) verifyStream() {
 	if a.hashLen != 0 {
 		return
@@ -438,35 +450,37 @@ func (a *archive) verifyStream() {
 		a.solidFile.Seek(0, io.SeekStart)
 		h := hashReader(a.solidFile)
 		if !bytes.Equal(h[:8], a.solidHash[:]) {
-			fatal("固实流校验失败(数据损坏)")
+			fatal("solid stream verify failed (data corruption)")
 		}
 	}
 	if a.rawLen > 0 {
 		h := hashReader(io.NewSectionReader(a.src, a.rawOff, a.rawLen))
 		if !bytes.Equal(h[:8], a.rawHash[:]) {
-			fatal("原样区校验失败(数据损坏)")
+			fatal("raw region verify failed (data corruption)")
 		}
 	}
 }
 
 func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	if !safeName(fe.name) {
-		fatal("非法路径: %s", fe.name)
+		fatal("illegal path: %s", fe.name)
 	}
 	defer a.addProgress(fe.size) // 所有 return 分支都要计入进度
 	target := joinOut(outDir, fe.name)
-	// 覆盖计数: 解到非空目录时会静默改写同名条目。tar 也这样, 但至少该让人知道
-	// "这次解包动了多少已有的东西" —— 否则误以为解进了空目录, 事后发现被改了都不知道。
-	// 目录条目不计: MkdirAll 对已存在的目录是空操作(不是改写), 而且目录往往会
-	// 因为"先给文件建父目录"而提前存在, 算进去会把首次解包也报成覆盖。
+	// Overwrite count: unpacking into a non-empty dir silently replaces same-named
+	// entries. tar does too, but the user should know "how much existing state this
+	// unpack touched" — otherwise they assume an empty dir and never notice later.
+	// Dir entries are excluded: MkdirAll on an existing dir is a no-op (not a replace),
+	// and dirs usually already exist from creating file parents, counting them would
+	// flag first-time unpacks as overwrites.
 	if !fe.isDir {
 		if _, err := os.Lstat(target); err == nil {
 			a.overwrote++
 		}
 	}
-	// 目录条目(含空目录): 先按可写权限建出来, 权限与 mtime 记下来,
-	// 等所有条目(含它下面的文件)都写完再统一补 —— 否则往里写文件既写不进
-	// (只读目录), 也会把 mtime 冲成"现在"。
+	// Directory entries (incl. empty dirs): create writable first, remember mode and
+	// mtime, apply after all entries (including child files) are written — otherwise
+	// writing files fails (read-only dir) and mtime is bumped to "now".
 	if fe.isDir {
 		if err := mkdirUnderOut(outDir, target); err != nil {
 			fatal("mkdir: %v", err)
@@ -474,8 +488,9 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 		a.dirTodos = append(a.dirTodos, dirTodo{path: target, mode: fe.mode, nano: entryNano(fe)})
 		return
 	}
-	// 符号链接(v9): 重建链接本身, 不写内容。
-	// 注: Go 标准库没有 lutimes, 链接自身的 mtime 无法还原(只还原普通文件/目录的)。
+	// Symlink (v9): rebuild the link itself, no content.
+	// Note: Go's stdlib has no lutimes, so a link's own mtime cannot be restored
+	// (only regular files/dirs get theirs).
 	if fe.isLink {
 		if err := mkdirUnderOut(outDir, filepath.Dir(target)); err != nil {
 			fatal("mkdir: %v", err)
@@ -489,9 +504,10 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	if err := mkdirUnderOut(outDir, filepath.Dir(target)); err != nil {
 		fatal("mkdir: %v", err)
 	}
-	// 硬链接(v11): 尽量还原成共享 inode 的硬链接。
-	// 源不在这次解包范围内时(extract 只抽了一部分)退化成普通文件 —— 块索引还在,
-	// 内容照样完整, 不会解出一个空壳。
+	// Hard link (v11): restore as a shared-inode hard link when possible. If the
+	// source is outside this unpack's selection (extract of a subset), fall back to a
+	// regular file — the chunk indices are still there, content is complete, never a
+	// hollow shell.
 	if fe.isHard {
 		src := joinOut(outDir, fe.link)
 		if _, e := os.Lstat(src); e == nil {
@@ -501,9 +517,10 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 			}
 		}
 	}
-	// 防"先建链接再写穿": 归档里若先有条目在 target 处建了符号链接(比如 -> /etc),
-	// 后续同名文件条目经 os.Create 会跟随该链接写到链接指向的目录里去。
-	// 写文件前先把已存在的符号链接摘掉, 保证只会写解包目录内部。
+	// Prevent "write-through a pre-created link": if the archive places a symlink at
+	// target first (e.g. -> /etc), a later same-named file entry through os.Create
+	// would follow the link and write into the pointed-to directory. Remove any
+	// existing symlink before writing the file, keeping writes inside the unpack dir.
 	if li, e := os.Lstat(target); e == nil && li.Mode()&os.ModeSymlink != 0 {
 		os.Remove(target)
 	}
@@ -511,19 +528,22 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	if err != nil {
 		fatal("create %s: %v", target, err)
 	}
-	// Close 也要检查: 数据在内核页缓存里, Close 之前的 Write 成功不代表真的落盘
+	// Close must be checked too: data sits in kernel page cache; a successful Write
+	// before Close does not mean it hit the disk
 	defer func() {
 		if err := out.Close(); err != nil {
-			fatal("关闭 %s 失败(磁盘可能已满): %v", fe.name, err)
+			fatal("close %s failed (disk may be full): %v", fe.name, err)
 		}
 	}()
-	// 文件级光栅变换(v7): 变换跨块生效, 必须先拼出整文件再逆变换
+	// File-level raster transform (v7): the transform spans chunks, so assemble the
+	// whole file before inverting
 	if len(fe.chunks) > 0 && fe.xform >= xfRasterMed && fe.xform <= xfRasterRowRctMed {
-		// 这条路径要**整文件进内存**。打包侧有 rasterMaxBytes 门控, 写出来的归档
-		// 不可能超; 所以超限只可能是损坏或恶意构造(声明一个巨大的"光栅图",
-		// 内容全是零 —— 几 KB 的归档就能让人吃掉几十 GB 内存)。在读块之前挡掉。
+		// This path needs the **whole file in memory**. Pack side gates on
+		// rasterMaxBytes, so a written archive cannot exceed it; exceeding it means
+		// corruption or malice (declare a huge "raster", content all zeros — a few KB
+		// of archive can make someone eat tens of GB of RAM). Reject before reading chunks.
 		if fe.size > rasterMaxBytes {
-			fatal("文件 %s 声明 %d B, 超过光栅变换上限(%d B): 归档损坏",
+			fatal("file %s declares %d B, over the raster transform cap (%d B): corrupt archive",
 				fe.name, fe.size, rasterMaxBytes)
 		}
 		buf := []byte{}
@@ -531,10 +551,10 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 			buf = append(buf, a.readChunk(ix, verify)...)
 		}
 		if !rasterApply(fe.xform, buf, false) {
-			fatal("文件 %s: 光栅逆变换失败", fe.name)
+			fatal("file %s: raster inverse transform failed", fe.name)
 		}
 		if uint64(len(buf)) != fe.size {
-			fatal("文件 %s 大小不符: 期望 %d 实际 %d", fe.name, fe.size, len(buf))
+			fatal("file %s size mismatch: expected %d got %d", fe.name, fe.size, len(buf))
 		}
 		mustWrite(out, buf, fe.name)
 		os.Chmod(target, os.FileMode(fe.mode))
@@ -543,8 +563,10 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	}
 	if len(fe.chunks) > 0 {
 		first := a.readChunk(fe.chunks[0], verify)
-		// 兼容旧版(v2~v6): 旧归档无文件级变换记录, 按"BMP 一定做过二维预测"的规则逆运算。
-		// v7 起变换显式记录在 fe.xform, 不再走启发式(否则"故意不做变换"的文件会被误逆变换)。
+		// Legacy (v2~v6): old archives have no file-level transform record; invert
+		// assuming "BMP was 2-D predicted". Since v7 the transform is explicit in
+		// fe.xform — no heuristics (else files deliberately left untransformed would
+		// be wrongly inverted).
 		if a.ver < 7 && len(first) >= 2 && first[0] == 'B' && first[1] == 'M' {
 			buf := append([]byte{}, first...)
 			for _, ix := range fe.chunks[1:] {
@@ -554,7 +576,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 				pred2DLegacy(buf, false) // 旧版用的是二维梯度预测
 			}
 			if uint64(len(buf)) != fe.size {
-				fatal("文件 %s 大小不符: 期望 %d 实际 %d", fe.name, fe.size, len(buf))
+				fatal("file %s size mismatch: expected %d got %d", fe.name, fe.size, len(buf))
 			}
 			mustWrite(out, buf, fe.name)
 			os.Chmod(target, os.FileMode(fe.mode))
@@ -574,7 +596,7 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 			written2 += uint64(len(cb))
 		}
 		if written2 != fe.size {
-			fatal("文件 %s 大小不符: 期望 %d 实际 %d", fe.name, fe.size, written2)
+			fatal("file %s size mismatch: expected %d got %d", fe.name, fe.size, written2)
 		}
 		os.Chmod(target, os.FileMode(fe.mode))
 		os.Chtimes(target, entryTime(fe), entryTime(fe))
@@ -582,19 +604,19 @@ func (a *archive) extractFile(fe fileEntry, outDir string, verify bool) {
 	}
 	var written uint64
 	if written != fe.size {
-		fatal("文件 %s 大小不符: 期望 %d 实际 %d", fe.name, fe.size, written)
+		fatal("file %s size mismatch: expected %d got %d", fe.name, fe.size, written)
 	}
 	os.Chmod(target, os.FileMode(fe.mode))
 	os.Chtimes(target, entryTime(fe), entryTime(fe))
 }
 
-// 归一用户给出的抽取目标: 反斜杠按分隔符处理, 去掉结尾多余的分隔符,
-// 这样 "d/sub" 与 "d/sub/" 是同一个意思。
+// Normalize a user-supplied extract target: backslashes as separators, strip trailing
+// separators, so "d/sub" and "d/sub/" mean the same thing.
 func normAsk(s string) string {
 	s = filepath.ToSlash(s)
-	// 归档内的名字永远是相对的, 而 shell 补全/automation 拼出来的目标常常带
-	// "./" 甚至 "/" 前缀 —— 不归一化的话, 用户照着 ls 的输出粘过来反而抽不到,
-	// 报"没有匹配"还很让人困惑(明明 list 里就有)。
+	// In-archive names are always relative, but shell completion / automation often
+	// produces "./" or even "/" prefixes — without normalization, pasting an ls line
+	// extracts nothing and "no match" is baffling (the entry is right there in list).
 	for strings.HasPrefix(s, "./") {
 		s = s[2:]
 	}
@@ -606,13 +628,14 @@ func normAsk(s string) string {
 	return s
 }
 
-// 判断归档内的一个条目是否被用户的某个抽取目标命中。三种命中方式(由精确到宽松):
-//  1. 完整路径相等:   "d/sub/r.bin"
-//  2. 基名相等:       "r.bin"   —— 记不住全路径时的兜底
-//  3. 目录前缀:       "d/sub"   —— 抽出该子树(含子树下的目录条目)
+// Does an in-archive entry match one of the user's extract targets? Three match kinds
+// (precise to loose):
+//  1. full path equal:     "d/sub/r.bin"
+//  2. basename equal:      "r.bin"   — fallback when the full path is not remembered
+//  3. directory prefix:    "d/sub"   — extracts that subtree (incl. dir entries under it)
 //
-// 老实现只支持 1)2), 于是 extract 归档 d/sub 只会建出一个空的 d/sub 目录,
-// 里面的文件一个都没抽出来; 用户会以为命令成功、数据到手了。
+// The old implementation only supported 1)2), so extracting d/sub created an empty
+// d/sub dir while none of its files came out; the user assumed success and data in hand.
 func matchEntry(name, ask string) bool {
 	n := filepath.ToSlash(name)
 	if n == ask {
@@ -624,8 +647,9 @@ func matchEntry(name, ask string) bool {
 	return strings.HasPrefix(n, ask+"/")
 }
 
-// 用户指定的目标一个都没命中, 十有八九是拼错了 —— 静默"抽取完成: 0 文件"
-// 会让人误以为成功。全部落空直接报错; 部分落空只警告(批量抽取时常见)。
+// If no user target matched at all, it is almost certainly a typo — a silent
+// "extracted: 0 files" reads as success. Total miss errors out; partial miss warns
+// (common with batch extraction).
 func reportUnmatched(asks []string, hit map[string]bool) {
 	var miss []string
 	for _, p := range asks {
@@ -636,14 +660,14 @@ func reportUnmatched(asks []string, hit map[string]bool) {
 	if len(miss) == 0 {
 		return
 	}
-	msg := "归档中没有匹配 " + strings.Join(miss, ", ") + " 的条目"
+	msg := "no entries matching " + strings.Join(miss, ", ") + " in the archive"
 	if len(miss) == len(asks) {
-		fatal("%s(用 list 查看归档内的真实路径)", msg)
+		fatal("%s (use list to see real in-archive paths)", msg)
 	}
-	fmt.Fprintf(os.Stderr, "警告: %s\n", msg)
+	fmt.Fprintf(os.Stderr, "warning: %s\n", msg)
 }
 
-// 只有"够大"才显示进度: 小归档一闪而过, 进度反而成了噪音
+// Only show progress when "big enough": tiny archives flash by, progress is noise
 func (a *archive) setProgress(items []fileEntry) {
 	var tot uint64
 	for _, fe := range items {
@@ -656,8 +680,8 @@ func (a *archive) setProgress(items []fileEntry) {
 	a.progTotal = tot
 }
 
-// 目录的权限与 mtime 最后统一补(见 archive.dirTodos)。
-// 顺序: 深的在前 —— 万一某个父目录的权限挡住了子目录, 子目录已经先设完了。
+// Directory modes and mtimes are applied at the end (see archive.dirTodos).
+// Order: deepest first — if a parent's mode blocks a child dir, the child is already done.
 func (a *archive) applyDirMeta() {
 	todos := a.dirTodos
 	a.dirTodos = nil
@@ -667,31 +691,34 @@ func (a *archive) applyDirMeta() {
 	for _, d := range todos {
 		if d.mode != 0 {
 			if err := os.Chmod(d.path, os.FileMode(d.mode)); err != nil {
-				fmt.Fprintf(os.Stderr, "警告: 无法设置目录权限 %s: %v\n", d.path, err)
+				fmt.Fprintf(os.Stderr, "warning: cannot set directory mode %s: %v\n", d.path, err)
 			}
 		}
 		if d.nano != 0 {
 			t := time.Unix(0, d.nano)
 			if err := os.Chtimes(d.path, t, t); err != nil {
-				fmt.Fprintf(os.Stderr, "警告: 无法设置目录时间 %s: %v\n", d.path, err)
+				fmt.Fprintf(os.Stderr, "warning: cannot set directory time %s: %v\n", d.path, err)
 			}
 		}
 	}
 }
 
-// 在解包目录内建目录, 途中任何一段若是符号链接就先摘掉。
+// Create a directory inside the unpack dir, removing any symlink encountered along
+// the way.
 //
-// os.MkdirAll 会**跟随**符号链接: 恶意归档可以先放一个条目 link -> /etc(或 -> ../..),
-// 再放一个 "link/xxx" 的文件/目录条目, MkdirAll 就会顺着链接把目录建到解包目录
-// 外面去, 随后的 os.Create 也就写穿了。原先只在"写文件前检查 target 本身是不是
-// 链接", 挡不住"链接出现在路径中间"这一种。
+// os.MkdirAll **follows** symlinks: a malicious archive can place an entry
+// link -> /etc (or -> ../..) then a "link/xxx" file/dir entry; MkdirAll walks the
+// link and creates directories outside the unpack dir, and the subsequent os.Create
+// writes through. The old check only looked at whether target itself was a link
+// before writing files; it did not stop "a link in the middle of the path".
 //
-// 归档里出现"符号链接之下还有条目"本身就不合法(打包侧 Walk 不跟随链接, 写不出
-// 这种结构), 所以直接把挡路的链接摘掉, 与上面写文件时的处理保持一致。
+// "Entries under a symlink" is itself illegal in an archive (pack-side Walk does not
+// follow links, so it cannot produce such a structure); removing the blocking link is
+// therefore consistent with the file-write handling above.
 func mkdirUnderOut(outDir, target string) error {
 	root := filepath.Clean(outDir)
 	if target != root && !strings.HasPrefix(target, root+string(os.PathSeparator)) {
-		return fmt.Errorf("路径逃逸出解包目录: %s", target)
+		return fmt.Errorf("path escapes the unpack dir: %s", target)
 	}
 	cur := root
 	rest := strings.TrimPrefix(target, root)
@@ -713,7 +740,7 @@ func overwriteNote(n int) string {
 	if n == 0 {
 		return ""
 	}
-	return fmt.Sprintf("  (覆盖 %d 个已存在条目)", n)
+	return fmt.Sprintf("  (overwrote %d existing entries)", n)
 }
 
 func unpack(archivePath, outDir string, verify bool, only []string) {
@@ -724,13 +751,13 @@ func unpack(archivePath, outDir string, verify bool, only []string) {
 	os.MkdirAll(outDir, 0o755)
 	a.setProgress(a.files)
 	if len(only) == 0 {
-		// 全量解包: 顺序读取, 固实流按需推进即可
+		// Full unpack: read in order, the solid stream advances on demand
 		for _, fe := range a.files {
 			a.extractFile(fe, outDir, verify)
 		}
 		a.applyDirMeta()
 		runCleanups()
-		fmt.Printf("解包完成: %d 条目 -> %s  模式=%s 校验=%v%s\n",
+		fmt.Printf("unpacked: %d entries -> %s  mode=%s verify=%v%s\n",
 			len(a.files), outDir, modeName(a.spec.code), verify, overwriteNote(a.overwrote))
 		return
 	}
@@ -751,13 +778,14 @@ func unpack(archivePath, outDir string, verify bool, only []string) {
 	}
 	reportUnmatched(asks, hit)
 	a.setProgress(want)
-	// 只解到目标文件的块末尾为止: 抽归档前部的小文件不必解压整条固实流
+	// Only decompress up to the selected files' chunk ends: extracting a few early
+	// files need not decompress the whole solid stream
 	a.prepareFor(want)
 	for _, fe := range want {
 		a.extractFile(fe, outDir, verify)
 	}
 	a.applyDirMeta()
 	runCleanups()
-	fmt.Printf("抽取完成: %d 文件 -> %s  模式=%s 校验=%v%s\n",
+	fmt.Printf("extracted: %d files -> %s  mode=%s verify=%v%s\n",
 		len(want), outDir, modeName(a.spec.code), verify, overwriteNote(a.overwrote))
 }

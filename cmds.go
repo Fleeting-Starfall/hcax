@@ -1,6 +1,6 @@
 package main
 
-// 只读命令: list / info / verify —— 它们都不需要展开数据区。
+// Read-only commands: list / info / verify — none of them inflate the data region.
 
 import (
 	"fmt"
@@ -18,8 +18,9 @@ func modeName(code byte) string {
 	return "?"
 }
 
-// 归档里只存了权限位(0777)和 mtime, 类型由标志位决定 —— 拼回一个 os.FileMode
-// 只为借用它的 String() 打印 "drwxr-xr-x" 这种人眼一眼能读的形式。
+// The archive stores only permission bits (0777) and mtime; the entry type comes from
+// flags. Reconstruct an os.FileMode just to reuse its String() for readable output
+// like "drwxr-xr-x".
 func modeString(fe fileEntry) string {
 	m := os.FileMode(fe.mode)
 	switch {
@@ -31,7 +32,7 @@ func modeString(fe fileEntry) string {
 	return m.String()
 }
 
-// 人类可读的大小: 字节数在列表里一眼看不出量级(100000 还是 100000000?)
+// humanSize formats a byte count so its magnitude is obvious at a glance.
 func humanSize(n uint64) string {
 	const unit = 1024
 	if n < unit {
@@ -47,8 +48,8 @@ func humanSize(n uint64) string {
 
 func listArchive(archivePath string, long bool) {
 	a := openArchive(archivePath)
-	// 按路径排序: 打包顺序是 文件→目录→链接 三组分着来的, 直接打印看着是乱的。
-	// 只排副本, 不动 a.files —— 解包依赖其原顺序(固实流顺序读)。
+	// Sort by path: pack order groups files, dirs, then links, which looks arbitrary.
+	// Sort a copy only — unpack relies on a.files' original order (solid-stream order).
 	items := make([]fileEntry, len(a.files))
 	copy(items, a.files)
 	sort.Slice(items, func(i, j int) bool { return items[i].name < items[j].name })
@@ -73,9 +74,9 @@ func listArchive(archivePath string, long bool) {
 			suffix := ""
 			switch {
 			case fe.isLink:
-				suffix = " -> " + fe.link // 符号链接
+				suffix = " -> " + fe.link // symlink target
 			case fe.isHard:
-				suffix = " => " + fe.link // 硬链接: 指向归档内首个名字(共享同一 inode)
+				suffix = " => " + fe.link // hard link to the first name sharing this inode
 			case fe.isDir:
 				suffix = "/"
 			}
@@ -91,18 +92,19 @@ func listArchive(archivePath string, long bool) {
 			fmt.Printf("  %12d  %s\n", fe.size, fe.name)
 		}
 	}
-	fmt.Printf("共 %d 条目 (%d 文件 / %d 目录 / %d 链接), 原大小 %d B (%s), 唯一块 %d\n",
+	fmt.Printf("total %d entries (%d files / %d dirs / %d links), raw size %d B (%s), unique chunks %d\n",
 		len(items), nFile, nDir, nLink, tot, humanSize(tot), len(a.chunks))
-	runCleanups() // 成功路径也要清理(见 verifyArchive 里的说明)
+	runCleanups() // success path must clean up too (see verifyArchive)
 }
 
-// info: 打印容器内部布局。配合 FORMAT.md 用来核对/调试格式 —— 光看归档大小
-// 无法判断"到底是数据压得好, 还是元数据占了大头"、"有没有走原样存储"这些问题。
+// info prints the container's internal layout for format debugging (see FORMAT.md).
+// Archive size alone cannot tell whether data compressed well, metadata dominates, or
+// raw storage was used.
 func infoArchive(archivePath string) {
 	a := openArchive(archivePath)
 	fi, fierr := a.src.Stat()
 	if fierr != nil || fi == nil {
-		fatal("取归档大小失败: %v", fierr)
+		fatal("stat archive failed: %v", fierr)
 	}
 	sz := fi.Size()
 	var nStored, nComp, rawSum uint64
@@ -132,31 +134,31 @@ func infoArchive(archivePath string) {
 		}
 		return fmt.Sprintf("%.2f%%", 100.0*float64(n)/float64(d))
 	}
-	fmt.Printf("归档: %s\n", archivePath)
-	fmt.Printf("  版本      v%d\n", a.ver)
-	fmt.Printf("  模式      %s (后端 %s)\n", modeName(a.spec.code), a.spec.backend)
-	fmt.Printf("  条目      %d 个 (文件 %d / 目录 %d / 链接 %d)\n",
+	fmt.Printf("archive: %s\n", archivePath)
+	fmt.Printf("  version   v%d\n", a.ver)
+	fmt.Printf("  mode      %s (backend %s)\n", modeName(a.spec.code), a.spec.backend)
+	fmt.Printf("  entries   %d (files %d / dirs %d / links %d)\n",
 		len(a.files), len(a.files)-nDir-nLink, nDir, nLink)
-	fmt.Printf("  块        %d (可压 %d / 原样 %d)\n", len(a.chunks), nComp, nStored)
-	fmt.Printf("  块数据    %d B (去重后)\n", rawSum)
-	fmt.Printf("  归档大小  %d B\n", sz)
-	fmt.Printf("---- 布局 ----\n")
+	fmt.Printf("  chunks    %d (compressed %d / raw %d)\n", len(a.chunks), nComp, nStored)
+	fmt.Printf("  chunk data %d B (after dedup)\n", rawSum)
+	fmt.Printf("  archive size %d B\n", sz)
+	fmt.Printf("---- layout ----\n")
 	hdrLen := int64(48)
 	if a.ver < 6 {
 		hdrLen = a.dataStart // v2=24, v3~v5=32
 	}
-	fmt.Printf("  头部      %d B\n", hdrLen)
-	fmt.Printf("  元数据    %d B (压缩) -> %d B (原始)\n", a.metaCompLen, a.metaRawLen)
-	fmt.Printf("  数据区    %d B  %s\n", a.compLen, pct(a.compLen, sz))
-	fmt.Printf("  原样区    %d B  %s\n", a.rawLen, pct(a.rawLen, sz))
-	fmt.Printf("  字典区    %d B  %s\n", dictLen, func() string {
+	fmt.Printf("  header    %d B\n", hdrLen)
+	fmt.Printf("  metadata  %d B (compressed) -> %d B (raw)\n", a.metaCompLen, a.metaRawLen)
+	fmt.Printf("  data      %d B  %s\n", a.compLen, pct(a.compLen, sz))
+	fmt.Printf("  raw       %d B  %s\n", a.rawLen, pct(a.rawLen, sz))
+	fmt.Printf("  dict      %d B  %s\n", dictLen, func() string {
 		if dictLen > 8 {
-			return "含训练字典"
+			return "contains training dict"
 		}
-		return "无"
+		return "none"
 	}())
-	fmt.Printf("  尾部      %d B\n", int64(20))
-	fmt.Printf("  合计      %d B (文件 %d B)\n", a.dataStart+a.compLen+a.rawLen+dictLen+20, sz)
+	fmt.Printf("  trailer   %d B\n", int64(20))
+	fmt.Printf("  total     %d B (file %d B)\n", a.dataStart+a.compLen+a.rawLen+dictLen+20, sz)
 	runCleanups()
 }
 
@@ -169,25 +171,26 @@ func verifyArchive(archivePath string) {
 	}
 
 	a.checkLogical()
-	checked := "固实流/原样区哈希一致"
+	checked := "solid/raw stream hashes match"
 	if a.hashLen == 0 {
 		a.verifyStream()
 	} else {
-		checked = "逐块哈希一致"
+		checked = "per-chunk hashes match"
 		for i := range a.chunks {
 			_ = a.readChunk(uint32(i), true)
 		}
 	}
 	el := time.Since(t0)
 	rate := ""
-	if el > 0 && tot >= 1<<20 { // 小归档算出来的速率没意义(还容易显示成 0.0 MB/s)
+	if el > 0 && tot >= 1<<20 { // rate for tiny archives is meaningless (often 0.0 MB/s)
 		rate = fmt.Sprintf(", %.1f MB/s", float64(tot)/el.Seconds()/1048576)
 	}
-	fmt.Printf("校验通过: %s; %d 个条目 / %d 块, 解压数据 %d B (%s), 耗时 %v%s\n",
+	fmt.Printf("verify OK: %s; %d entries / %d chunks, decompressed %d B (%s), took %v%s\n",
 		checked, len(a.files), len(a.chunks), tot, humanSize(tot), el.Round(time.Millisecond), rate)
-	// 必须显式清理: verify 会 readChunk -> ensureSolid, 那会在系统临时目录建一个
-	// 固实流临时文件(可达**整个解压后的大小**)。fatal 路径由 fatal() 里的
-	// runCleanups 兜着, 而成功路径没人管 —— 于是每跑一次 verify 就在 /tmp 里
-	// 留下一个几十 MB 的 hcax-solid-*。(infoArchive 一直有, list/verify 漏了。)
+	// Explicit cleanup is required: verify calls readChunk -> ensureSolid, which creates
+	// a solid-stream temp file (up to the full decompressed size) in the system temp dir.
+	// The fatal path is covered by runCleanups inside fatal(), but the success path was
+	// not — each verify left a tens-of-MB hcax-solid-* in /tmp. (infoArchive always had
+	// it; list/verify missed it.)
 	runCleanups()
 }

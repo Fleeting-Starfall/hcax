@@ -1,6 +1,7 @@
 package main
 
-// 容器格式的读写: 条目类型、元数据序列化/解析、版本决策。字节级布局见 FORMAT.md。
+// Container format read/write: entry types, metadata serialization/parsing, version
+// decisions. Byte-level layout is in FORMAT.md.
 
 import (
 	"bytes"
@@ -10,17 +11,18 @@ import (
 
 type chunkMeta struct {
 	hash   [16]byte
-	offset uint64 // 可压块: 在 compSolid 中的偏移; 原样块: 在 rawRegion 中的偏移
+	offset uint64 // comp blocks: offset in compSolid; stored blocks: offset in rawRegion
 	uncomp uint32
-	stored bool // true=原样存储(跳过压缩器)
-	xform  byte // 预处理类型(DELTA/BCJ), 解码时逆变换还原
-	dictID byte // 训练字典索引(best 相似文件); 0=无
+	stored bool // true = store raw (skip the compressor)
+	xform  byte // preprocessing type (DELTA/BCJ), inverted on decode
+	dictID byte // training dict index (best for similar files); 0 = none
 	data   []byte
 	idx    uint32
 }
 
-// 文件身份: (设备号, inode) 唯一确定一个文件; nlink>1 才说明它有多个名字(硬链接)。
-// 单名字文件不记 —— 否则每个文件都要白存一份键。
+// File identity: (device, inode) uniquely identifies a file; nlink>1 means it has
+// multiple names (hard links). Single-name files are not recorded — otherwise every
+// file would store a useless key.
 type fileIDKey struct {
 	dev, ino, nlink uint64
 }
@@ -28,24 +30,27 @@ type fileIDKey struct {
 type fileEntry struct {
 	name   string
 	size   uint64
-	mtime  uint64 // Unix 秒(仅用于显示; v10 的精确时间在 nano 里)
-	nano   int64  // v10: Unix 纳秒。0 = 该条目没有可用时间戳
-	mode   uint32 // 权限位 + setuid/setgid/sticky(Go os.FileMode 的位布局)
+	mtime  uint64 // Unix seconds (display only; v10 precise time lives in nano)
+	nano   int64  // v10: Unix nanoseconds. 0 = no timestamp available for this entry
+	mode   uint32 // permission bits + setuid/setgid/sticky (Go os.FileMode bit layout)
 	chunks []uint32
-	isDir  bool // 目录条目(空目录也保留)
-	isLink bool // v9: 符号链接条目(存链接目标, 不存文件内容)
-	isHard bool // v11: 硬链接条目(复用首个条目的块索引, 不再读一遍内容)
+	isDir  bool // directory entry (empty dirs are kept)
+	isLink bool // v9: symlink entry (stores target, not content)
+	isHard bool // v11: hard link entry (reuses the first entry's chunk indices)
 	link   string
-	// xform: 文件级预处理标记(v7)。光栅图(BMP/TGA/PNM)在分块之前对整文件做过
-	// 二维预测/色彩去相关, 该变换跨块生效, 故必须记在文件级而非块级。
-	// 非光栅文件恒为 xfNone。
+	// xform: file-level preprocessing flag (v7). Raster images (BMP/TGA/PNM) get
+	// 2-D prediction / color decorrelation before chunking; the transform spans chunks,
+	// so it must live at file level, not chunk level. Non-raster files are xfNone.
 	xform byte
 }
 
-// 元数据序列化(v6): [流哈希16B] + 块表(5B/项: len4 + flags1) + 文件表
-//   - 块偏移不再存储: 可压块在固实流中、原样块在原样区中都是按顺序紧凑排列, 解包时累加即得
-//   - 不再逐块存哈希(每块 8B 随机数完全不可压, 大量小文件时开销巨大);
-//     改为流级校验: 固实流 + 原样区 各存 8B 哈希。verify 时校验整条流。
+// Metadata serialization (v6): [stream hash 16B] + chunk table (5B/entry: len4 + flags1)
+// + file table.
+//   - Chunk offsets are no longer stored: comp chunks in the solid stream and stored
+//     chunks in the raw region are packed sequentially; unpack accumulates offsets.
+//   - No per-chunk hashes (8B of random data per chunk is incompressible and costly
+//     with many small files); instead stream-level checks: 8B hash each for the solid
+//     stream and the raw region, verified over the whole stream on verify.
 func serializeMeta(chunks []*chunkMeta, files []fileEntry, solidHash, rawHash [8]byte, ver byte) []byte {
 	var b bytes.Buffer
 	b.Write(solidHash[:])
@@ -70,17 +75,17 @@ func serializeMeta(chunks []*chunkMeta, files []fileEntry, solidHash, rawHash [8
 		if fe.isDir {
 			f |= 1
 		}
-		f |= (fe.xform & 0x0f) << 1 // v7: 文件级光栅变换
+		f |= (fe.xform & 0x0f) << 1 // v7: file-level raster transform
 		if fe.isLink {
-			f |= 0x20 // v9: 符号链接
+			f |= 0x20 // v9: symlink
 		}
 		if fe.isHard {
-			f |= 0x40 // v11: 硬链接
+			f |= 0x40 // v11: hard link
 		}
 		b.WriteByte(f)
 		binary.Write(&b, binary.LittleEndian, fe.size)
 		if ver >= 10 {
-			// v10: 纳秒时间戳 + 完整模式位(含 setuid/setgid/sticky)
+			// v10: nanosecond timestamp + full mode bits (incl. setuid/setgid/sticky)
 			binary.Write(&b, binary.LittleEndian, entryNano(fe))
 			binary.Write(&b, binary.LittleEndian, fe.mode)
 		} else {
@@ -91,7 +96,7 @@ func serializeMeta(chunks []*chunkMeta, files []fileEntry, solidHash, rawHash [8
 		for _, ix := range fe.chunks {
 			binary.Write(&b, binary.LittleEndian, ix)
 		}
-		if fe.isLink || fe.isHard { // v9 链接目标 / v11 硬链接指向的归档内路径
+		if fe.isLink || fe.isHard { // v9 link target / v11 in-archive path of the hard link
 			lb := []byte(fe.link)
 			binary.Write(&b, binary.LittleEndian, uint16(len(lb)))
 			b.Write(lb)
@@ -102,7 +107,7 @@ func serializeMeta(chunks []*chunkMeta, files []fileEntry, solidHash, rawHash [8
 
 func need(m []byte, pos, n int, what string) {
 	if pos < 0 || n < 0 || pos+n > len(m) {
-		fatal("元数据损坏: 解析%s时越界(偏移 %d 需要 %d 字节, 元数据共 %d 字节)", what, pos, n, len(m))
+		fatal("corrupt metadata: %s parse out of bounds (offset %d needs %d bytes, metadata has %d)", what, pos, n, len(m))
 	}
 }
 
@@ -116,15 +121,16 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 	chunks := make([]chunkMeta, nChunks)
 	var compOff, rawOff uint64
 	for i := range chunks {
-		need(m, pos, 5, "块表项")
+		need(m, pos, 5, "chunk table entry")
 		chunks[i].uncomp = binary.LittleEndian.Uint32(m[pos : pos+4])
 		pos += 4
-		// 单个块的声明长度必须落在**我们自己分块器**的上界之内(CDC 最大 256KB,
-		// ultra 的整文件固实最大 256MB)。损坏/恶意归档可以随便填 0xFFFFFFFF,
-		// 而 readChunk 是"先 make([]byte, uncomp) 再发现数据不够" —— 一个 1KB 的
-		// 归档就能让人先吃掉 4GB 内存。这句把巨额分配挡在读数据之前。
+		// A chunk's declared length must fit our own chunker's bounds (CDC max 256KB,
+		// ultra whole-file solid max 256MB). Corrupt or malicious archives can set
+		// 0xFFFFFFFF, and readChunk does make([]byte, uncomp) before discovering short
+		// data — a 1KB archive could force a 4GB allocation. This check rejects huge
+		// allocations before any read.
 		if chunks[i].uncomp > maxChunkUncomp {
-			fatal("块 %d 声明长度 %d B 超出合理上界(%d B): 归档损坏",
+			fatal("chunk %d declares %d B, over the sane bound (%d B): corrupt archive",
 				i, chunks[i].uncomp, maxChunkUncomp)
 		}
 		f := m[pos]
@@ -144,10 +150,10 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 	}
 	files := make([]fileEntry, nFiles)
 	for i := range files {
-		need(m, pos, 2, "文件名长度")
+		need(m, pos, 2, "file name length")
 		nl := int(binary.LittleEndian.Uint16(m[pos : pos+2]))
 		pos += 2
-		need(m, pos, nl+1+8+4+2+4, "文件表项")
+		need(m, pos, nl+1+8+4+2+4, "file table entry")
 		files[i].name = string(m[pos : pos+nl])
 		pos += nl
 		f := m[pos]
@@ -161,7 +167,7 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 		files[i].size = binary.LittleEndian.Uint64(m[pos : pos+8])
 		pos += 8
 		if ver >= 10 {
-			need(m, pos, 12, "文件表项(v10 时间/权限)")
+			need(m, pos, 12, "file table entry (v10 time/mode)")
 			files[i].nano = int64(binary.LittleEndian.Uint64(m[pos : pos+8]))
 			pos += 8
 			files[i].mode = binary.LittleEndian.Uint32(m[pos : pos+4])
@@ -177,26 +183,26 @@ func parseMeta(m []byte, nChunks, nFiles uint32, ver byte) ([]chunkMeta, []fileE
 		}
 		nc := int(binary.LittleEndian.Uint32(m[pos : pos+4]))
 		pos += 4
-		need(m, pos, 4*nc, "文件块索引")
-		// 不能拿"文件引用的块数"去和"块表条目数"比大小: 去重之后同一个块会被
-		// 引用多次, 引用数**必然**可以大于唯一块数(一个 35MB 全零文件只对应
-		// 2 个唯一块, 却要引用 134 次)。老检查在这里直接判"元数据损坏",
-		// 于是内部重复度高的归档打得开、解不开 —— 数据被自己锁死。
-		// 只对逐个索引做上界检查(下面那个循环)。
+		need(m, pos, 4*nc, "file chunk indices")
+		// Do not compare the file's chunk count with the chunk table size: after
+		// dedup one chunk is referenced many times, so references can exceed unique
+		// chunks (a 35MB all-zero file has 2 unique chunks but 134 references). The old
+		// check called this corruption, locking archives with high internal redundancy
+		// out of unpack. Only bound-check each index (loop below).
 		idxs := make([]uint32, nc)
 		for j := range idxs {
 			idxs[j] = binary.LittleEndian.Uint32(m[pos : pos+4])
 			pos += 4
 			if idxs[j] >= nChunks {
-				fatal("元数据损坏: 文件 %s 引用了不存在的块 %d(共 %d 块)", files[i].name, idxs[j], nChunks)
+				fatal("corrupt metadata: file %s references nonexistent chunk %d (of %d)", files[i].name, idxs[j], nChunks)
 			}
 		}
 		files[i].chunks = idxs
 		if files[i].isLink || files[i].isHard {
-			need(m, pos, 2, "链接目标长度")
+			need(m, pos, 2, "link target length")
 			tl := int(binary.LittleEndian.Uint16(m[pos : pos+2]))
 			pos += 2
-			need(m, pos, tl, "链接目标")
+			need(m, pos, tl, "link target")
 			files[i].link = string(m[pos : pos+tl])
 			pos += tl
 		}
@@ -208,27 +214,28 @@ const (
 	magic      = "HCAX"
 	trailerMag = "XACH"
 
-	// 兼容读 v2~v12。写的时候能不升就不升 —— 每升一版就等于跟旧版二进制绝缘:
-	//   普通归档写 v8; 含符号链接写 v9; 含 setuid/setgid/sticky 或 2038 后的
-	//   时间戳写 v10; 含硬链接写 v11; 含逐行光栅变换(8/9 号)写 v12 —— 旧版二进制
-	//   不认识这两个变换号, 会把它当未知变换直接报错, 不如在开档时就拒绝。
+	// Reads v2~v12 for compatibility. When writing, avoid bumping versions whenever
+	// possible — each bump breaks older binaries:
+	//   plain archives write v8; symlinks write v9; setuid/setgid/sticky or post-2038
+	//   timestamps write v10; hard links write v11; row raster transforms (8/9) write
+	//   v12 — older binaries treat unknown transforms as errors, so reject at open time.
 	version   = 12
 	verCompat = 8
-	verLinks  = 9  // 需要符号链接条目
-	verExt    = 10 // 需要扩展时间/权限
-	verHard   = 11 // 需要硬链接条目
-	verRow    = 12 // 需要逐行光栅变换(xform 8/9)
+	verLinks  = 9  // requires symlink entries
+	verExt    = 10 // requires extended time/permissions
+	verHard   = 11 // requires hard link entries
+	verRow    = 12 // requires row raster transforms (xform 8/9)
 
-	headerSize = 24 // v2 头长; v3+ 头长 32(后续再读 8 字节 rawLen)
+	headerSize = 24 // v2 header length; v3+ is 32 (reads 8 more bytes of rawLen)
 
-	// 单个块声明长度的上界。取自 ultra 模式 newChunkerMinMax(nil, 4MB, 256MB) 的
-	// 上限 —— 我们自己写出来的块不可能比它更大。
+	// Upper bound for a single chunk's declared length, from ultra mode
+	// newChunkerMinMax(nil, 4MB, 256MB) — our own chunks cannot exceed it.
 	maxChunkUncomp = 256 << 20
 )
 
-// 该写哪个版本? 逐条检查: 只要有一个条目用了高版本才装得下的特性, 就整体升上去
-// (容器只有一个版本号, 不能每个条目各写各的)。
-// precise = 用户显式要求纳秒时间戳(-T/--precise-times)
+// Which version to write? Scan every entry: if any uses a feature that needs a newer
+// version, bump the whole container (there is one version number, not per-entry).
+// precise = user explicitly requested nanosecond timestamps (-T/--precise-times)
 func writeVer(files []fileEntry, precise bool) byte {
 	if precise {
 		return verExt
@@ -248,7 +255,8 @@ func writeVer(files []fileEntry, precise bool) byte {
 		if v >= verExt {
 			continue
 		}
-		// v9 及以前: 权限只有 0777, 时间是 uint32 秒 —— 这两个存不下才升 v10
+		// v9 and earlier: mode is 0777 only and time is uint32 seconds — bump only when
+		// these cannot hold the value
 		if fe.mode&^uint32(os.ModePerm) != 0 || !fitsOldTime(fe.nano) {
 			v = verExt
 		}
@@ -256,13 +264,14 @@ func writeVer(files []fileEntry, precise bool) byte {
 	return v
 }
 
-// 亚秒部分**不算**必须升版本的理由: 现实里几乎所有文件都带亚秒时间戳(APFS/ext4
-// 都是纳秒级), 若因此一律写 v10, 等于让每一个新归档都与旧版二进制绝缘 —— 为了
-// 一点点精度牺牲兼容性不值得。所以默认按秒存(与 tar 一致), 只有用户显式
-// 要求 -T、或归档本来就要升 v10 时才把纳秒一起存下来。
+// Sub-second precision is not a reason to bump the version: nearly every real file has
+// a sub-second timestamp (APFS/ext4 are nanosecond), so always writing v10 would cut
+// every new archive off from older binaries — not worth it for a bit of precision.
+// Store seconds by default (like tar); keep nanoseconds only with explicit -T or when
+// the archive already needs v10.
 func fitsOldTime(nano int64) bool {
 	if nano == 0 {
-		return true // 没有可用时间戳, 存 0 即可, 不必为此升版本
+		return true // no timestamp available; storing 0 needs no version bump
 	}
 	sec := nano / 1e9
 	return sec >= 0 && sec <= 0xFFFFFFFF

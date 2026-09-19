@@ -13,8 +13,9 @@ const (
 	mask64    = (1 << chunkBits) - 1
 )
 
-// 不可压判定阈值: 廉价 zstd-l1 压缩后若输出 >= 输入(完全压不动)才原样存储;
-// 只要 l1 能缩小一点点, 就交真压缩器(可能压得更好), 避免误丢压率
+// Incompressibility threshold: store raw only when cheap zstd-l1 output >= input
+// (nothing to gain); as long as l1 shrinks it at all, hand it to the real compressor
+// (which may do better), avoiding a wasted ratio opportunity
 
 type chunker struct {
 	rh      uint64
@@ -44,9 +45,10 @@ func hash16(b []byte) [16]byte {
 	return out
 }
 
-// ---------- 内容自适应预处理 (DELTA / BCJ-x86) ----------
-// 进压缩器前对可压块做变换, 把"结构化冗余"暴露给 LZ/熵编码, 解码时逆变换还原原始字节.
-// 纯 Go 实现, 自包含可逆, 不依赖 xz 滤波器解码.
+// ---------- content-adaptive preprocessing (DELTA / BCJ-x86) ----------
+// Transform compressible blocks before the compressor, exposing "structured
+// redundancy" to LZ/entropy coding; decode inverts the transform to restore the
+// original bytes. Pure Go, self-contained and reversible, no xz filter decoding.
 
 func newChunker(on func([]byte)) *chunker {
 	return &chunker{minS: chunkMin, maxS: chunkMax, mask: mask64, gear: gear, onChunk: on}
@@ -56,8 +58,9 @@ func newChunkerMinMax(on func([]byte), mn, mx int) *chunker {
 	return &chunker{minS: mn, maxS: mx, mask: mask64, gear: gear, onChunk: on}
 }
 
-// v8: 复用块缓冲, 避免大文件分块时每块都 make([]byte,~64K) 造成瞬时内存/GC 峰值(尤其 GOMAXPROCS 高时).
-// onChunk 内部会把所需数据复制到 cm.data(含 xfNone 也复制), 故归还缓冲安全.
+// Reuse chunk buffers to avoid per-chunk make([]byte, ~64K) allocation spikes on large
+// files (especially at high GOMAXPROCS). Safe to return because onChunk copies the data
+// it needs into cm.data (even for xfNone).
 var chunkPool = sync.Pool{New: func() interface{} { b := make([]byte, 0, chunkMax); return &b }}
 
 func (c *chunker) emit(n int) {

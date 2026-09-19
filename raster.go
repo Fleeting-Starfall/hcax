@@ -1,38 +1,45 @@
 package main
 
-// raster.go - 光栅图(未压缩位图)专用处理
-//  1) 识别 BMP / TGA / PNM 头, 拿到像素区偏移/行跨距/通道数
-//  2) 可逆色彩去相关(RCT): 彩图相邻通道高度相关(R≈G≈B), 换成 (G, R-G, B-G) 后
-//     两个差通道接近 0 -> 直接消掉一大块冗余。实测真实照片再省 11~14%。
-//  3) 二维中值边缘预测(MED, JPEG-LS 的 LOCO-I 预测器): 用左/上/左上按边缘方向预测,
-//     比"左+上-左上"梯度更稳(在边缘处不越界)。实测优于梯度/Paeth/平均。
-//  4) 字节熵: 辅助"不可压判定", 避免把"块内不可压但整体可压"的图像残差误判为随机数据
-// 纯算法, 可逆(逐字节 mod 256), 无 AI, 无外部依赖。
+// raster.go - handling for raster images (uncompressed bitmaps)
+//  1) Recognize BMP / TGA / PNM headers; get pixel offset, row stride, channel count
+//  2) Reversible color transform (RCT): channels are highly correlated (R≈G≈B), so
+//     (G, R-G, B-G) pushes two difference channels near 0, removing bulk redundancy.
+//     Measured 11-14% extra savings on real photos.
+//  3) 2-D median edge prediction (MED, JPEG-LS LOCO-I): predicts from left/up/up-left
+//     along the edge direction; more stable than "left+up-up-left" gradient at edges.
+//     Beats gradient/Paeth/average in practice.
+//  4) Byte entropy: helps "incompressible" decisions, so image residuals that are
+//     incompressible per chunk but compressible overall are not mistaken for random.
+// Pure algorithm, reversible (byte-wise mod 256), no AI, no external deps.
 
 import "math"
 
 const (
-	xfRasterMed    byte = 6 // 光栅: MED 二维预测(旧, 覆盖整行含填充)
-	xfRasterRctMed byte = 7 // 光栅: 可逆色彩去相关 + MED(旧, 整行扁平处理)
-	// 8/9: 逐行版本。BMP 每行有 0~3 字节的 4 字节对齐填充, 24bpp 且 宽%4∈{1,2} 时
-	// 行跨距不是 3 的倍数 —— 旧的 7 号变换把填充和下一行的头两个字节当成一个"像素"
-	// 去做色彩去相关, 于是通道相位逐行漂移, MED 的"上/左上"邻居落到别的通道上,
-	// 竖直预测彻底失效(实测比不做变换还差 60%)。8/9 只在每行前 rowBytes 字节内运算,
-	// 跳过填充, 通道相位恒定。实测这类图比旧路径再省 4~7%。
-	xfRasterRowMed    byte = 8 // 光栅: MED 二维预测(逐行, 跳过行尾填充)
-	xfRasterRowRctMed byte = 9 // 光栅: 逐行色彩去相关 + 逐行 MED
+	xfRasterMed    byte = 6 // raster: MED 2-D prediction (legacy, whole row incl. padding)
+	xfRasterRctMed byte = 7 // raster: reversible color transform + MED (legacy, flat rows)
+	// 8/9 are row-wise. BMP rows have 0-3 bytes of 4-byte alignment padding; at 24bpp
+	// with width%4 in {1,2} the stride is not a multiple of 3 — legacy transform 7
+	// treated padding plus the next row's first two bytes as one "pixel" for color
+	// decorrelation, so channel phase drifted every row and MED's up/up-left neighbors
+	// landed on other channels, killing vertical prediction (measured 60% worse than no
+	// transform). 8/9 operate only on the first rowBytes of each row, skip padding, and
+	// keep the channel phase fixed. Measured 4-7% better than the legacy path on such
+	// images.
+	xfRasterRowMed    byte = 8 // raster: MED 2-D prediction (row-wise, skip row padding)
+	xfRasterRowRctMed byte = 9 // raster: row-wise color transform + row-wise MED
 )
 
-// 光栅变换需把整图读进内存(预测跨行/跨块), 超大图跳过以免占用过多内存, 退回流式打包
+// Raster transforms need the whole image in memory (prediction spans rows/chunks);
+// skip oversized images to bound memory, falling back to streaming pack.
 const rasterMaxBytes = 512 << 20
 
-// 光栅几何信息
+// Raster geometry
 type rasterGeom struct {
-	dataOff  int // 像素数据起始偏移
-	stride   int // 每行字节数(含 BMP 的 4 字节对齐填充)
-	rowBytes int // 每行**真实像素**字节数(= 宽 * bpp, 不含行尾填充)
-	rows     int // 行数
-	bpp      int // 每像素字节数(通道数)
+	dataOff  int // offset of pixel data
+	stride   int // bytes per row (incl. BMP 4-byte alignment padding)
+	rowBytes int // real pixel bytes per row (= width * bpp, no padding)
+	rows     int // number of rows
+	bpp      int // bytes per pixel (channels)
 }
 
 func le16(b []byte, o int) uint16 { return uint16(b[o]) | uint16(b[o+1])<<8 }
@@ -40,7 +47,8 @@ func le32(b []byte, o int) uint32 {
 	return uint32(b[o]) | uint32(b[o+1])<<8 | uint32(b[o+2])<<16 | uint32(b[o+3])<<24
 }
 
-// 只凭头部魔数快速判断"像不像光栅图"(用于决定要不要读整个文件)
+// Quick header-magic check whether b looks like a raster (decides whether to read
+// the whole file).
 func rasterLikely(b []byte) bool {
 	if len(b) < 2 {
 		return false
@@ -48,12 +56,12 @@ func rasterLikely(b []byte) bool {
 	if b[0] == 'B' && b[1] == 'M' { // BMP
 		return true
 	}
-	if b[0] == 'P' && (b[1] == '5' || b[1] == '6') { // PNM P5(灰)/P6(彩)
+	if b[0] == 'P' && (b[1] == '5' || b[1] == '6') { // PNM P5 (gray) / P6 (color)
 		return true
 	}
-	if len(b) >= 18 && b[1] == 0 { // TGA: 无调色板
+	if len(b) >= 18 && b[1] == 0 { // TGA: no palette
 		t := b[2]
-		if t == 2 || t == 3 { // 未压缩 真彩/灰度
+		if t == 2 || t == 3 { // uncompressed truecolor/grayscale
 			depth := int(b[16])
 			if depth == 8 || depth == 24 || depth == 32 {
 				return true
@@ -63,7 +71,7 @@ func rasterLikely(b []byte) bool {
 	return false
 }
 
-// 完整识别并返回几何信息; 失败返回 ok=false
+// Full recognition; returns geometry, ok=false on failure.
 func rasterInfo(b []byte) (rasterGeom, bool) {
 	var g rasterGeom
 	// ---- BMP ----
@@ -73,7 +81,7 @@ func rasterInfo(b []byte) (rasterGeom, bool) {
 		h := int(int32(le32(b, 22)))
 		bits := int(le16(b, 28))
 		comp := le32(b, 30)
-		if comp != 0 { // 仅支持 BI_RGB 未压缩
+		if comp != 0 { // BI_RGB uncompressed only
 			return g, false
 		}
 		switch bits {
@@ -103,13 +111,13 @@ func rasterInfo(b []byte) (rasterGeom, bool) {
 		g.dataOff, g.stride, g.rowBytes, g.rows = dataOff, stride, rb, rows
 		return g, true
 	}
-	// ---- PNM (P5 灰度 / P6 彩色, maxval<=255) ----
+	// ---- PNM (P5 gray / P6 color, maxval<=255) ----
 	if len(b) >= 3 && b[0] == 'P' && (b[1] == '5' || b[1] == '6') {
 		pos := 2
 		nums := []int{}
 		for pos < len(b) && len(nums) < 3 {
 			c := b[pos]
-			if c == '#' { // 注释行
+			if c == '#' { // comment line
 				for pos < len(b) && b[pos] != '\n' {
 					pos++
 				}
@@ -132,7 +140,7 @@ func rasterInfo(b []byte) (rasterGeom, bool) {
 		if len(nums) != 3 || pos >= len(b) {
 			return g, false
 		}
-		pos++ // 单个空白分隔符
+		pos++ // single whitespace separator
 		w, h, maxv := nums[0], nums[1], nums[2]
 		ch := 1
 		if b[1] == '6' {
@@ -147,7 +155,7 @@ func rasterInfo(b []byte) (rasterGeom, bool) {
 		g.dataOff, g.stride, g.rowBytes, g.rows, g.bpp = pos, w*ch, w*ch, h, ch
 		return g, true
 	}
-	// ---- TGA (类型 2/3, 24/32/8 位, 无调色板) ----
+	// ---- TGA (type 2/3, 24/32/8-bit, no palette) ----
 	if len(b) >= 18 && b[1] == 0 && (b[2] == 2 || b[2] == 3) {
 		idLen := int(b[0])
 		w := int(le16(b, 12))
@@ -168,7 +176,7 @@ func rasterInfo(b []byte) (rasterGeom, bool) {
 			return g, false
 		}
 		off := 18 + idLen
-		stride := w * ch // TGA 无行对齐填充
+		stride := w * ch // TGA has no row alignment padding
 		if off+stride*h > len(b) {
 			return g, false
 		}
@@ -180,12 +188,13 @@ func rasterInfo(b []byte) (rasterGeom, bool) {
 
 func stride3(w, ch, h int) int { return w * ch * h }
 
-// ---- MED 二维中值边缘预测 ----
-// forward: 求残差; false: 逆变换还原。就地修改像素区。
+// ---- MED 2-D median edge prediction ----
+// forward: compute residuals; false: inverse. Modifies the pixel region in place.
 func medApply(b []byte, g rasterGeom, forward bool, rowAware bool) {
 	px := b[g.dataOff : g.dataOff+g.stride*g.rows]
 	stride, rows, bp := g.stride, g.rows, g.bpp
-	// rowAware: 只处理每行前 rowBytes 字节; 否则连行尾填充一起处理(旧行为)
+	// rowAware: process only the first rowBytes of each row; otherwise include row
+	// padding (legacy behavior)
 	rb := stride
 	if rowAware {
 		rb = g.rowBytes
@@ -231,7 +240,7 @@ func medApply(b []byte, g rasterGeom, forward bool, rowAware bool) {
 	}
 }
 
-// LOCO-I / JPEG-LS 中值边缘检测预测器
+// LOCO-I / JPEG-LS median edge detection predictor
 func medPred(l, u, ul byte) byte {
 	li, ui, uli := int(l), int(u), int(ul)
 	if uli >= li && uli >= ui {
@@ -249,11 +258,12 @@ func medPred(l, u, ul byte) byte {
 	return byte(li + ui - uli)
 }
 
-// ---- 可逆色彩去相关 (LOCO-I 式) ----
-// forward: (R,G,B) -> (G, R-G, B-G);  逆: G=c0, R=c1+G, B=c2+G。逐字节 mod 256 可逆。
-// 仅对 3 通道以上生效(处理前 3 个通道; 第 4 通道如 alpha 原样保留, 交给 MED 预测)。
-// rowAware=true 时逐行处理(跳过行尾填充), =false 时沿整块缓冲区按 3 字节滑动(旧行为,
-// 仅供解码历史归档; 会在 stride%bpp!=0 时把填充与下一行数据搅在一起)
+// ---- reversible color transform (LOCO-I style) ----
+// forward: (R,G,B) -> (G, R-G, B-G); inverse: G=c0, R=c1+G, B=c2+G. Reversible
+// byte-wise mod 256. Only applies to 3+ channel images (first 3 channels; channel 4
+// like alpha is left to MED). rowAware=true processes per row (skips padding); false
+// slides 3 bytes over the whole buffer (legacy, decode-only for old archives; mixes
+// padding with the next row when stride%bpp!=0)
 func rctApply(b []byte, g rasterGeom, forward bool, rowAware bool) {
 	if g.bpp < 3 {
 		return
@@ -294,8 +304,8 @@ func rctApply(b []byte, g rasterGeom, forward bool, rowAware bool) {
 	}
 }
 
-// 应用/逆应用光栅变换。forward=false 时为逆变换(顺序相反)。
-// 返回是否成功(非光栅或越界则 false, 调用方应视作 xfNone)。
+// Apply or invert a raster transform (forward=false inverts, reverse order).
+// Returns success (false for non-raster or out-of-bounds; caller treats as xfNone).
 func rasterApply(t byte, b []byte, forward bool) bool {
 	var rowAware, rct bool
 	switch t {
@@ -314,7 +324,7 @@ func rasterApply(t byte, b []byte, forward bool) bool {
 		return false
 	}
 	if rct && g.bpp < 3 {
-		return false // 灰度图无色彩可去相关
+		return false // grayscale has no color to decorrelate
 	}
 	if forward {
 		if rct {
@@ -330,14 +340,14 @@ func rasterApply(t byte, b []byte, forward bool) bool {
 	return true
 }
 
-// 从候选变换里按门控预测大小选最优(绝不退步), 返回选中的变换类型。
-// 调用方需先把 whole 读进来。xform 候选: 无 / MED / RCT+MED。
+// Pick the best candidate transform by gated predicted size (never worse); returns
+// the chosen type. Caller must have whole in memory. Candidates: none / MED / RCT+MED.
 func (b *backend) chooseRasterXform(whole []byte) byte {
 	g, ok := rasterInfo(whole)
 	if !ok {
 		return xfNone
 	}
-	// 只写逐行版本(8/9); 6/7 仅用于解码历史归档, 不再生成
+	// Only write row-wise versions (8/9); 6/7 decode old archives only, never generated
 	cands := []byte{xfNone, xfRasterRowMed}
 	if g.bpp >= 3 {
 		cands = append(cands, xfRasterRowRctMed)
@@ -359,7 +369,7 @@ func (b *backend) chooseRasterXform(whole []byte) byte {
 	return best
 }
 
-// 门控预测大小: 有廉价编码器就用它, 否则退回字节熵估计
+// Gated size estimate: use the cheap encoder if available, else byte entropy.
 func gateSize(b *backend, data []byte) int {
 	if b != nil && b.gateEnc != nil {
 		return len(b.gateEnc.EncodeAll(data, nil))
@@ -367,9 +377,10 @@ func gateSize(b *backend, data []byte) int {
 	return int(byteEntropy(data) * float64(len(data)) / 8.0)
 }
 
-// ---------- 旧版(v2~v6)读取兼容 ----------
-// 早期版本对 BMP 用的是"二维梯度预测(左+上-左上)"且无文件级变换记录,
-// 为能解出历史归档, 保留该算法的逆变换(仅供解包兼容路径使用, 新归档不再使用)。
+// ---------- legacy (v2~v6) read compatibility ----------
+// Early versions used 2-D gradient prediction (left+up-up-left) on BMP with no
+// file-level transform record. Keep the inverse for historical archives (compat
+// unpack path only; never used for new archives).
 
 func bmpInfoLegacy(b []byte) (rasterGeom, bool) {
 	var g rasterGeom
@@ -447,7 +458,8 @@ func pred2DLegacy(b []byte, forward bool) bool {
 	return true
 }
 
-// 字节熵(bits/byte, 0~8): 用于区分"真随机(≈8)"与"有分布的残差(<8)"
+// Byte entropy (bits/byte, 0-8): distinguishes true randomness (≈8) from residual
+// data with structure (<8).
 func byteEntropy(b []byte) float64 {
 	if len(b) == 0 {
 		return 0

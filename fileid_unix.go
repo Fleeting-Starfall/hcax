@@ -7,9 +7,9 @@ import (
 	"syscall"
 )
 
-// 硬链接识别需要 (dev, ino, nlink): 同一 inode 的多个名字就是硬链接。
-// os.SameFile 也能判断, 但它是两两比较 —— 几万个文件时会退化成 O(n²);
-// 而 (dev, ino) 可以直接当 map 键, 一次遍历搞定。
+// Hard-link detection needs (dev, ino, nlink): multiple names for the same inode are
+// hard links. os.SameFile also works but compares pairwise — O(n²) on tens of
+// thousands of files; (dev, ino) works directly as a map key in one pass.
 func fileKey(fi os.FileInfo) (fileIDKey, bool) {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
@@ -22,7 +22,7 @@ func fileKey(fi os.FileInfo) (fileIDKey, bool) {
 	}, true
 }
 
-// 取不到文件身份时的兜底: 零值在 hardSeen 里永远查不到, 等价于"不识别为硬链接"
+// fileKeyOf returns the zero key when identity is unavailable; it never matches hardSeen.
 func fileKeyOf(fi os.FileInfo) fileIDKey {
 	k, _ := fileKey(fi)
 	return k
