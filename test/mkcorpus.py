@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""生成回归测试语料。
+"""Generate the regression-test corpus.
 
-设计要点:
-- 可压(不是随机数据, 否则会被判为"原样存储", 绕开压缩器)
-- 非重复(否则 CDC 去重会把语料折叠成几十块, 测不出真实内存/耗时)
-- 类型多样(文本/代码/JSON/结构化二进制/不可压图片), 贴近真实归档场景
+design notes:
+- compressible (random data would be "raw-stored", bypassing the compressors)
+- non-repetitive (else CDC dedup folds the corpus to dozens of chunks, hiding real cost)
+- diverse types (text/code/JSON/structured binary/incompressible images), like real archives
 """
 import math
 import os
@@ -21,7 +21,7 @@ VOCAB = (
 
 
 def gen_text(n, rng):
-    """英文伪文本: 词表有限 -> 可压; 组合随机 -> 长距离重复极少"""
+    """English pseudo-text: limited vocab -> compressible; random combos -> few long repeats"""
     out = []
     size = 0
     while size < n:
@@ -35,7 +35,7 @@ def gen_text(n, rng):
 
 
 def gen_code(n, rng):
-    """伪源码: 缩进/关键字重复 -> 可压"""
+    """pseudo source: repeated indentation/keywords -> compressible"""
     lines = []
     size = 0
     kw = ["func", "return", "if", "for", "range", "var", "const", "type", "struct"]
@@ -58,7 +58,7 @@ def gen_code(n, rng):
 
 
 def gen_json(n, rng):
-    """伪 JSON 记录: 结构高度重复 -> 可压且是典型的"文件夹归档"负载"""
+    """pseudo JSON records: highly repeated structure -> compressible, a classic folder-archive load"""
     out = []
     size = 0
     i = 0
@@ -84,7 +84,7 @@ def gen_json(n, rng):
 
 
 def gen_struct(n, rng):
-    """结构化二进制: 整型序列小幅游走 -> DELTA 预处理可吃下, lzma2 也有得压"""
+    """structured binary: small integer walks -> DELTA preprocessable, lzma2 also wins"""
     buf = bytearray()
     v = rng.randint(0, 1 << 30)
     while len(buf) < n:
@@ -95,7 +95,7 @@ def gen_struct(n, rng):
 
 
 def gen_random(n, rng):
-    """真随机: 不可压, 用于验证"原样存储"路径与压率上限"""
+    """true random: incompressible, exercises the raw-storage path and ratio ceiling"""
     return rng.randbytes(n)
 
 
@@ -108,18 +108,18 @@ def _bmp_header(w, h, bpp, data_off, file_size):
     struct.pack_into("<I", hdr, 10, data_off)
     struct.pack_into("<I", hdr, 14, 40)
     struct.pack_into("<i", hdr, 18, w)
-    struct.pack_into("<i", hdr, 22, h)  # 正=自下而上
+    struct.pack_into("<i", hdr, 22, h)  # positive = bottom-up
     struct.pack_into("<H", hdr, 26, 1)
     struct.pack_into("<H", hdr, 28, bpp)
     return hdr
 
 
 def gen_bmp24(n, rng):
-    """24bpp 未压缩 BMP, 宽取 101 -> 每行 303 字节像素 + 1 字节对齐填充。
+    """24bpp uncompressed BMP, width 101 -> 303 pixel bytes + 1 alignment byte per row.
 
-    选这个宽度是故意的: 行跨距(304)不是 3 的倍数, 光栅变换一旦按"整块缓冲区
-    每 3 字节一组"去色彩去相关, 通道相位就会逐行漂移, 竖直预测失效。回归里
-    必须有能触发它的语料, 否则这条路径永远没人跑。
+    the width is deliberate: stride (304) is not a multiple of 3; if the raster transform
+    groups the whole buffer by 3 bytes for decorrelation, channel phase drifts per row
+    and vertical prediction fails. The corpus must trigger it or the path never runs.
     """
     import math
 
@@ -127,7 +127,7 @@ def gen_bmp24(n, rng):
     ch = 3
     stride = ((w * ch + 3) // 4) * 4
     h = max(1, max(0, n - 54) // stride)
-    px = bytearray(stride * h)  # 填充字节恒为 0, 正是真实 BMP 的样子
+    px = bytearray(stride * h)  # padding bytes stay 0, just like real BMPs
     for y in range(h):
         base = y * stride
         for x in range(w):
@@ -142,7 +142,7 @@ def gen_bmp24(n, rng):
 
 
 def gen_bmp32(n, rng):
-    """32bpp BMP: 行跨距天然 4 字节对齐(无填充), 与 24bpp 互为对照"""
+    """32bpp BMP: stride naturally 4-byte aligned (no padding), a 24bpp counterpart"""
     w, bpp = 101, 32
     ch = 4
     stride = w * ch
@@ -157,15 +157,15 @@ def gen_bmp32(n, rng):
             px[o] = max(0, min(255, int(v - 12 + nz)))
             px[o + 1] = max(0, min(255, int(v + nz)))
             px[o + 2] = max(0, min(255, int(v + 9 + nz)))
-            px[o + 3] = 255  # alpha 恒 255
+            px[o + 3] = 255  # alpha stays 255
     return bytes(_bmp_header(w, h, bpp, 54, 54 + len(px))) + bytes(px)
 
 
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "/tmp/hcaxlab/corpus"
     total = int(sys.argv[2]) if len(sys.argv) > 2 else 12 << 20
-    # 第三个参数 noimg: 只生成非位图语料。兼容矩阵要用它 —— 位图会正当升到 v12,
-    # 老版本按设计拒绝读取, 那就测不到"v8 归档双向互通"了
+    # third arg noimg: generate only non-bitmap corpora. The compat matrix needs this --
+    # bitmaps legitimately bump to v12, which old builds reject by design, killing v8 interop
     noimg = len(sys.argv) > 3 and sys.argv[3] == "noimg"
     os.makedirs(root, exist_ok=True)
     rng = random.Random(20260912)
@@ -176,13 +176,13 @@ def main():
         ("records.json", gen_json, 0.22),
         ("series.bin", gen_struct, 0.14),
         ("random.bin", gen_random, 0.10),
-        # 未压缩位图: 光栅变换(逐行 MED / 逐行色彩去相关)的唯一端到端覆盖点
+        # uncompressed bitmaps: the only e2e coverage of raster transforms (row MED / row decorrelation)
         ("photo24.bmp", gen_bmp24, 0.06),
         ("photo32.bmp", gen_bmp32, 0.04),
     ]
     if noimg:
         parts = [p for p in parts if not p[0].endswith(".bmp")]
-        # 去掉位图后把份额重新归一化, 保持总量不变
+        # renormalize shares after dropping bitmaps, keeping the total unchanged
         s = sum(p[2] for p in parts)
         parts = [(n, f, w / s) for n, f, w in parts]
     for name, fn, frac in parts:
@@ -190,7 +190,7 @@ def main():
         with open(os.path.join(root, name), "wb") as f:
             f.write(fn(n, rng))
         print(f"  {name:14s} {n:>10,} B")
-    print(f"语料就绪: {root}")
+    print(f"corpus ready: {root}")
 
 
 if __name__ == "__main__":
