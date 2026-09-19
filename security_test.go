@@ -1,10 +1,10 @@
 package main
 
-// 恶意归档的安全用例。
+// security cases for hostile archives.
 //
-// 归档里的名字是**别人给的**, 不能信: 打包侧永远不会往归档里写 "../" 或指向
-// 外面的符号链接, 但解包侧必须假设对方递过来的就是一个精心构造的归档。
-// 这些用例全部是"先确认能攻进去, 再修"的路子 —— 修完如果又被人改回去, 测试会红。
+// names in an archive are **someone else's**, never trusted: pack never writes "../"
+// or outward symlinks, but unpack must assume a hand-crafted hostile archive.
+// each case first proves the attack works, then guards it; regressing the fix turns red.
 
 import (
 	"os"
@@ -12,11 +12,11 @@ import (
 	"testing"
 )
 
-// 造一个最小的归档对象: 只用来调 extractFile, 不碰固实流
+// build a minimal archive object: only for extractFile, no solid stream involved
 func emptyArchive() *archive { return &archive{} }
 
-// 攻击 1: 先放一个指向解包目录外的符号链接, 再放一个"在该链接之下"的文件条目。
-// 解包时 MkdirAll(父目录) 会**跟随**这个链接, 把目录建到外面去, 写文件也就写到外面了。
+// attack 1: an outward symlink entry, then a file entry "under" that link.
+// MkdirAll(parent) **follows** the link during unpack, building dirs and writing files outside.
 func TestNoWriteThroughDirSymlink(t *testing.T) {
 	dir := t.TempDir()
 	outside := filepath.Join(dir, "outside")
@@ -28,27 +28,27 @@ func TestNoWriteThroughDirSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	a := emptyArchive()
-	// 条目 1: 符号链接 out/link -> <outside>
+	// entry 1: symlink out/link -> <outside>
 	if runCatchingFatal(func() {
 		a.extractFile(fileEntry{name: "link", isLink: true, link: outside, mode: 0o777}, out, false)
 	}) {
-		t.Fatal("建符号链接条目失败")
+		t.Fatal("failed to build symlink entry")
 	}
-	// 条目 2: 文件 link/sub/f.txt —— 顺着链接就写到 outside/sub/f.txt 了
+	// entry 2: file link/sub/f.txt -- follows the link straight to outside/sub/f.txt
 	if runCatchingFatal(func() {
 		a.extractFile(fileEntry{name: "link/sub/f.txt", size: 0, mode: 0o644}, out, false)
 	}) {
-		t.Fatal("解出文件条目失败")
+		t.Fatal("failed to extract file entry")
 	}
 	if _, err := os.Lstat(filepath.Join(outside, "sub")); err == nil {
-		t.Fatalf("目录符号链接被跟随了: 在解包目录外建出了 %s", filepath.Join(outside, "sub"))
+		t.Fatalf("dir symlink followed: created %s outside the extract dir", filepath.Join(outside, "sub"))
 	}
 	if _, err := os.Lstat(filepath.Join(outside, "sub", "f.txt")); err == nil {
-		t.Fatalf("写穿符号链接: 文件被写到了 %s", filepath.Join(outside, "sub", "f.txt"))
+		t.Fatalf("wrote through symlink: file landed at %s", filepath.Join(outside, "sub", "f.txt"))
 	}
 }
 
-// 攻击 2: 目录条目本身落在符号链接之下(MkdirAll 直接建到外面)
+// attack 2: a dir entry itself sits under a symlink (MkdirAll builds outside)
 func TestNoMkdirThroughSymlink(t *testing.T) {
 	dir := t.TempDir()
 	outside := filepath.Join(dir, "outside")
@@ -59,19 +59,19 @@ func TestNoMkdirThroughSymlink(t *testing.T) {
 	if runCatchingFatal(func() {
 		a.extractFile(fileEntry{name: "link", isLink: true, link: outside, mode: 0o777}, out, false)
 	}) {
-		t.Fatal("建符号链接条目失败")
+		t.Fatal("failed to build symlink entry")
 	}
 	if runCatchingFatal(func() {
 		a.extractFile(fileEntry{name: "link/deep", isDir: true, mode: 0o755}, out, false)
 	}) {
-		t.Fatal("建目录条目失败")
+		t.Fatal("failed to build dir entry")
 	}
 	if _, err := os.Lstat(filepath.Join(outside, "deep")); err == nil {
-		t.Fatalf("目录条目顺着符号链接建到了解包目录外: %s", filepath.Join(outside, "deep"))
+		t.Fatalf("dir entry built outside the extract dir via symlink: %s", filepath.Join(outside, "deep"))
 	}
 }
 
-// 攻击 3: 符号链接指向解包目录内的上级(".."), 让后续条目绕出解包目录
+// attack 3: a symlink pointing at a parent ("..") lets later entries escape the extract dir
 func TestNoEscapeViaDotDotSymlink(t *testing.T) {
 	dir := t.TempDir()
 	outside := filepath.Join(dir, "outside")
@@ -80,17 +80,17 @@ func TestNoEscapeViaDotDotSymlink(t *testing.T) {
 	os.MkdirAll(out, 0o755)
 	a := emptyArchive()
 	if runCatchingFatal(func() {
-		// out/up -> out 的上一层(dir), 于是 out/up/outside 就是解包目录之外
+		// out/up -> parent of out (dir), so out/up/outside is outside the extract dir
 		a.extractFile(fileEntry{name: "up", isLink: true, link: filepath.Join("..", "outside"), mode: 0o777}, out, false)
 	}) {
-		t.Fatal("建符号链接条目失败")
+		t.Fatal("failed to build symlink entry")
 	}
 	if runCatchingFatal(func() {
 		a.extractFile(fileEntry{name: "up/pwned.txt", size: 0, mode: 0o644}, out, false)
 	}) {
-		t.Fatal("解出文件条目失败")
+		t.Fatal("failed to extract file entry")
 	}
 	if _, err := os.Lstat(filepath.Join(outside, "pwned.txt")); err == nil {
-		t.Fatalf("通过 ../ 符号链接写出了文件: %s", filepath.Join(outside, "pwned.txt"))
+		t.Fatalf("wrote a file through a ../ symlink: %s", filepath.Join(outside, "pwned.txt"))
 	}
 }

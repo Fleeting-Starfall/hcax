@@ -1,9 +1,9 @@
 package main
 
-// 老版本(v2~v5)归档的读取分支: 所有现存测试打的、解的**全是 v6+ 归档**,
-// 那段 90 行的兼容代码从没被执行过一次 —— 它坏掉也无人知晓。
-// 这里按 FORMAT.md 手工拼出 v3 / v5 归档的字节流, 直接喂给解包路径。
-// 顺带也把 FORMAT.md 里记的布局"用代码对一遍"。
+// read path for legacy (v2-v5) archives: every live test packs/unpacks **v6+ only**,
+// so that ~90-line compat code never runs -- a break there would go unnoticed.
+// hand-craft v3 / v5 byte streams per FORMAT.md and feed them straight to unpack.
+// this also cross-checks the FORMAT.md layout against code.
 
 import (
 	"bytes"
@@ -21,8 +21,8 @@ type legacyFile struct {
 	mode uint32
 }
 
-// 造一个 v3(无字典区)或 v5(有字典区, 本例字典数为 0)归档。
-// 布局: [头32B][数据区][原样区][块表][文件表][(v5)字典区][尾部20B]
+// build a v3 (no dict region) or v5 (dict region, zero dicts here) archive.
+// layout: [header 32B][data][raw][chunk table][file table][(v5) dicts][tail 20B]
 func buildLegacyArchive(t *testing.T, ver byte, comp, rawRegion []byte, files []legacyFile, chunks []chunkMeta) []byte {
 	t.Helper()
 	var ctEntry int
@@ -52,7 +52,7 @@ func buildLegacyArchive(t *testing.T, ver byte, comp, rawRegion []byte, files []
 	b.Write(comp)
 	b.Write(rawRegion)
 
-	// 块表: hash16 + offset + uncomp + stored[+xform(v4+)][+dictID(v5+)]
+	// chunk table: hash16 + offset + uncomp + stored [+xform(v4+)] [+dictID(v5+)]
 	for _, c := range chunks {
 		e := make([]byte, ctEntry)
 		copy(e[0:16], c.hash[:])
@@ -70,7 +70,7 @@ func buildLegacyArchive(t *testing.T, ver byte, comp, rawRegion []byte, files []
 		b.Write(e)
 	}
 
-	// 文件表: nameLen + name + size + mtime + mode + nChunks + chunks
+	// file table: nameLen + name + size + mtime + mode + nChunks + chunks
 	var total uint64
 	for i, f := range files {
 		nb := []byte(f.name)
@@ -79,12 +79,12 @@ func buildLegacyArchive(t *testing.T, ver byte, comp, rawRegion []byte, files []
 		binary.Write(&b, binary.LittleEndian, uint64(len(f.data)))
 		binary.Write(&b, binary.LittleEndian, uint64(1700000000))
 		binary.Write(&b, binary.LittleEndian, f.mode)
-		binary.Write(&b, binary.LittleEndian, uint32(1)) // 每个文件 1 个块
+		binary.Write(&b, binary.LittleEndian, uint32(1)) // 1 chunk per file
 		binary.Write(&b, binary.LittleEndian, uint32(i))
 		total += uint64(len(f.data))
 	}
 
-	if ver == 5 { // v5 必有字典区; 本例字典数为 0
+	if ver == 5 { // v5 always has a dict region; this case uses zero dicts
 		binary.Write(&b, binary.LittleEndian, uint32(0))
 	}
 	b.WriteString(trailerMag)
@@ -95,7 +95,7 @@ func buildLegacyArchive(t *testing.T, ver byte, comp, rawRegion []byte, files []
 }
 
 func TestReadLegacyArchive(t *testing.T) {
-	// 两个文件: 一个走压缩块(可压文本), 一个走原样区(随机数据)
+	// two files: one via a compressed chunk (compressible text), one via raw (random)
 	text := bytes.Repeat([]byte("hcax legacy format round-trip test. "), 60)
 	rnd := make([]byte, 700)
 	for i := range rnd {
@@ -123,27 +123,27 @@ func TestReadLegacyArchive(t *testing.T) {
 		if err := os.WriteFile(arc, blob, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		// list 能读出来
+		// list must read it
 		if runCatchingFatal(func() { listArchive(arc, false) }) {
-			t.Fatalf("v%d: list 失败", ver)
+			t.Fatalf("v%d: list failed", ver)
 		}
 		out := filepath.Join(dir, "out")
 		if runCatchingFatal(func() { unpack(arc, out, true, nil) }) {
-			t.Fatalf("v%d: 解包失败", ver)
+			t.Fatalf("v%d: unpack failed", ver)
 		}
 		for _, f := range files {
 			got, err := os.ReadFile(filepath.Join(out, f.name))
 			if err != nil {
-				t.Fatalf("v%d: 读回 %s: %v", ver, f.name, err)
+				t.Fatalf("v%d: reading back %s: %v", ver, f.name, err)
 			}
 			if !bytes.Equal(got, f.data) {
-				t.Errorf("v%d: %s 内容不符(%d vs %d 字节)", ver, f.name, len(got), len(f.data))
+				t.Errorf("v%d: %s content mismatch (%d vs %d bytes)", ver, f.name, len(got), len(f.data))
 			}
 		}
 	}
 }
 
-// 老版本靠"逐块 16B 哈希"校验(v6 起改成流级)。把块内容改坏必须被抓到。
+// legacy versions verify per-chunk 16B hashes (v6+ moved to stream-level). A flipped chunk must be caught.
 func TestLegacyChunkHashChecked(t *testing.T) {
 	text := bytes.Repeat([]byte("legacy hash check. "), 50)
 	enc, _ := zstd.NewWriter(nil, zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(3)))
@@ -151,7 +151,7 @@ func TestLegacyChunkHashChecked(t *testing.T) {
 	enc.Close()
 
 	h := hash16(text)
-	h[0] ^= 0xff // 故意写错哈希
+	h[0] ^= 0xff // deliberately corrupt the hash
 	chunks := []chunkMeta{{hash: h, uncomp: uint32(len(text)), offset: 0}}
 	files := []legacyFile{{name: "a.txt", data: text, mode: 0644}}
 	blob := buildLegacyArchive(t, 3, comp, nil, files, chunks)
@@ -159,8 +159,8 @@ func TestLegacyChunkHashChecked(t *testing.T) {
 	dir := t.TempDir()
 	arc := filepath.Join(dir, "bad.hcax")
 	os.WriteFile(arc, blob, 0o644)
-	// 块哈希不匹配 -> 必须干净报错, 而不是解出错误数据
+	// chunk hash mismatch -> must fail cleanly, not emit wrong data
 	if !runCatchingFatal(func() { unpack(arc, filepath.Join(dir, "out"), true, nil) }) {
-		t.Error("块哈希不符却没有报错 —— 老版本归档的校验形同虚设")
+		t.Error("chunk hash mismatch went unreported -- legacy archive verification is a no-op")
 	}
 }

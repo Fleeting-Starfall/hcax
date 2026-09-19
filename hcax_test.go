@@ -1,8 +1,8 @@
 package main
 
-// 单元测试: 锁住那些"改坏了会静默损坏数据"的纯函数。
-// 端到端的往返测试(见 test/regress.sh)跑一遍要几十秒, 而且一旦失败很难定位;
-// 这些用例毫秒级就能指出是哪个变换/哪条规则坏了。
+// Unit tests: pin down the pure functions whose breakage silently corrupts data.
+// End-to-end round trips (test/regress.sh) take tens of seconds and are hard to debug;
+// these cases point at the broken transform/rule in milliseconds.
 //
 //   go test ./...
 
@@ -21,7 +21,7 @@ import (
 	"time"
 )
 
-// ---------- 预处理变换必须可逆(否则解包就是静默的数据损坏) ----------
+// ---------- preprocess transforms must be invertible (else unpack silently corrupts) ----------
 
 func TestDeltaRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
@@ -31,7 +31,7 @@ func TestDeltaRoundTrip(t *testing.T) {
 		enc := deltaXform(src, d, false)
 		dec := deltaXform(enc, d, true)
 		if !bytes.Equal(dec, src) {
-			t.Fatalf("delta d=%d 不可逆", d)
+			t.Fatalf("delta d=%d not invertible", d)
 		}
 	}
 }
@@ -40,7 +40,7 @@ func TestBCJRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(2))
 	src := make([]byte, 8192)
 	rng.Read(src)
-	// 人为埋一些 E8/E9/0F8x 指令前缀, 保证真的走到变换分支
+	// plant E8/E9/0F8x opcode prefixes so the transform branch is really taken
 	for i := 0; i < 200; i++ {
 		src[rng.Intn(len(src)-8)] = 0xE8
 		src[rng.Intn(len(src)-8)] = 0x0F
@@ -48,7 +48,7 @@ func TestBCJRoundTrip(t *testing.T) {
 	enc := bcjX86(src, false)
 	dec := bcjX86(enc, true)
 	if !bytes.Equal(dec, src) {
-		t.Fatal("bcj-x86 不可逆")
+		t.Fatal("bcj-x86 not invertible")
 	}
 }
 
@@ -60,13 +60,13 @@ func TestApplyXformRoundTrip(t *testing.T) {
 		enc := applyXform(xf, src, false)
 		dec := applyXform(xf, enc, true)
 		if !bytes.Equal(dec, src) {
-			t.Fatalf("xform %d 不可逆", xf)
+			t.Fatalf("xform %d not invertible", xf)
 		}
 	}
 }
 
-// applyXformInPlace 必须与非 in-place 版本结果一致(chooseTransform 用前者选参,
-// 真正落盘用后者; 两者不一致会导致"选了 A 却按 B 编码")
+// applyXformInPlace must match the non-in-place variant (chooseTransform uses the
+// former to pick params, real writes use the latter; mismatch means "picked A, encoded B")
 func TestApplyXformInPlaceMatches(t *testing.T) {
 	rng := rand.New(rand.NewSource(4))
 	src := make([]byte, 1024)
@@ -76,12 +76,12 @@ func TestApplyXformInPlaceMatches(t *testing.T) {
 		applyXformInPlace(xf, a)
 		b := applyXform(xf, src, false)
 		if !bytes.Equal(a, b) {
-			t.Fatalf("xform %d: in-place 与非 in-place 结果不一致", xf)
+			t.Fatalf("xform %d: in-place and non-in-place results differ", xf)
 		}
 	}
 }
 
-// ---------- 路径校验: 既要挡住逃逸, 也不能误杀合法文件名 ----------
+// ---------- path validation: block escapes without killing legitimate names ----------
 
 func TestSafeName(t *testing.T) {
 	cases := []struct {
@@ -90,56 +90,56 @@ func TestSafeName(t *testing.T) {
 	}{
 		{"a.txt", true},
 		{"dir/a.txt", true},
-		{"a..b.txt", true},     // 合法: 连续两个点只是文件名的一部分
-		{"..weird.txt", true},  // 合法: Unix 下这就是个普通文件名
-		{"a/../b.txt", false},  // 逃逸
-		{"../b.txt", false},    // 逃逸
-		{"..", false},          // 逃逸
-		{"a/..", false},        // 逃逸
-		{"/etc/passwd", false}, // 绝对路径
-		{"", false},            // 空名
-		{`a\..\b.txt`, false},  // Windows 风格逃逸(Unix 上 \ 是合法字符, 但仍要挡)
+		{"a..b.txt", true},     // legit: consecutive dots are just part of a name
+		{"..weird.txt", true},  // legit: a plain file name on Unix
+		{"a/../b.txt", false},  // escape
+		{"../b.txt", false},    // escape
+		{"..", false},          // escape
+		{"a/..", false},        // escape
+		{"/etc/passwd", false}, // absolute path
+		{"", false},            // empty name
+		{`a\..\b.txt`, false},  // Windows-style escape (\\ is legal on Unix, still blocked)
 	}
 	for _, c := range cases {
 		if got := safeName(c.name); got != c.ok {
-			t.Errorf("safeName(%q) = %v, 期望 %v", c.name, got, c.ok)
+			t.Errorf("safeName(%q) = %v, want %v", c.name, got, c.ok)
 		}
 	}
 }
 
-// ---------- 归档根: 必须与 tar/zip 语义一致 ----------
+// ---------- archive root: must match tar/zip semantics ----------
 
 func TestCommonRoot(t *testing.T) {
 	cases := []struct {
 		in   []string
 		want string
 	}{
-		{[]string{"dir"}, "."},                 // 打包一个目录 -> 保留目录名
-		{[]string{"dir/a.txt"}, "dir"},         // 打包单个文件 -> 只存文件名
+		{[]string{"dir"}, "."},                 // packing one dir -> keep the dir name
+		{[]string{"dir/a.txt"}, "dir"},         // packing one file -> store the file name only
 		{[]string{"a.txt", "b.txt"}, "."},      //
-		{[]string{"d1", "d2"}, "."},            // 多个顶层目录
-		{[]string{"/x/y/z", "/x/y/w"}, "/x/y"}, // 绝对路径: 不能丢掉开头的 /
+		{[]string{"d1", "d2"}, "."},            // multiple top-level dirs
+		{[]string{"/x/y/z", "/x/y/w"}, "/x/y"}, // absolute paths: keep the leading /
 		{[]string{"/x/y/a.txt", "/x/y/b.txt"}, "/x/y"},
 	}
 	for _, c := range cases {
 		if got := commonRoot(c.in); got != c.want {
-			t.Errorf("commonRoot(%v) = %q, 期望 %q", c.in, got, c.want)
+			t.Errorf("commonRoot(%v) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }
 
-// 回归: 目录里的文件全在子目录中时, 归档根不能被推得太深
-// (src/main/go/main.go 曾存成 main.go, go/ 这一层直接消失)
+// regression: with all files inside one subdir, the archive root must not be pushed too deep
+// (src/main/go/main.go used to be stored as main.go, the go/ level vanished)
 func TestCommonRootNotTooDeep(t *testing.T) {
 	got := commonRoot([]string{"src"})
 	if got != "." {
-		t.Fatalf("commonRoot([src]) = %q, 期望 \".\"(否则目录结构会被拍平)", got)
+		t.Fatalf("commonRoot([src]) = %q, want \".\" (else the dir tree flattens)", got)
 	}
 }
 
-// ---------- 分块器 ----------
+// ---------- chunker ----------
 
-// 同样的输入必须切出同样的块(去重依赖内容寻址: 切法变了, 旧归档就读不对了)
+// identical input must chunk identically (dedup relies on content addressing:
 func TestChunkerDeterministic(t *testing.T) {
 	rng := rand.New(rand.NewSource(5))
 	data := make([]byte, 300000)
@@ -154,16 +154,16 @@ func TestChunkerDeterministic(t *testing.T) {
 		ch.flush()
 	}
 	if len(a) != len(b) {
-		t.Fatalf("两次分块块数不同: %d vs %d", len(a), len(b))
+		t.Fatalf("two chunkings differ in count: %d vs %d", len(a), len(b))
 	}
 	for i := range a {
 		if !bytes.Equal(a[i], b[i]) {
-			t.Fatalf("第 %d 块内容不同", i)
+			t.Fatalf("chunk %d content differs", i)
 		}
 	}
 }
 
-// 分块必须无损: 所有块拼回来要等于原始输入
+// chunking must be lossless: reassembled chunks equal the input
 func TestChunkerLossless(t *testing.T) {
 	rng := rand.New(rand.NewSource(6))
 	for _, n := range []int{0, 1, 100, 8192, 8193, 300000} {
@@ -174,42 +174,42 @@ func TestChunkerLossless(t *testing.T) {
 		ch.write(data)
 		ch.flush()
 		if !bytes.Equal(out, data) {
-			t.Fatalf("长度 %d: 分块拼接后与输入不一致", n)
+			t.Fatalf("len %d: reassembled chunks differ from input", n)
 		}
-		// 块大小必须在 [chunkMin, chunkMax] 之间(最后一块除外)
+		// chunk size must stay within [chunkMin, chunkMax] (last chunk excepted)
 		var sizes []int
 		ch2 := newChunker(func(c []byte) { sizes = append(sizes, len(c)) })
 		ch2.write(data)
 		ch2.flush()
 		for i, s := range sizes {
 			if i < len(sizes)-1 && (s < chunkMin || s > chunkMax) {
-				t.Fatalf("长度 %d: 第 %d 块大小 %d 越界", n, i, s)
+				t.Fatalf("len %d: chunk %d size %d out of range", n, i, s)
 			}
 		}
 	}
 }
 
-// ---------- 字节熵 ----------
+// ---------- byte entropy ----------
 
 func TestByteEntropy(t *testing.T) {
 	rng := rand.New(rand.NewSource(7))
 	rnd := make([]byte, 65536)
 	rng.Read(rnd)
 	if e := byteEntropy(rnd); e < 7.9 {
-		t.Errorf("随机数据熵 %.3f 偏低(应接近 8)", e)
+		t.Errorf("random data entropy %.3f too low (want ~8)", e)
 	}
-	same := make([]byte, 65536) // 全 0
+	same := make([]byte, 65536) // all zero
 	if e := byteEntropy(same); e > 0.01 {
-		t.Errorf("常量数据熵 %.3f 偏高(应接近 0)", e)
+		t.Errorf("constant data entropy %.3f too high (want ~0)", e)
 	}
 }
 
-// ---------- CM: 压缩再解压必须还原 ----------
+// ---------- CM: compress then decompress must restore ----------
 
 func TestCMRoundTrip(t *testing.T) {
 	rng := rand.New(rand.NewSource(8))
 	src := make([]byte, 20000)
-	// 造一段有统计结构的数据(CM 靠预测, 纯随机数据压不动也没意义)
+	// build statistically structured data (CM predicts; pure random neither compresses nor tests)
 	words := []byte("the quick brown fox jumps over the lazy dog ")
 	for i := 0; i < len(src); i++ {
 		src[i] = words[rng.Intn(len(words))]
@@ -217,35 +217,35 @@ func TestCMRoundTrip(t *testing.T) {
 	enc := cmCompress(src)
 	dec := cmDecompress(enc, int64(len(src)))
 	if !bytes.Equal(dec, src) {
-		t.Fatal("CM 解压结果与原文不一致")
+		t.Fatal("CM decompressed output differs from input")
 	}
 }
 
-// CM 帧头那 8 字节长度是**不可信**的(归档被改坏就是任意值), 而 CM 逐 bit 解码
-// 没有天然结束标记 —— 解码器读完输入会一直补 0, 唯一的终止条件就是这个长度。
-// 少了这道上限, 一个损坏的 text 归档能让 hcax list 永久挂死(实测: 单核跑满,
-// 调用栈停在 cmCodec.update)。
+// the 8-byte length in the CM frame header is **untrusted** (arbitrary when tampered),
+// and CM decodes bit by bit with no natural end marker -- after input it keeps padding 0,
+// so without this cap a corrupt text archive hangs hcax list forever (observed: one core
+// pegged, stack stuck in cmCodec.update).
 func TestCMRejectsAbsurdDeclaredLength(t *testing.T) {
 	src := bytes.Repeat([]byte("abcdefgh"), 64)
 	enc := cmCompress(src)
-	// 把帧头的 8 字节长度改成天文数字
+	// set the frame header length to an astronomic number
 	binary.LittleEndian.PutUint64(enc[1:9], ^uint64(0)>>4)
-	// 上限给到正常值: 必须**报错**, 不能去解码 2^60 个字节
+	// normal cap: must **error out**, not try to decode 2^60 bytes
 	if err := cmDecompressTo(io.Discard, enc, int64(len(src))); err == nil {
-		t.Fatal("声明天文数字长度的 CM 帧没有被拒绝 —— 解码器会一直跑到挂死")
+		t.Fatal("CM frame claiming astronomic length was accepted -- decoder would run forever")
 	}
-	// 反向验证: 完好的帧配上正确的上限必须正常解开, 别把这条检查写成误伤
+	// reverse check: an intact frame with the right cap must decode fine (no false positive)
 	good := cmCompress(src)
 	var out bytes.Buffer
 	if err := cmDecompressTo(&out, good, int64(len(src))); err != nil {
-		t.Fatalf("完好帧被误拒: %v", err)
+		t.Fatalf("intact frame wrongly rejected: %v", err)
 	}
 	if !bytes.Equal(out.Bytes(), src) {
-		t.Fatal("完好帧解出的内容不对")
+		t.Fatal("intact frame decoded to wrong content")
 	}
 }
 
-// ---------- 光栅变换可逆(文件级, 一旦不可逆整个图片就废了) ----------
+// ---------- raster transforms invertible (file-level; one bad inversion ruins the image) ----------
 
 func makeTestBMP(w, h, bpp int) []byte {
 	rowSize := ((w*bpp/8 + 3) / 4) * 4
@@ -260,7 +260,7 @@ func makeTestBMP(w, h, bpp int) []byte {
 	binary.LittleEndian.PutUint32(b[22:], uint32(h))
 	binary.LittleEndian.PutUint16(b[26:], 1) // planes
 	binary.LittleEndian.PutUint16(b[28:], uint16(bpp))
-	// 像素填成带梯度的内容(全 0 的话压不压都一样, 测不出问题)
+	// fill pixels with a gradient (all-zero would compress identically and prove nothing)
 	rng := rand.New(rand.NewSource(99))
 	for i := off; i < len(b); i++ {
 		b[i] = byte(rng.Intn(256))
@@ -269,53 +269,53 @@ func makeTestBMP(w, h, bpp int) []byte {
 }
 
 func TestRasterRoundTrip(t *testing.T) {
-	// 宽度取 13..20: 24bpp 时行填充分别是 3/2/1/0/3/2/1/0 字节,
-	// 覆盖"行跨距不是 3 的倍数"(宽%4 ∈ {1,2})这个最容易出错的情形
+	// widths 13..20: at 24bpp the row paddings are 3/2/1/0/3/2/1/0 bytes,
+	// covering the error-prone "row stride not a multiple of 3" (width%%4 in {1,2})
 	for _, bpp := range []int{8, 24, 32} {
 		for _, w := range []int{13, 14, 15, 16, 17, 18, 19, 20} {
 			src := makeTestBMP(w, 9, bpp)
 			for _, xf := range []byte{xfRasterMed, xfRasterRctMed, xfRasterRowMed, xfRasterRowRctMed} {
 				buf := append([]byte(nil), src...)
 				if !rasterApply(xf, buf, true) {
-					continue // 该 bpp 不支持此变换(如灰度图无 RCT)
+					continue // transform unsupported for this bpp (e.g. no RCT for grayscale)
 				}
 				if bytes.Equal(buf, src) {
-					t.Fatalf("bpp=%d w=%d xform=%d: 正向变换后数据没变(可能是空操作)", bpp, w, xf)
+					t.Fatalf("bpp=%d w=%d xform=%d: forward transform left data unchanged (no-op?)", bpp, w, xf)
 				}
 				if !rasterApply(xf, buf, false) {
-					t.Fatalf("bpp=%d w=%d xform=%d: 逆变换失败", bpp, w, xf)
+					t.Fatalf("bpp=%d w=%d xform=%d: inverse transform failed", bpp, w, xf)
 				}
 				if !bytes.Equal(buf, src) {
-					t.Fatalf("bpp=%d w=%d xform=%d: 逆变换后与原文不一致(图片会损坏)", bpp, w, xf)
+					t.Fatalf("bpp=%d w=%d xform=%d: inverse differs from input (image would corrupt)", bpp, w, xf)
 				}
 			}
 		}
 	}
 }
 
-// 逐行变换(8/9)必须保留行尾填充字节原样 —— 填充恒为 0, 被残差化反而变大。
+// row transforms (8/9) must keep trailing padding bytes untouched -- padding is always 0,
 func TestRasterRowAwareKeepsPadding(t *testing.T) {
-	src := makeTestBMP(17, 9, 24) // stride=52, 每行 1 字节填充
+	src := makeTestBMP(17, 9, 24) // stride=52, 1 padding byte per row
 	g, ok := rasterInfo(src)
 	if !ok || g.stride-g.rowBytes != 1 {
-		t.Fatalf("构造的 BMP 应当有 1 字节行填充, 实际 stride=%d rowBytes=%d", g.stride, g.rowBytes)
+		t.Fatalf("test BMP should have 1 padding byte per row, got stride=%d rowBytes=%d", g.stride, g.rowBytes)
 	}
 	for _, xf := range []byte{xfRasterRowMed, xfRasterRowRctMed} {
 		buf := append([]byte(nil), src...)
 		if !rasterApply(xf, buf, true) {
-			t.Fatalf("xform=%d: 正向变换失败", xf)
+			t.Fatalf("xform=%d: forward transform failed", xf)
 		}
 		for y := 0; y < g.rows; y++ {
 			p := g.dataOff + y*g.stride + g.rowBytes
 			if buf[p] != src[p] {
-				t.Fatalf("xform=%d: 第 %d 行填充字节被改动了(%d -> %d)", xf, y, src[p], buf[p])
+				t.Fatalf("xform=%d: padding byte of row %d modified (%d -> %d)", xf, y, src[p], buf[p])
 			}
 		}
 	}
 }
 
-// 逐行变换存在的意义: 宽%4∈{1,2} 的 24bpp BMP 上, 旧的扁平 RCT 会让通道相位逐行漂移,
-// MED 的竖直预测因此失效, 结果比"不做色彩去相关"还差一大截。这里锁住这个收益。
+// why row transforms exist: on 24bpp BMPs with width%%4 in {1,2}, the old flat RCT
+// drifts channel phase per row, killing MED vertical prediction and losing to no decorrelation.
 func TestRasterRowAwareBeatsFlat(t *testing.T) {
 	for _, w := range []int{101, 102} { // pad=1 / pad=2
 		src := makePhotoBMP(w, 120, 24)
@@ -325,18 +325,18 @@ func TestRasterRowAwareBeatsFlat(t *testing.T) {
 			}
 			b := append([]byte(nil), src...)
 			if !rasterApply(xf, b, true) {
-				t.Fatalf("w=%d xform=%d: 变换失败", w, xf)
+				t.Fatalf("w=%d xform=%d: transform failed", w, xf)
 			}
 			return gateSize(nil, b)
 		}
 		flat, row := sz(xfRasterRctMed), sz(xfRasterRowRctMed)
 		if row >= flat {
-			t.Errorf("w=%d: 逐行 RCT(%d) 未优于扁平 RCT(%d)", w, row, flat)
+			t.Errorf("w=%d: row RCT(%d) not better than flat RCT(%d)", w, row, flat)
 		}
 		if row >= sz(xfRasterRowMed) {
-			t.Errorf("w=%d: 逐行 RCT(%d) 未优于只做 MED(%d)", w, row, sz(xfRasterRowMed))
+			t.Errorf("w=%d: row RCT(%d) not better than MED alone(%d)", w, row, sz(xfRasterRowMed))
 		}
-		// 关键: 扁平版本被门控淘汰后, 现状最多只能选 MED; 逐行版应当明显更好
+		// key: once the flat variant is gated out, today can pick at best MED; row should win clearly
 		best := flat
 		if v := sz(xfRasterRowMed); v < best {
 			best = v
@@ -345,12 +345,12 @@ func TestRasterRowAwareBeatsFlat(t *testing.T) {
 			best = v
 		}
 		if float64(row) > float64(best)*0.97 {
-			t.Errorf("w=%d: 逐行 RCT(%d) 相对旧路径最优值(%d) 收益不足 3%%", w, row, best)
+			t.Errorf("w=%d: row RCT(%d) gains less than 3%% over old-path best(%d)", w, row, best)
 		}
 	}
 }
 
-// 照片风格 BMP: 通道间高度相关(R≈G≈B) + 低频渐变 + 少量噪声, 用来测压率而非只测可逆性
+// photo-style BMP: highly correlated channels (R~G~B) + low-frequency gradient + a little noise,
 func makePhotoBMP(w, h, bpp int) []byte {
 	ch := bpp / 8
 	if ch < 3 {
@@ -391,7 +391,7 @@ func clampByte(v float64) int {
 	return int(v)
 }
 
-// ---------- 元数据序列化/解析往返 ----------
+// ---------- metadata serialize/parse round trip ----------
 
 func TestMetaRoundTrip(t *testing.T) {
 	chunks := []*chunkMeta{
@@ -413,49 +413,49 @@ func TestMetaRoundTrip(t *testing.T) {
 	gotChunks, gotFiles, gotSH, gotRH := parseMeta(raw, uint32(len(chunks)), uint32(len(files)), version)
 
 	if gotSH != sh || gotRH != rh {
-		t.Fatal("流级哈希往返不一致")
+		t.Fatal("stream hash round trip mismatch")
 	}
 	if len(gotChunks) != len(chunks) || len(gotFiles) != len(files) {
-		t.Fatalf("条目数不符: 块 %d/%d 文件 %d/%d", len(gotChunks), len(chunks), len(gotFiles), len(files))
+		t.Fatalf("count mismatch: chunks %d/%d files %d/%d", len(gotChunks), len(chunks), len(gotFiles), len(files))
 	}
 	for i := range chunks {
 		if gotChunks[i].uncomp != chunks[i].uncomp || gotChunks[i].stored != chunks[i].stored ||
 			gotChunks[i].xform != chunks[i].xform || (gotChunks[i].dictID != 0) != (chunks[i].dictID != 0) {
-			t.Errorf("块 %d 往返不一致: %+v vs %+v", i, gotChunks[i], chunks[i])
+			t.Errorf("chunk %d round trip mismatch: %+v vs %+v", i, gotChunks[i], chunks[i])
 		}
 	}
 	for i := range files {
 		g, w := gotFiles[i], files[i]
 		if g.name != w.name || g.size != w.size || g.mtime != w.mtime || g.mode != w.mode ||
 			g.isDir != w.isDir || g.isLink != w.isLink || g.link != w.link || g.xform != w.xform {
-			t.Errorf("文件 %d 往返不一致: %+v vs %+v", i, g, w)
+			t.Errorf("file %d round trip mismatch: %+v vs %+v", i, g, w)
 		}
 		if len(g.chunks) != len(w.chunks) {
-			t.Errorf("文件 %d 块索引数不一致", i)
+			t.Errorf("file %d chunk index count mismatch", i)
 		}
 	}
-	// 块偏移: 可压块与原样块各自顺序累加(v6 起不再存偏移)
+	// chunk offsets: comp and raw regions accumulate separately (not stored since v6)
 	var compOff, rawOff uint64
 	for i, c := range gotChunks {
 		if c.stored {
 			if c.offset != rawOff {
-				t.Errorf("块 %d 原样偏移 %d 期望 %d", i, c.offset, rawOff)
+				t.Errorf("chunk %d raw offset %d want %d", i, c.offset, rawOff)
 			}
 			rawOff += uint64(c.uncomp)
 		} else {
 			if c.offset != compOff {
-				t.Errorf("块 %d 固实偏移 %d 期望 %d", i, c.offset, compOff)
+				t.Errorf("chunk %d comp offset %d want %d", i, c.offset, compOff)
 			}
 			compOff += uint64(c.uncomp)
 		}
 	}
 }
 
-// ---------- 版本决策 ----------
+// ---------- version decisions ----------
 
-// 版本策略是"能不升就不升": 升级意味着旧版二进制读不了, 必须有真理由。
-// dictFor 的档位是有实测依据的, 不是随手写的: 多样语料上 4MiB 之后加字典零收益,
-// 可执行文件上 8→16MiB 还能再省 4%。这里把档位钉住, 免得以后被"顺手调小"。
+// version policy: "bump only when needed" -- a bump strands old binaries, must earn it.
+// dictFor tiers are measured, not hand-waved: on mixed corpora, past 4MiB a bigger
+// dict gains nothing; executables save 4%% more at 16MiB. Pin the tiers so nobody trims them.
 func TestDictFor(t *testing.T) {
 	cases := []struct {
 		n    int
@@ -464,12 +464,12 @@ func TestDictFor(t *testing.T) {
 		{1 << 20, "2MiB"},
 		{4 << 20, "4MiB"},
 		{15 << 20, "4MiB"},
-		{16 << 20, "16MiB"}, // 20MB 的 Mach-O 从这里拿到 16MiB, 省 4%
+		{16 << 20, "16MiB"}, // a 20MB Mach-O gets 16MiB here, saving 4%
 		{500 << 20, "16MiB"},
 	}
 	for _, c := range cases {
 		if got := dictFor(c.n); got != c.want {
-			t.Errorf("dictFor(%d) = %s, 期望 %s", c.n, got, c.want)
+			t.Errorf("dictFor(%d) = %s, want %s", c.n, got, c.want)
 		}
 	}
 }
@@ -489,23 +489,23 @@ func TestWriteVer(t *testing.T) {
 		precise bool
 		want    byte
 	}{
-		{"普通文件(哪怕带亚秒时间戳)仍写 v8", plain, false, 8},
-		{"含符号链接升 v9", withLink, false, 9},
-		{"含 sticky 位升 v10", sticky, false, 10},
-		{"2038 之后的时间戳升 v10", future, false, 10},
-		{"-T 显式要求纳秒则升 v10", plain, true, 10},
-		{"旧的扁平光栅变换(6/7)不升版本", oldXform, false, 8},
-		{"逐行光栅变换(8/9)升 v12", rowXform, false, 12},
+		{"plain file (even with sub-second mtime) stays v8", plain, false, 8},
+		{"symlink bumps to v9", withLink, false, 9},
+		{"sticky bit bumps to v10", sticky, false, 10},
+		{"post-2038 mtime bumps to v10", future, false, 10},
+		{"-T explicitly asks ns, bumps to v10", plain, true, 10},
+		{"legacy flat raster transforms (6/7) keep v8", oldXform, false, 8},
+		{"row raster transforms (8/9) bump to v12", rowXform, false, 12},
 	}
 	for _, c := range cases {
 		if got := writeVer(c.files, c.precise); got != c.want {
-			t.Errorf("%s: 得到 v%d, 期望 v%d", c.name, got, c.want)
+			t.Errorf("%s: got v%d, want v%d", c.name, got, c.want)
 		}
 	}
 }
 
-// v8 归档必须只落地"老格式装得下"的元数据(权限截到 0777、时间截到秒),
-// 否则写出去的字节流老版本按自己的布局解析会错位。
+// v8 archives must persist only metadata the old format can hold (mode to 0777,
+// time to seconds); otherwise old builds parse the bytes with a shifted layout.
 func TestMetaRoundTripV8(t *testing.T) {
 	files := []fileEntry{
 		{name: "a.txt", size: 5, mtime: 12345, mode: 0644},
@@ -515,14 +515,14 @@ func TestMetaRoundTripV8(t *testing.T) {
 	raw := serializeMeta(nil, files, sh, rh, 8)
 	_, got, _, _ := parseMeta(raw, 0, uint32(len(files)), 8)
 	if got[0].mtime != 12345 {
-		t.Errorf("v8 时间往返不一致: %d", got[0].mtime)
+		t.Errorf("v8 mtime round trip mismatch: %d", got[0].mtime)
 	}
 	if got[1].mode != 0755 {
-		t.Errorf("v8 应把权限截到 0777, 实际 %o", got[1].mode)
+		t.Errorf("v8 should clamp mode to 0777, got %o", got[1].mode)
 	}
 }
 
-// ---------- verify 的逻辑一致性检查 ----------
+// ---------- verify logical consistency checks ----------
 
 func TestCheckLogical(t *testing.T) {
 	a := &archive{
@@ -530,59 +530,59 @@ func TestCheckLogical(t *testing.T) {
 		files:  []fileEntry{{name: "f", size: 150, chunks: []uint32{0, 1}}},
 	}
 	if runCatchingFatal(a.checkLogical) {
-		t.Error("一致的归档不该报错")
+		t.Error("a consistent archive must not error")
 	}
 	a.files[0].size = 149
 	if !runCatchingFatal(a.checkLogical) {
-		t.Error("size 与块长不符必须报错 —— 否则 verify 会把自相矛盾的归档判为通过")
+		t.Error("size mismatching chunk lengths must error -- else verify passes self-contradictory archives")
 	}
-	// 目录与链接不产生数据块, 不参与这项检查
+	// dirs and links carry no data chunks; skip them in this check
 	a.files = []fileEntry{{name: "d", isDir: true}, {name: "l", isLink: true, link: "x"}}
 	if runCatchingFatal(a.checkLogical) {
-		t.Error("目录/链接条目不该参与块长校验")
+		t.Error("dir/link entries must not be part of chunk-length checks")
 	}
 }
 
-// ---------- 恶意/损坏归档: 声明一个巨额块, 不能先吃掉 4GB 内存 ----------
+// ---------- hostile/corrupt archives: a huge declared chunk must not eat 4GB up front ----------
 
 func TestAbsurdChunkSizeRejected(t *testing.T) {
 	files := []fileEntry{{name: "a.txt", size: 100, mode: 0644, chunks: []uint32{0}}}
 	var sh, rh [8]byte
-	// 块表里声明 0xFFFFFFFF(~4GB): 真实数据只有 100 字节
+	// chunk table claims 0xFFFFFFFF (~4GB); real data is 100 bytes
 	raw := serializeMeta([]*chunkMeta{{uncomp: 0xFFFFFFFF}}, files, sh, rh, 8)
 	if !runCatchingFatal(func() { parseMeta(raw, 1, 1, 8) }) {
-		t.Error("声明 4GB 的块没有被拒绝 —— readChunk 会先 make 出 4GB 再发现数据不够")
+		t.Error("4GB-declared chunk accepted -- readChunk would make 4GB then find short data")
 	}
-	// 正常大小必须放行(别把这条检查写成误伤)
+	// normal sizes must pass (no false positive)
 	raw2 := serializeMeta([]*chunkMeta{{uncomp: 4096}}, files, sh, rh, 8)
 	parseMeta(raw2, 1, 1, 8)
 }
 
-// ---------- 打包期间源文件被改写: 归档必须仍自洽 ----------
+// ---------- source files modified mid-pack: the archive must stay self-consistent ----------
 
 func TestSizedReadAccountsActualBytes(t *testing.T) {
 	unmute := muteStdio(t)
 	defer unmute()
-	// 没变 -> 原样返回 stat 的大小, 且不报警告
+	// unchanged -> return the stat size as-is, no warning
 	if got := sizedRead("f", 100, 100); got != 100 {
-		t.Errorf("大小没变时应原样返回 100, 实际 %d", got)
+		t.Errorf("unchanged should return 100 as-is, got %d", got)
 	}
-	// 变小/变大 -> 按实读记账(归档内部才自洽)
+	// smaller/larger -> account by bytes actually read (keeps the archive self-consistent)
 	if got := sizedRead("f", 100, 70); got != 70 {
-		t.Errorf("文件变小时应按实读记 70, 实际 %d", got)
+		t.Errorf("shrunk file should account 70 bytes read, got %d", got)
 	}
 	if got := sizedRead("f", 100, 140); got != 140 {
-		t.Errorf("文件变大时应按实读记 140, 实际 %d", got)
+		t.Errorf("grown file should account 140 bytes read, got %d", got)
 	}
 }
 
 func TestPackSurvivesFileChangingUnderfoot(t *testing.T) {
-	// 打包期间源文件被别的过程改写是常态(日志、数据库、正在下载的文件)。
-	// 老代码一律按打开时 stat 的大小记账, 于是写出"声明 N 字节、实际 M 字节"
-	// 的归档 —— 打包报成功, 要等解包才炸。
+	// files being modified mid-pack is the norm (logs, DBs, in-flight downloads).
+	// old code accounted by the stat size at open, writing archives that declare N bytes
+	// but hold M -- pack reported success, the explosion waited for unpack.
 	//
-	// 这条不断言"竞态一定发生"(那会变成 flaky 用例), 只断言**不变式**:
-	// 文件在变也好、没变也好, 打出来的归档都必须自洽(解得开)。
+	// this case does not assert the race happens (that would be flaky), only the invariant:
+	// whatever happens to the files, the archive must stay self-consistent (unpacks).
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")
 	if err := os.MkdirAll(src, 0o755); err != nil {
@@ -592,7 +592,7 @@ func TestPackSurvivesFileChangingUnderfoot(t *testing.T) {
 	if err := os.WriteFile(big, bytes.Repeat([]byte("log line ................\n"), 300000), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// 后台持续追加, 制造"文件在脚下变化"。必须设上限, 否则几秒就能把盘写满。
+	// append in the background so the file changes underfoot. Cap it or it fills the disk.
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -621,59 +621,59 @@ func TestPackSurvivesFileChangingUnderfoot(t *testing.T) {
 	close(stop)
 	wg.Wait()
 
-	// 不变式: 归档必须解得开(verify=true 会连流级校验一起做)
+	// invariant: the archive must unpack (verify=true also runs stream-level checks)
 	out := filepath.Join(dir, "out")
 	unmute = muteStdio(t)
 	fataled := runCatchingFatal(func() { unpack(arc, out, true, nil) })
 	unmute()
 	if fataled {
-		t.Fatal("源文件在打包期间被改写后, 打出的归档解不开 —— 归档内部不自洽")
+		t.Fatal("archive packed while sources changed does not unpack -- internally inconsistent")
 	}
 }
 
-// ---------- 系统 xz 缺失时必须报警, 不能静默降级 ----------
+// ---------- missing system xz must warn, not silently degrade ----------
 
 func TestXZFallbackWarns(t *testing.T) {
-	// 系统 xz 不在 PATH 时, max/ultra 会回退到内置的纯 Go lzma2。
-	// 这不是"慢一点"而已 —— 同一语料实测 26.89% -> 33.40%, 归档凭空大 24%。
-	// 此前这条路径完全静默, 用户以为自己在用最强档。这里锁住"必须报一次警"。
+	// without system xz on PATH, max/ultra fall back to the built-in pure-Go lzma2.
+	// this is not merely "slower" -- measured 26.89% -> 33.40% on one corpus, 24% bigger.
+	// that path used to be fully silent while users thought they were on max. Pin one warning.
 	//
-	// exec.LookPath 每次调用都现读 PATH, 把它指向一个空目录就必然找不到 xz,
-	// 于是这条用例在"装了 xz / 没装 xz"的机器上都能稳定触发回退分支。
+	// exec.LookPath re-reads PATH each call; pointing it at an empty dir guarantees no xz,
+	// so the fallback branch triggers reliably on machines with or without xz.
 	t.Setenv("PATH", t.TempDir())
 
 	before := xzWarnCount
-	xzWarnOnce = sync.Once{} // sync.Once 触发后无法重置, 换一个新的让本用例独立计数
+	xzWarnOnce = sync.Once{} // sync.Once cannot reset; swap in a fresh one for independent counting
 	b := &backend{}
 	if out := b.xzCompress(bytes.NewReader([]byte("hello, world")), "3", "2", "2MiB"); out != nil {
-		t.Fatal("PATH 里没有 xz, xzCompress 必须返回 nil, 好让上层走到回退实现")
+		t.Fatal("without xz on PATH, xzCompress must return nil so the caller falls back")
 	}
 	if xzWarnCount != before+1 {
-		t.Errorf("系统 xz 缺失时必须恰好警告一次(实际新增 %d 次)", xzWarnCount-before)
+		t.Errorf("missing system xz must warn exactly once (got %d new)", xzWarnCount-before)
 	}
 }
 
-// ---------- extract 的目标路径要能容忍 ./ 前缀 ----------
+// ---------- extract targets must tolerate a ./ prefix ----------
 
 func TestNormAsk(t *testing.T) {
-	// 注: 不测 "d\\sub" —— filepath.ToSlash 只在 Windows 上转换(Unix 里反斜杠
-	// 是合法的文件名字符), 在 macOS/Linux 上它本来就是恒等变换。
+	// note: "d\\sub" is not tested -- filepath.ToSlash converts only on Windows (backslash
+	// is a legal filename char on Unix), where it is already the identity.
 	cases := [][2]string{
-		{"d/sub/r.bin", "d/sub/r.bin"}, // 原样
+		{"d/sub/r.bin", "d/sub/r.bin"}, // as-is
 		{"./d/sub/r.bin", "d/sub/r.bin"},
 		{"././d", "d"},
 		{"/d/sub", "d/sub"},
-		{"d/sub/", "d/sub"}, // 目录后面的斜杠
+		{"d/sub/", "d/sub"}, // trailing slash on a dir
 		{"", ""},
 	}
 	for _, c := range cases {
 		if got := normAsk(c[0]); got != c[1] {
-			t.Errorf("normAsk(%q) = %q, 期望 %q", c[0], got, c[1])
+			t.Errorf("normAsk(%q) = %q, want %q", c[0], got, c[1])
 		}
 	}
 }
 
-// ---------- 读必须检查返回值: 短读会让 buffer 里留下零(静默损坏) ----------
+// ---------- reads must check the return: short reads leave zeros in the buffer (silent corruption) ----------
 
 func TestMustReadAt(t *testing.T) {
 	unmute := muteStdio(t)
@@ -681,28 +681,28 @@ func TestMustReadAt(t *testing.T) {
 	data := []byte("0123456789")
 	r := bytes.NewReader(data)
 
-	// 正常读: 不 fatal
+	// normal read: no fatal
 	buf := make([]byte, 4)
-	if runCatchingFatal(func() { mustReadAt(r, buf, 2, "测试") }) {
-		t.Fatal("正常读取不该 fatal")
+	if runCatchingFatal(func() { mustReadAt(r, buf, 2, "test") }) {
+		t.Fatal("a normal read must not fatal")
 	}
 	if string(buf) != "2345" {
-		t.Errorf("读到 %q, 期望 \"2345\"", buf)
+		t.Errorf("read %q, want \"2345\"", buf)
 	}
-	// 短读: 越界读 -> buffer 里会留下零, 必须 fatal
+	// short read: past-end read leaves zeros in the buffer; must fatal
 	over := make([]byte, 20)
-	if !runCatchingFatal(func() { mustReadAt(r, over, 5, "测试") }) {
-		t.Error("短读必须 fatal —— 否则 buffer 里剩下的零会被当数据写进归档")
+	if !runCatchingFatal(func() { mustReadAt(r, over, 5, "test") }) {
+		t.Error("short read must fatal -- leftover zeros would be written as data")
 	}
-	// 空读: 不该因为 0 长度就报错
-	if runCatchingFatal(func() { mustReadAt(r, nil, 0, "测试") }) {
-		t.Error("0 字节的读取不该 fatal")
+	// empty read: a 0-length read must not error
+	if runCatchingFatal(func() { mustReadAt(r, nil, 0, "test") }) {
+		t.Error("a 0-byte read must not fatal")
 	}
 }
 
-// ---------- 截断归档必须"干净失败", 不许 panic ----------
+// ---------- truncated archives must fail cleanly, never panic ----------
 
-// 静音: 下面要跑几千次解析, 让它们往测试输出里打印毫无意义
+// mute: thousands of parses below; printing each to test output is pointless
 func muteStdio(t *testing.T) func() {
 	t.Helper()
 	dn, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
@@ -718,16 +718,16 @@ func muteStdio(t *testing.T) func() {
 }
 
 func TestTruncatedArchiveNeverPanics(t *testing.T) {
-	// 截断归档是最容易撞出 panic 的输入: 头部说"元数据 N 字节 / 数据 M 字节",
-	// 而文件实际没那么长。panic 在"自动处理别人发来的归档"的场景里就是 DoS。
-	// 而且这类 bug 往往是"刚好截断到某个长度才崩", 手搓用例撞不到 —— 只能穷举前缀。
+	// truncated archives are the easiest panic input: the header claims N metadata bytes
+	// and M data bytes that the file does not have. A panic is DoS when auto-processing
+	// foreign archives. Such bugs often need a specific cut length, unreachable by hand --
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")
 	if err := os.MkdirAll(src, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// 三种内容: 可压文本(进固实流) / 随机(判为原样, 进原样区) / 中等重复,
-	// 这样归档里"元数据帧 + 数据帧 + 原样区"三段都有实体, 截断才有覆盖意义。
+	// enumerate prefixes instead. Three contents: compressible text (solid stream) /
+	// random (raw region) / medium-redundant, so metadata + data + raw all exist to cut.
 	rng := rand.New(rand.NewSource(20260913))
 	words := strings.Fields("the quick brown fox compress data streams context mixing " +
 		"predicts bits adaptive model archive solid chunk dedup")
@@ -746,8 +746,8 @@ func TestTruncatedArchiveNeverPanics(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// 五种模式是**五套不同的编解码实现**(zstd / lzma2-xz / 自写 CM),
-	// 只测一种等于只测了三分之一。逐个穷举。
+	// the five modes are **five different codec implementations** (zstd / lzma2-xz /
+	// hand-written CM); testing one tests a third. Enumerate them all.
 	unmute := muteStdio(t)
 	defer unmute()
 	for _, mode := range []string{"fast", "best", "max", "ultra", "text"} {
@@ -759,23 +759,23 @@ func TestTruncatedArchiveNeverPanics(t *testing.T) {
 				t.Fatal(err)
 			}
 			if len(full) < 512 {
-				t.Fatalf("归档只有 %d 字节, 穷举前缀测不到东西", len(full))
+				t.Fatalf("archive only %d bytes; prefix enumeration would test nothing", len(full))
 			}
-			// 先验: 完整归档必须能正常列出。否则下面几万轮全是"一开始就失败",
-			// 用例看着在跑, 其实一行有效代码都没执行到。
+			// prior: the intact archive must list fine. Else the thousands of rounds below
+			// all fail at step one and no real code path is exercised.
 			if runCatchingFatal(func() { listArchive(arc, false) }) {
-				t.Fatal("完好归档反而列不出来 —— 后面的穷举全是空转")
+				t.Fatal("intact archive does not list -- the enumeration below would be vacuous")
 			}
-			t.Logf("归档 %d 字节, 穷举 %d 个前缀(每 16 个做一次完整解包)", len(full), len(full)+1)
-			// runCatchingFatal 把 fatal 转成 panic 接住, 而**真正的 panic 会原样
-			// 抛出**, 于是"崩了"直接体现为测试失败 —— 正是想要的效果。
+			t.Logf("archive %d bytes, enumerating %d prefixes (full unpack every 16)", len(full), len(full)+1)
+			// runCatchingFatal converts fatal into a caught panic, while **real panics
+			// propagate**, so a crash surfaces as a test failure -- exactly what we want.
 			for n := 0; n <= len(full); n++ {
 				p := filepath.Join(dir, "trunc.hcax")
 				if err := os.WriteFile(p, full[:n], 0o644); err != nil {
 					t.Fatal(err)
 				}
 				runCatchingFatal(func() { listArchive(p, false) })
-				// 解包路径比只读元数据深得多(建文件/解压/变换), 抽样覆盖
+				// unpack goes far deeper than metadata reads (create files/decompress/transform);
 				if n%16 == 0 {
 					out := filepath.Join(dir, "out")
 					os.RemoveAll(out)
@@ -786,12 +786,12 @@ func TestTruncatedArchiveNeverPanics(t *testing.T) {
 	}
 }
 
-// ---------- 随机篡改的归档同样不许 panic ----------
+// ---------- randomly tampered archives must also never panic ----------
 
 func TestCorruptedArchiveNeverPanics(t *testing.T) {
-	// 截断只让数据"变少"; 随机篡改能让长度字段"变大"(比如块长从 100 变成 10 亿),
-	// 触发的是另一类越界 —— 光靠截断用例撞不到。
-	// 归档里的字节是**别人给的**, 处理它的人不该因为一个坏字节就整个崩掉。
+	// truncation only shrinks data; random tampering can grow length fields (chunk size
+	// 100 -> 1e9), a different out-of-bounds class truncation never hits.
+	// archive bytes are **someone else's**; handling them must not crash on one bad byte.
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")
 	if err := os.MkdirAll(src, 0o755); err != nil {
@@ -824,15 +824,15 @@ func TestCorruptedArchiveNeverPanics(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			// 先验: 同 TestTruncatedArchiveNeverPanics, 防止 200 轮全是空转
+			// prior: same as TestTruncatedArchiveNeverPanics; keep the 200 rounds honest
 			if runCatchingFatal(func() { listArchive(arc, false) }) {
-				t.Fatal("完好归档反而列不出来 —— 后面的篡改用例全是空转")
+				t.Fatal("intact archive does not list -- the tamper cases below would be vacuous")
 			}
 			const rounds = 200
 			t0 := time.Now()
 			for i := 0; i < rounds; i++ {
 				b := append([]byte(nil), full...)
-				for k, n := 0, 1+rng.Intn(3); k < n; k++ { // 每轮翻 1~3 个 bit
+				for k, n := 0, 1+rng.Intn(3); k < n; k++ { // flip 1-3 bits per round
 					b[rng.Intn(len(b))] ^= byte(1 << uint(rng.Intn(8)))
 				}
 				p := filepath.Join(dir, "corrupt.hcax")
@@ -846,73 +846,73 @@ func TestCorruptedArchiveNeverPanics(t *testing.T) {
 					runCatchingFatal(func() { unpack(p, out, false, nil) })
 				}
 			}
-			// 不许"只是变慢": 200 个几十 KB 的归档在正常情况下几秒就跑完了。
-			// 曾经有个真实的坑 —— CM 帧头长度字段被改坏后解码器不会停,
-			// 一个损坏的 text 归档能让 hcax list 永久挂死(单核跑满)。
-			// 那不会 panic, 只会卡住, 所以必须单独设一道时间闸门。
+			// no "merely slow": 200 archives of tens of KB finish in seconds when healthy.
+			// real trap once: a corrupted CM frame length makes the decoder never stop,
+			// hanging hcax list forever on one corrupt text archive (core pegged).
+			// that hangs rather than panics, hence this separate time gate.
 			if d := time.Since(t0); d > 60*time.Second {
-				t.Errorf("%s 模式 200 轮用了 %v —— 有输入让解码器陷进去了", mode, d)
+				t.Errorf("%s mode 200 rounds took %v -- some input trapped the decoder", mode, d)
 			}
 		})
 	}
 }
 
-// ---------- 归档落盘必须原子: 失败时不能把旧归档一起毁掉 ----------
+// ---------- archive writes must be atomic: a failure must not destroy the old archive ----------
 
 func TestArchiveWriterKeepsOldOnFailure(t *testing.T) {
-	// 老代码 os.Create(outPath) 一打开就把旧归档截成 0。打包跑到最后写盘阶段
-	// 失败(磁盘满)时, 旧备份已经没了, 新的只写了一半 —— 一次失败毁两份。
+	// old code os.Create(outPath) truncated the old archive to 0 on open. A failure at
+	// the final write stage (disk full) lost the old backup and left half a new one.
 	dir := t.TempDir()
 	out := filepath.Join(dir, "backup.hcax")
-	const old = "上一版的好归档"
+	const old = "previous good archive"
 	if err := os.WriteFile(out, []byte(old), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	w := openArchiveForWrite(out)
-	w.f.Write([]byte("写了一半就崩了")) // 模拟写到一半失败
-	w.abort()                       // fatal() 走的就是这一步
+	w.f.Write([]byte("wrote half, then crashed")) // simulate a mid-write failure
+	w.abort()                       // this is exactly what fatal() does
 
 	got, err := os.ReadFile(out)
 	if err != nil || string(got) != old {
-		t.Errorf("写盘失败后旧归档被毁了: %q (err=%v)", got, err)
+		t.Errorf("old archive destroyed on write failure: %q (err=%v)", got, err)
 	}
-	// 半成品临时文件不能留在目录里当垃圾
+	// no half-written temp file may be left behind
 	ents, _ := os.ReadDir(dir)
 	if len(ents) != 1 {
-		t.Errorf("目录里还剩 %d 个文件, 半成品没清理干净", len(ents))
+		t.Errorf("%d files left in dir; partial artifacts not cleaned up", len(ents))
 	}
 }
 
 func TestArchiveWriterCommitsAtomically(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "a.hcax")
-	if err := os.WriteFile(out, []byte("旧"), 0o600); err != nil {
+	if err := os.WriteFile(out, []byte("old"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	w := openArchiveForWrite(out)
-	w.f.Write([]byte("新内容"))
+	w.f.Write([]byte("new content"))
 	w.f.Close()
 	w.commit()
 
 	got, _ := os.ReadFile(out)
-	if string(got) != "新内容" {
-		t.Errorf("commit 后目标归档内容不对: %q", got)
+	if string(got) != "new content" {
+		t.Errorf("archive content wrong after commit: %q", got)
 	}
-	// 覆盖已有归档时要沿用它的权限, 别顺手把 0600 改成 0644
+	// overwriting an existing archive keeps its mode; do not bump 0600 to 0644
 	fi, _ := os.Stat(out)
 	if fi.Mode().Perm() != 0o600 {
-		t.Errorf("覆盖了已有归档却改了它的权限: %v(应为 0600)", fi.Mode().Perm())
+		t.Errorf("overwrite changed the archive mode: %v (want 0600)", fi.Mode().Perm())
 	}
-	// tmp 置空后 abort 必须是空操作(清理钩子会无条件再调一次)
+	// abort with tmp cleared must be a no-op (the cleanup hook calls it unconditionally)
 	w.abort()
 	ents, _ := os.ReadDir(dir)
 	if len(ents) != 1 {
-		t.Errorf("commit 后又多出文件: %d 个", len(ents))
+		t.Errorf("%d extra files after commit", len(ents))
 	}
 }
 
 func TestArchiveWriterNewFilePerm(t *testing.T) {
-	// 新建的归档如果留着 CreateTemp 的 0600, 备份出来别人读不了
+	// a fresh archive keeping CreateTemp's 0600 is unreadable to others when backed up
 	dir := t.TempDir()
 	out := filepath.Join(dir, "new.hcax")
 	w := openArchiveForWrite(out)
@@ -924,23 +924,23 @@ func TestArchiveWriterNewFilePerm(t *testing.T) {
 		t.Fatal(err)
 	}
 	if fi.Mode().Perm() != 0o644 {
-		t.Errorf("新建归档权限 %v, 应为 0644", fi.Mode().Perm())
+		t.Errorf("fresh archive mode %v, want 0644", fi.Mode().Perm())
 	}
 }
 
-// ---------- 系统 xz 的 stderr 绝不能混进压缩流 ----------
+// ---------- system xz stderr must never leak into the compressed stream ----------
 
 func TestXZStderrNotMixedIntoOutput(t *testing.T) {
-	// 构造一个"往 stderr 打一条警告、但照常完成压缩"的 xz。若把 cmd.Stderr 接到
-	// 与 stdout 同一个 buffer, 这条警告会拼进压缩流头部 —— 打包成功、归档大几十
-	// 字节, 解包时才报 invalid header magic bytes。数据损坏是静默发生的。
+	// build an xz that warns on stderr yet compresses fine. If cmd.Stderr shares the
+	// stdout buffer, the warning lands in the stream header -- pack succeeds, archives
+	// grow bytes, and unpack finally reports invalid header magic bytes. Silent corruption.
 	real, err := exec.LookPath("xz")
 	if err != nil {
-		t.Skip("本机没有系统 xz(或不在 PATH), 这条用例需要一个真实的 xz 来转发")
+		t.Skip("no system xz on this machine (or not on PATH); the case needs a real xz to wrap")
 	}
 	dir := t.TempDir()
 	shim := filepath.Join(dir, "xz")
-	script := "#!/bin/sh\necho 'xz: (模拟) 一条无害的警告' >&2\nexec " + real + " \"$@\"\n"
+	script := "#!/bin/sh\necho 'xz: (simulated) one harmless warning' >&2\nexec " + real + " \"$@\"\n"
 	if err := os.WriteFile(shim, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -949,10 +949,10 @@ func TestXZStderrNotMixedIntoOutput(t *testing.T) {
 	b := &backend{}
 	out := b.xzCompress(bytes.NewReader([]byte("hello, world, hello, world")), "3", "2", "2MiB")
 	if out == nil {
-		t.Fatal("xz 明明成功了, 不该返回 nil")
+		t.Fatal("xz succeeded, must not return nil")
 	}
 	const xzMagic = "\xFD" + "7zXZ" + "\x00"
 	if len(out) < 6 || string(out[:6]) != xzMagic {
-		t.Errorf("压缩流开头不是 xz magic, stderr 混进来了: %q", out[:min(len(out), 32)])
+		t.Errorf("stream does not start with xz magic; stderr leaked in: %q", out[:min(len(out), 32)])
 	}
 }
